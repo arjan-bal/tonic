@@ -3,17 +3,16 @@ name = "benchamark"
 version = "0.1.0"
 edition = "2021"
 publish = false
-
-[[bin]]
-name = "client"
-path = "src/bin/client.rs"
-
-[[bin]]
-name = "server"
-path = "src/bin/server.rs"
-
+license = "Apache-2.0"
 
 [dependencies]
+clap = { version = "4.5.21", features = ["derive"] }
+num_cpus = "1.16.0"
+prost = "0.13"
+tokio = {version = "1.0", features = ["rt-multi-thread", "time", "macros"]}
+tokio-stream = "0.1"
+tonic = {path = "../tonic", features = ["tls-ring"]}
+tower = "0.5"
 
 [build-dependencies]
 tonic-build = {path = "../tonic-build", features = ["prost"]}
