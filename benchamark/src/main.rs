@@ -1,14 +1,16 @@
-use std::pin::Pin;
+#![recursion_limit = "1024"]
 
-use crate::worker::worker_service_server::WorkerService;
-use clap::Parser;
-use tokio::sync::mpsc;
-use tokio_stream::Stream;
-use tonic::{transport::Server, Response, Status};
-use worker::{
-    worker_service_server::WorkerServiceServer, ClientArgs, ClientStatus, CoreRequest,
-    CoreResponse, ServerArgs, ServerStatus, Void,
+use std::{pin::Pin, time::Duration};
+
+use benchmark::benchmark_client::BenchmarkClient;
+use benchmark::worker::{
+    client_args, worker_service_server::WorkerService, worker_service_server::WorkerServiceServer,
+    ClientArgs, ClientStatus, CoreRequest, CoreResponse, ServerArgs, ServerStatus, Void,
 };
+use clap::Parser;
+use tokio::{sync::mpsc, time};
+use tokio_stream::{Stream, StreamExt};
+use tonic::{transport::Server, Response, Status};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -20,10 +22,6 @@ struct Args {
     driver_port: u16,
 }
 
-pub mod worker {
-    tonic::include_proto!("grpc.testing");
-}
-
 #[derive(Debug)]
 struct DriverService {
     shutdowon_channel: mpsc::Sender<()>,
@@ -31,13 +29,13 @@ struct DriverService {
 
 #[tonic::async_trait]
 impl WorkerService for DriverService {
-    /// Server streaming response type for the RunServer method.
+    // Server streaming response type for the RunServer method.
     type RunServerStream =
         Pin<Box<dyn Stream<Item = Result<ServerStatus, Status>> + Send + 'static>>;
 
     async fn run_server(
         &self,
-        request: tonic::Request<tonic::Streaming<ServerArgs>>,
+        _request: tonic::Request<tonic::Streaming<ServerArgs>>,
     ) -> std::result::Result<Response<Self::RunServerStream>, Status> {
         unimplemented!()
     }
@@ -49,7 +47,33 @@ impl WorkerService for DriverService {
         &self,
         request: tonic::Request<tonic::Streaming<ClientArgs>>,
     ) -> std::result::Result<Response<Self::RunClientStream>, Status> {
-        unimplemented!()
+        let mut benchmark_client: Option<BenchmarkClient> = None;
+        let mut stream = request.into_inner();
+
+        let output = async_stream::try_stream! {
+            while let Some(request) = stream.next().await {
+                let request = request?;
+                let mut reset_stats = false;
+                match request.argtype.unwrap() {
+                    client_args::Argtype::Setup(client_config) => {
+                        if let Some(mut client) = benchmark_client {
+                            println!("client setup received when client already exists, shutting down the existing client");
+                            client.shutdown();
+                        }
+                        benchmark_client = Some(BenchmarkClient::create_and_start());
+                    }
+                    client_args::Argtype::Mark(mark) => {
+                        benchmark_client.as_ref().ok_or(Status::new(tonic::Code::InvalidArgument, "client setup received when client already exists, shutting down the existing client"))?;
+                        reset_stats = mark.reset;
+                    }
+                };
+                yield ClientStatus {
+                    stats: Some(benchmark_client.as_mut().unwrap().get_stats(reset_stats)),
+                };
+            }
+        };
+
+        Ok(Response::new(Box::pin(output) as Self::RunClientStream))
     }
 
     async fn core_count(
@@ -91,6 +115,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(svc)
         .serve_with_shutdown(addr, async {
             rx.recv().await;
+            // Wait for the quit_worker response to be sent.
+            time::sleep(Duration::from_secs(1)).await;
         })
         .await?;
 
