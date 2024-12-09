@@ -1,7 +1,16 @@
 #![recursion_limit = "1024"]
 
-pub mod benchmark_client;
+pub mod client;
+pub mod common;
+pub mod stats;
 
 pub mod worker {
-    tonic::include_proto!("grpc.testing");
+    include!(concat!(env!("OUT_DIR"), "/worker_service/grpc.testing.rs"));
+}
+
+pub mod benchmark_service {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/benchmark_service/simple/grpc.testing.rs"
+    ));
 }

@@ -1,0 +1,370 @@
+use std::{
+    str::FromStr,
+    sync::{Arc, Mutex},
+    time::Duration,
+    usize,
+};
+
+use hdrhistogram::Histogram;
+use rand::thread_rng;
+use rand_distr::{Distribution, Exp};
+use tokio::{
+    runtime::Runtime,
+    sync::watch::{self, Receiver, Sender},
+    time,
+};
+use tonic::{
+    transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Uri},
+    Code, Request, Status,
+};
+
+use crate::{
+    benchmark_service::{
+        self, benchmark_service_client::BenchmarkServiceClient, Payload, SimpleRequest,
+    },
+    worker::{
+        self,
+        payload_config::Payload::{BytebufParams, SimpleParams},
+        ClientConfig,
+    },
+};
+
+pub struct BenchmarkClient {
+    shutdown_tx: Sender<bool>,
+    histograms: Vec<Arc<Mutex<Histogram<u64>>>>,
+    runtime: Option<Runtime>,
+}
+
+#[derive(Debug)]
+enum PayloadType {
+    ByteBuf,
+    Protobuf,
+}
+
+impl BenchmarkClient {
+    pub fn shutdown(&mut self) -> Result<(), Status> {
+        self.shutdown_tx.send(true).map_err(|err| {
+            Status::new(
+                Code::Internal,
+                format!("failed to close client: {}", err.to_string()),
+            )
+        })?;
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(Duration::from_secs(1));
+        }
+        Ok(())
+    }
+
+    pub fn start(config: ClientConfig) -> Result<BenchmarkClient, Status> {
+        println!("{:?}", config);
+
+        // Sanity check for client type.
+        match config.client_type() {
+            worker::ClientType::SyncClient => (),
+            worker::ClientType::AsyncClient => (),
+            _ => return Err(Status::new(Code::InvalidArgument, "Invalid client_type")),
+        };
+
+        let payload_type = config
+            .payload_config
+            .ok_or(Status::new(Code::InvalidArgument, "payload_config missing"))?
+            .payload
+            .ok_or(Status::new(Code::InvalidArgument, "payload missing"))?;
+
+        let (payload_req_size, payload_resp_size, payload_type) = match payload_type {
+            BytebufParams(params) => (
+                params.req_size as usize,
+                params.resp_size as usize,
+                PayloadType::ByteBuf,
+            ),
+            SimpleParams(params) => (
+                params.req_size as usize,
+                params.resp_size as usize,
+                PayloadType::Protobuf,
+            ),
+            _ => {
+                return Err(Status::new(
+                    tonic::Code::InvalidArgument,
+                    format!("unknown payload type: {:?}", payload_type),
+                ))
+            }
+        };
+
+        let load = config
+            .load_params
+            .ok_or(Status::new(Code::InvalidArgument, "load_params missing"))?
+            .load
+            .ok_or(Status::new(Code::InvalidArgument, "load missing"))?;
+
+        let distribution: Option<Exp<f64>> = match load {
+            worker::load_params::Load::ClosedLoop(_) => None,
+            worker::load_params::Load::Poisson(poisson_params) => {
+                Some(Exp::new(poisson_params.offered_load).map_err(|err| {
+                    Status::new(
+                        Code::InvalidArgument,
+                        format!(
+                            "failed to create exponential distribution: {}",
+                            err.to_string()
+                        ),
+                    )
+                })?)
+            }
+        };
+
+        let channel_count = config.client_channels as usize;
+        let histogram_params = config.histogram_params.unwrap();
+
+        // Check and set security options.
+        let tls = if let Some(params) = &config.security_params {
+            Some(if params.use_test_ca {
+                let data_dir =
+                    std::path::PathBuf::from_iter([std::env!("CARGO_MANIFEST_DIR"), "data"]);
+                let pem = std::fs::read_to_string(data_dir.join("tls/ca.pem"))?;
+                let ca = Certificate::from_pem(pem);
+                ClientTlsConfig::new()
+                    .ca_certificate(ca)
+                    .domain_name(params.server_host_override.to_string())
+            } else {
+                ClientTlsConfig::new()
+            })
+        } else {
+            None
+        };
+
+        let rpc_count_per_conn = config.outstanding_rpcs_per_channel as usize;
+
+        let thread_count = std::cmp::max(config.async_client_threads as usize, num_cpus::get());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .thread_name("client-pool")
+            .worker_threads(thread_count)
+            .enable_all()
+            .build()
+            .map_err(|err| Status::new(Code::Internal, err.to_string()))?;
+
+        let rpc_type = match config.rpc_type() {
+            worker::RpcType::Unary => RpcType::Unary,
+            worker::RpcType::Streaming => RpcType::Streaming,
+            _ => return Err(Status::new(Code::InvalidArgument, "invalid rpc_type")),
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let num_servers = config.server_targets.len();
+        let mut histograms = Vec::with_capacity(channel_count * rpc_count_per_conn);
+        for i in 0..channel_count {
+            let uri = Uri::from_str(&config.server_targets[i % num_servers]).map_err(|err| {
+                Status::new(
+                    Code::InvalidArgument,
+                    format!("failed to parse URI: {}", err.to_string()),
+                )
+            })?;
+            let endpoint = Channel::builder(uri);
+            let endpoint = if let Some(tls) = tls.as_ref() {
+                endpoint.tls_config(tls.clone()).map_err(|err| {
+                    Status::new(
+                        Code::InvalidArgument,
+                        format!("bad TLS config: {}", err.to_string()),
+                    )
+                })?
+            } else {
+                endpoint
+            };
+
+            // Create one histogram per client rpc to minimise contention for
+            // the lock. These histograms will be combined when getting stats.
+            let mut channel_histograms = Vec::with_capacity(rpc_count_per_conn);
+
+            for _ in 0..rpc_count_per_conn {
+                let histogram = Histogram::new_with_max(histogram_params.max_possible as u64, 3)
+                    .map_err(|err| {
+                        Status::new(
+                            Code::InvalidArgument,
+                            format!(
+                                "failed to build histogram with given max_possible value: {}",
+                                err
+                            ),
+                        )
+                    })?;
+                let histogram = Arc::new(Mutex::new(histogram));
+                channel_histograms.push(histogram.clone());
+                histograms.push(histogram.clone());
+            }
+            let args = TestArgs {
+                histograms: channel_histograms,
+                distribution: distribution.clone(),
+                payload_req_size,
+                payload_resp_size,
+                endpoint,
+                rpc_count_per_conn,
+                rpc_type: rpc_type.clone(),
+                shutdown_rx: shutdown_rx.clone(),
+            };
+            runtime.spawn(perform_rpcs(args));
+        }
+
+        Ok(BenchmarkClient {
+            histograms,
+            shutdown_tx,
+            runtime: Some(runtime),
+        })
+    }
+
+    pub fn get_stats(&mut self, _reset: bool) -> worker::ClientStats {
+        todo!()
+    }
+}
+
+#[derive(Debug)]
+struct TestArgs {
+    histograms: Vec<Arc<Mutex<Histogram<u64>>>>,
+    distribution: Option<Exp<f64>>,
+    payload_req_size: usize,
+    payload_resp_size: usize,
+    endpoint: Endpoint,
+    rpc_count_per_conn: usize,
+    rpc_type: RpcType,
+    shutdown_rx: Receiver<bool>,
+}
+
+#[derive(Debug, Clone)]
+enum RpcType {
+    Unary,
+    Streaming,
+}
+
+async fn perform_rpcs(args: TestArgs) {
+    let client = SimpleClient {
+        client: BenchmarkServiceClient::connect(args.endpoint)
+            .await
+            .unwrap(),
+        payload_req_size: args.payload_req_size,
+        payload_resp_size: args.payload_resp_size,
+    };
+
+    match args.rpc_type {
+        RpcType::Unary => {
+            for i in 0..args.rpc_count_per_conn {
+                let histogram = args.histograms[i].clone();
+                match &args.distribution {
+                    Some(distibution) => {
+                        // Open loop.
+                        tokio::spawn(poisson_unary(
+                            client.clone(),
+                            distibution.clone(),
+                            histogram.clone(),
+                            args.shutdown_rx.clone(),
+                        ));
+                    }
+                    None => {
+                        // Closed loop.
+                        tokio::spawn(blocking_unary(
+                            client.clone(),
+                            histogram.clone(),
+                            args.shutdown_rx.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        RpcType::Streaming => todo!(),
+    };
+}
+
+#[derive(Clone)]
+struct SimpleClient {
+    client: BenchmarkServiceClient<Channel>,
+    payload_req_size: usize,
+    payload_resp_size: usize,
+}
+
+async fn blocking_unary(
+    client: SimpleClient,
+    histogram: Arc<Mutex<Histogram<u64>>>,
+    shutdown_rx: Receiver<bool>,
+) {
+    let mut shutdown_rx = shutdown_rx.clone();
+    loop {
+        let mut client = client.clone();
+        let mut histogram = histogram.clone();
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                return;
+            }
+            _ = async {
+                let start = time::Instant::now();
+                match (&mut client).unary_call().await {
+                    Ok(_) => {
+                        let elapsed = time::Instant::now().duration_since(start);
+                        (&mut histogram)
+                            .lock()
+                            .unwrap()
+                            .record(elapsed.as_nanos() as u64).unwrap();
+                    }
+                    Err(_) => {}
+                }
+            } => {}
+        }
+    }
+}
+
+async fn poisson_unary(
+    client: SimpleClient,
+    distribution: Exp<f64>,
+    histogram: Arc<Mutex<Histogram<u64>>>,
+    shutdown_rx: Receiver<bool>,
+) {
+    loop {
+        let time_between_rpcs = distribution.sample(&mut thread_rng()) * 1e9;
+        time::sleep(Duration::from_nanos(time_between_rpcs.round() as u64)).await;
+
+        let histogram_copy = histogram.clone();
+        let mut client_copy = client.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+            _ = shutdown_rx.changed() => {
+                return;
+            }
+            _ = async {
+                let start = time::Instant::now();
+                match client_copy.unary_call().await {
+                    Ok(_) => {
+                        let elapsed = time::Instant::now().duration_since(start);
+                        histogram_copy
+                            .lock()
+                            .unwrap()
+                            .record(elapsed.as_nanos() as u64)
+                            .unwrap();
+                    }
+                    Err(_) => {}
+                }
+            } => {}
+            }
+        });
+    }
+}
+
+impl SimpleClient {
+    async fn unary_call(&mut self) -> Result<(), Status> {
+        let req = SimpleRequest {
+            response_type: benchmark_service::PayloadType::Compressable as i32,
+            response_size: self.payload_resp_size as i32,
+            payload: Some(self.new_payload()),
+            fill_username: false,
+            fill_oauth_scope: false,
+            response_compressed: None,
+            response_status: None,
+            expect_compressed: None,
+            fill_server_id: false,
+            fill_grpclb_route_type: false,
+            orca_per_query_report: None,
+        };
+        self.client.unary_call(Request::new(req)).await.and(Ok(()))
+    }
+
+    fn new_payload(&self) -> Payload {
+        Payload {
+            r#type: PayloadType::Protobuf as i32,
+            body: vec![0; self.payload_req_size],
+        }
+    }
+}

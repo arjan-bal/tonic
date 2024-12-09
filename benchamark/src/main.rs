@@ -2,7 +2,7 @@
 
 use std::{pin::Pin, time::Duration};
 
-use benchmark::benchmark_client::BenchmarkClient;
+use benchmark::client::BenchmarkClient;
 use benchmark::worker::{
     client_args, worker_service_server::WorkerService, worker_service_server::WorkerServiceServer,
     ClientArgs, ClientStatus, CoreRequest, CoreResponse, ServerArgs, ServerStatus, Void,
@@ -58,9 +58,9 @@ impl WorkerService for DriverService {
                     client_args::Argtype::Setup(client_config) => {
                         if let Some(mut client) = benchmark_client {
                             println!("client setup received when client already exists, shutting down the existing client");
-                            client.shutdown();
+                            client.shutdown()?;
                         }
-                        benchmark_client = Some(BenchmarkClient::create_and_start());
+                        benchmark_client = Some(BenchmarkClient::start(client_config)?);
                     }
                     client_args::Argtype::Mark(mark) => {
                         benchmark_client.as_ref().ok_or(Status::new(tonic::Code::InvalidArgument, "client setup received when client already exists, shutting down the existing client"))?;
@@ -99,8 +99,7 @@ impl WorkerService for DriverService {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_worker() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     println!("{:?}", args);
 
@@ -120,5 +119,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(run_worker())?;
     Ok(())
 }
