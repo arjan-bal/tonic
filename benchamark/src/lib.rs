@@ -2,7 +2,6 @@
 
 pub mod client;
 pub mod common;
-pub mod stats;
 
 pub mod worker {
     include!(concat!(env!("OUT_DIR"), "/worker_service/grpc.testing.rs"));

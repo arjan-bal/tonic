@@ -67,8 +67,9 @@ impl WorkerService for DriverService {
                         reset_stats = mark.reset;
                     }
                 };
+                let stats = benchmark_client.as_mut().unwrap().get_stats(reset_stats)?;
                 yield ClientStatus {
-                    stats: Some(benchmark_client.as_mut().unwrap().get_stats(reset_stats)),
+                    stats: Some(stats),
                 };
             }
         };

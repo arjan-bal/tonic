@@ -1,12 +1,16 @@
 use std::{
     str::FromStr,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
     usize,
 };
 
 use bytes::Bytes;
 use hdrhistogram::Histogram;
+use nix::sys::{
+    resource::{getrusage, Usage, UsageWho},
+    time::TimeValLike,
+};
 use rand::thread_rng;
 use rand_distr::{Distribution, Exp};
 use tokio::{runtime::Runtime, time};
@@ -21,13 +25,16 @@ use crate::{
     worker::{
         self,
         payload_config::Payload::{BytebufParams, SimpleParams},
-        ClientConfig,
+        ClientConfig, ClientStats, HistogramData, HistogramParams,
     },
 };
 
 pub struct BenchmarkClient {
     histograms: Vec<Arc<Mutex<Histogram<u64>>>>,
+    histogram_params: HistogramParams,
     runtime: Option<Runtime>,
+    last_reset_time: Instant,
+    last_rusage: Usage,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -47,8 +54,8 @@ impl BenchmarkClient {
 
     pub fn start(config: ClientConfig) -> Result<BenchmarkClient, Status> {
         println!("{:?}", config);
+        // Parse and validate the config.
 
-        // Sanity check for client type.
         match config.client_type() {
             worker::ClientType::SyncClient => (),
             worker::ClientType::AsyncClient => (),
@@ -86,6 +93,14 @@ impl BenchmarkClient {
             .load
             .ok_or(Status::new(Code::InvalidArgument, "load missing"))?;
 
+        // If set, perform an open loop, if not perform a closed loop. An open
+        // loop asynchronously starts RPCs based on random start times derived
+        // from a Poisson distribution. A closed loop performs RPCs in a
+        // blocking manner, and runs the next RPC after the previous RPC
+        // completes and returns.
+        // The time between two events (rpcs) in a Poisson process follows an
+        // exponential distribution with parameter λ, where λ represents the
+        // number of events per unit time for the poisson process.
         let distribution: Option<Exp<f64>> = match load {
             worker::load_params::Load::ClosedLoop(_) => None,
             worker::load_params::Load::Poisson(poisson_params) => {
@@ -159,7 +174,7 @@ impl BenchmarkClient {
             };
 
             // Create one histogram per client rpc to minimise contention for
-            // the lock. These histograms will be combined when getting stats.
+            // the lock. These histograms will be merged when querying stats.
             let mut channel_histograms = Vec::with_capacity(rpc_count_per_conn);
 
             for _ in 0..rpc_count_per_conn {
@@ -192,12 +207,105 @@ impl BenchmarkClient {
 
         Ok(BenchmarkClient {
             histograms,
+            histogram_params,
             runtime: Some(runtime),
+            last_reset_time: Instant::now(),
+            last_rusage: getrusage(UsageWho::RUSAGE_SELF).map_err(|err| {
+                Status::new(
+                    Code::Internal,
+                    format!("failed to query system resource usage: {}", err.to_string()),
+                )
+            })?,
         })
     }
 
-    pub fn get_stats(&mut self, _reset: bool) -> worker::ClientStats {
-        todo!()
+    pub fn get_stats(&mut self, reset: bool) -> Result<worker::ClientStats, Status> {
+        let mut aggregated =
+            Histogram::new_with_max(self.histogram_params.max_possible as u64, 3).unwrap();
+
+        if reset {
+            // Merging histogram may take some time.
+            // Put all histograms aside and merge later.
+            for histogram in self.histograms.iter() {
+                let new =
+                    Histogram::new_with_max(self.histogram_params.max_possible as u64, 3).unwrap();
+                let mut lock = histogram.lock().unwrap();
+                let old = std::mem::replace(&mut *lock, new);
+                drop(lock);
+                aggregated.add(old).map_err(|err| {
+                    Status::new(
+                        Code::Internal,
+                        format!("error while merging histograms: {}", err.to_string()),
+                    )
+                })?;
+            }
+        } else {
+            // Merge only, don't reset.
+            for histogram in self.histograms.iter() {
+                let lock = histogram.lock().unwrap();
+                aggregated.add(&*lock).map_err(|err| {
+                    Status::new(
+                        Code::Internal,
+                        format!("error while merging histograms: {}", err.to_string()),
+                    )
+                })?;
+            }
+        }
+
+        let now = Instant::now();
+        let wall_time_elapsed = now.duration_since(self.last_reset_time);
+        let latest_rusage = getrusage(UsageWho::RUSAGE_SELF).map_err(|err| {
+            Status::new(
+                Code::Internal,
+                format!("failed to query system resource usage: {}", err.to_string()),
+            )
+        })?;
+        let user_time = latest_rusage.user_time() - self.last_rusage.user_time();
+        let system_time = latest_rusage.system_time() - self.last_rusage.system_time();
+
+        if reset {
+            self.last_rusage = latest_rusage;
+            self.last_reset_time = now;
+        }
+        let resolution = 1.0 + self.histogram_params.resolution.max(0.01 as f64);
+        let mut base = 1 as f64;
+        // Calculating the mean and stddev involves iterating over the
+        // histogram, so save the values.
+        let mean = aggregated.mean() as f64;
+        let stddev = aggregated.stdev();
+        let variance = stddev * stddev;
+        let mut histogram_data = HistogramData {
+            bucket: Vec::new(),
+            min_seen: aggregated.min() as f64,
+            max_seen: aggregated.max() as f64,
+            sum: mean * aggregated.len() as f64,
+            sum_of_squares: variance * aggregated.len() as f64
+                + aggregated.len() as f64 * mean * mean,
+            count: aggregated.len() as f64,
+        };
+        for freq in aggregated.iter_log(1, resolution).skip(1) {
+            histogram_data
+                .bucket
+                .push(freq.count_since_last_iteration() as u32);
+            base = base * resolution;
+        }
+
+        // The driver expects values for all buckets in the range, not just the
+        // range of buckets that have values.
+        while base < self.histogram_params.max_possible {
+            histogram_data.bucket.push(0);
+            base = base * resolution;
+        }
+
+        Ok(ClientStats {
+            latencies: Some(histogram_data),
+            time_elapsed: wall_time_elapsed.as_nanos() as f64,
+            time_user: user_time.num_nanoseconds() as f64,
+            time_system: system_time.num_nanoseconds() as f64,
+            // The following fields are not set by Java and Go.
+            request_results: Vec::new(),
+            cq_poll_count: 0,
+        })
     }
 }
 
@@ -220,20 +328,7 @@ enum RpcType {
 }
 
 async fn perform_rpcs(args: TestArgs) {
-    let client = match args.payload_type {
-        PayloadType::ByteBuf => Client::ByteBufClient(ByteBufClient{
-           client: bytebuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient::connect(args.endpoint).await.unwrap(), 
-        payload_req_size: args.payload_req_size,
-        }),
-        PayloadType::Protobuf => Client::ProtoClient(ProtoClient{
-            client: protobuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient::connect(args.endpoint)
-            .await
-            .unwrap(),
-        payload_req_size: args.payload_req_size,
-        payload_resp_size: args.payload_resp_size,
-        }),
-    };
-
+    let client = Client::new(&args).await;
     match args.rpc_type {
         RpcType::Unary => {
             for i in 0..args.rpc_count_per_conn {
@@ -265,6 +360,22 @@ enum Client {
 }
 
 impl Client {
+    async fn new(args: &TestArgs) -> Self {
+        match args.payload_type {
+            PayloadType::ByteBuf => Client::ByteBufClient(ByteBufClient{
+               client: bytebuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient::connect(args.endpoint.clone()).await.unwrap(),
+            payload_req_size: args.payload_req_size,
+            }),
+            PayloadType::Protobuf => Client::ProtoClient(ProtoClient{
+                client: protobuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient::connect(args.endpoint.clone())
+                .await
+                .unwrap(),
+            payload_req_size: args.payload_req_size,
+            payload_resp_size: args.payload_resp_size,
+            }),
+        }
+    }
+
     async fn unary_call(&mut self) -> Result<(), Status> {
         match self {
             Client::ProtoClient(client) => client.unary_call().await,
@@ -314,7 +425,9 @@ struct ByteBufClient {
 
 impl ByteBufClient {
     async fn unary_call(&mut self) -> Result<(), Status> {
-        self.client.unary_call(Request::new(Bytes::from(vec![0u8; self.payload_req_size]))).await?;
+        self.client
+            .unary_call(Request::new(Bytes::from(vec![0u8; self.payload_req_size])))
+            .await?;
         Ok(())
     }
 }
