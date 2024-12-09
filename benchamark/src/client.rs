@@ -5,23 +5,19 @@ use std::{
     usize,
 };
 
+use bytes::Bytes;
 use hdrhistogram::Histogram;
 use rand::thread_rng;
 use rand_distr::{Distribution, Exp};
-use tokio::{
-    runtime::Runtime,
-    sync::watch::{self, Receiver, Sender},
-    time,
-};
+use tokio::{runtime::Runtime, time};
 use tonic::{
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Uri},
     Code, Request, Status,
 };
 
 use crate::{
-    benchmark_service::{
-        self, benchmark_service_client::BenchmarkServiceClient, Payload, SimpleRequest,
-    },
+    bytebuf_benchmark_service,
+    protobuf_benchmark_service::{self, Payload, SimpleRequest},
     worker::{
         self,
         payload_config::Payload::{BytebufParams, SimpleParams},
@@ -30,12 +26,11 @@ use crate::{
 };
 
 pub struct BenchmarkClient {
-    shutdown_tx: Sender<bool>,
     histograms: Vec<Arc<Mutex<Histogram<u64>>>>,
     runtime: Option<Runtime>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 enum PayloadType {
     ByteBuf,
     Protobuf,
@@ -43,14 +38,9 @@ enum PayloadType {
 
 impl BenchmarkClient {
     pub fn shutdown(&mut self) -> Result<(), Status> {
-        self.shutdown_tx.send(true).map_err(|err| {
-            Status::new(
-                Code::Internal,
-                format!("failed to close client: {}", err.to_string()),
-            )
-        })?;
+        // Dropping the runtime will stop all the futures when they yield.
         if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_timeout(Duration::from_secs(1));
+            drop(runtime);
         }
         Ok(())
     }
@@ -146,7 +136,6 @@ impl BenchmarkClient {
             worker::RpcType::Streaming => RpcType::Streaming,
             _ => return Err(Status::new(Code::InvalidArgument, "invalid rpc_type")),
         };
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let num_servers = config.server_targets.len();
         let mut histograms = Vec::with_capacity(channel_count * rpc_count_per_conn);
@@ -196,14 +185,13 @@ impl BenchmarkClient {
                 endpoint,
                 rpc_count_per_conn,
                 rpc_type: rpc_type.clone(),
-                shutdown_rx: shutdown_rx.clone(),
+                payload_type,
             };
             runtime.spawn(perform_rpcs(args));
         }
 
         Ok(BenchmarkClient {
             histograms,
-            shutdown_tx,
             runtime: Some(runtime),
         })
     }
@@ -222,7 +210,7 @@ struct TestArgs {
     endpoint: Endpoint,
     rpc_count_per_conn: usize,
     rpc_type: RpcType,
-    shutdown_rx: Receiver<bool>,
+    payload_type: PayloadType,
 }
 
 #[derive(Debug, Clone)]
@@ -232,12 +220,18 @@ enum RpcType {
 }
 
 async fn perform_rpcs(args: TestArgs) {
-    let client = SimpleClient {
-        client: BenchmarkServiceClient::connect(args.endpoint)
+    let client = match args.payload_type {
+        PayloadType::ByteBuf => Client::ByteBufClient(ByteBufClient{
+           client: bytebuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient::connect(args.endpoint).await.unwrap(), 
+        payload_req_size: args.payload_req_size,
+        }),
+        PayloadType::Protobuf => Client::ProtoClient(ProtoClient{
+            client: protobuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient::connect(args.endpoint)
             .await
             .unwrap(),
         payload_req_size: args.payload_req_size,
         payload_resp_size: args.payload_resp_size,
+        }),
     };
 
     match args.rpc_type {
@@ -251,16 +245,11 @@ async fn perform_rpcs(args: TestArgs) {
                             client.clone(),
                             distibution.clone(),
                             histogram.clone(),
-                            args.shutdown_rx.clone(),
                         ));
                     }
                     None => {
                         // Closed loop.
-                        tokio::spawn(blocking_unary(
-                            client.clone(),
-                            histogram.clone(),
-                            args.shutdown_rx.clone(),
-                        ));
+                        tokio::spawn(blocking_unary(client.clone(), histogram.clone()));
                     }
                 }
             }
@@ -269,84 +258,39 @@ async fn perform_rpcs(args: TestArgs) {
     };
 }
 
-#[derive(Clone)]
-struct SimpleClient {
-    client: BenchmarkServiceClient<Channel>,
-    payload_req_size: usize,
-    payload_resp_size: usize,
+#[derive(Clone, Debug)]
+enum Client {
+    ProtoClient(ProtoClient),
+    ByteBufClient(ByteBufClient),
 }
 
-async fn blocking_unary(
-    client: SimpleClient,
-    histogram: Arc<Mutex<Histogram<u64>>>,
-    shutdown_rx: Receiver<bool>,
-) {
-    let mut shutdown_rx = shutdown_rx.clone();
-    loop {
-        let mut client = client.clone();
-        let mut histogram = histogram.clone();
-        tokio::select! {
-            _ = shutdown_rx.changed() => {
-                return;
-            }
-            _ = async {
-                let start = time::Instant::now();
-                match (&mut client).unary_call().await {
-                    Ok(_) => {
-                        let elapsed = time::Instant::now().duration_since(start);
-                        (&mut histogram)
-                            .lock()
-                            .unwrap()
-                            .record(elapsed.as_nanos() as u64).unwrap();
-                    }
-                    Err(_) => {}
-                }
-            } => {}
+impl Client {
+    async fn unary_call(&mut self) -> Result<(), Status> {
+        match self {
+            Client::ProtoClient(client) => client.unary_call().await,
+            Client::ByteBufClient(client) => client.unary_call().await,
         }
     }
 }
 
-async fn poisson_unary(
-    client: SimpleClient,
-    distribution: Exp<f64>,
-    histogram: Arc<Mutex<Histogram<u64>>>,
-    shutdown_rx: Receiver<bool>,
-) {
-    loop {
-        let time_between_rpcs = distribution.sample(&mut thread_rng()) * 1e9;
-        time::sleep(Duration::from_nanos(time_between_rpcs.round() as u64)).await;
-
-        let histogram_copy = histogram.clone();
-        let mut client_copy = client.clone();
-        let mut shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-            _ = shutdown_rx.changed() => {
-                return;
-            }
-            _ = async {
-                let start = time::Instant::now();
-                match client_copy.unary_call().await {
-                    Ok(_) => {
-                        let elapsed = time::Instant::now().duration_since(start);
-                        histogram_copy
-                            .lock()
-                            .unwrap()
-                            .record(elapsed.as_nanos() as u64)
-                            .unwrap();
-                    }
-                    Err(_) => {}
-                }
-            } => {}
-            }
-        });
-    }
+#[derive(Clone, Debug)]
+struct ProtoClient {
+    client: protobuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient<Channel>,
+    payload_req_size: usize,
+    payload_resp_size: usize,
 }
 
-impl SimpleClient {
+impl ProtoClient {
+    fn new_payload(&self) -> Payload {
+        Payload {
+            r#type: PayloadType::Protobuf as i32,
+            body: vec![0; self.payload_req_size],
+        }
+    }
+
     async fn unary_call(&mut self) -> Result<(), Status> {
         let req = SimpleRequest {
-            response_type: benchmark_service::PayloadType::Compressable as i32,
+            response_type: protobuf_benchmark_service::PayloadType::Compressable as i32,
             response_size: self.payload_resp_size as i32,
             payload: Some(self.new_payload()),
             fill_username: false,
@@ -360,11 +304,58 @@ impl SimpleClient {
         };
         self.client.unary_call(Request::new(req)).await.and(Ok(()))
     }
+}
 
-    fn new_payload(&self) -> Payload {
-        Payload {
-            r#type: PayloadType::Protobuf as i32,
-            body: vec![0; self.payload_req_size],
+#[derive(Debug, Clone)]
+struct ByteBufClient {
+    client: bytebuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient<Channel>,
+    payload_req_size: usize,
+}
+
+impl ByteBufClient {
+    async fn unary_call(&mut self) -> Result<(), Status> {
+        self.client.unary_call(Request::new(Bytes::from(vec![0u8; self.payload_req_size]))).await?;
+        Ok(())
+    }
+}
+
+async fn blocking_unary(client: Client, histogram: Arc<Mutex<Histogram<u64>>>) {
+    loop {
+        let mut client = client.clone();
+        let mut histogram = histogram.clone();
+        let start = time::Instant::now();
+        if let Ok(_) = (&mut client).unary_call().await {
+            let elapsed = time::Instant::now().duration_since(start);
+            (&mut histogram)
+                .lock()
+                .unwrap()
+                .record(elapsed.as_nanos() as u64)
+                .unwrap();
         }
+    }
+}
+
+async fn poisson_unary(
+    client: Client,
+    distribution: Exp<f64>,
+    histogram: Arc<Mutex<Histogram<u64>>>,
+) {
+    loop {
+        let time_between_rpcs = distribution.sample(&mut thread_rng()) * 1e9;
+        time::sleep(Duration::from_nanos(time_between_rpcs.round() as u64)).await;
+
+        let histogram_copy = histogram.clone();
+        let mut client_copy = client.clone();
+        tokio::spawn(async move {
+            let start = time::Instant::now();
+            if let Ok(_) = client_copy.unary_call().await {
+                let elapsed = time::Instant::now().duration_since(start);
+                histogram_copy
+                    .lock()
+                    .unwrap()
+                    .record(elapsed.as_nanos() as u64)
+                    .unwrap();
+            }
+        });
     }
 }

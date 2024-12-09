@@ -38,7 +38,7 @@ impl Decoder for BytesDecoder {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct BytesCodec {}
 
 impl Codec for BytesCodec {

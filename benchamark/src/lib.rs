@@ -8,9 +8,16 @@ pub mod worker {
     include!(concat!(env!("OUT_DIR"), "/worker_service/grpc.testing.rs"));
 }
 
-pub mod benchmark_service {
+pub mod protobuf_benchmark_service {
     include!(concat!(
         env!("OUT_DIR"),
-        "/benchmark_service/simple/grpc.testing.rs"
+        "/benchmark_service/protobuf/grpc.testing.rs"
+    ));
+}
+
+pub mod bytebuf_benchmark_service {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/bytebuf.grpc.testing.BenchmarkService.rs"
     ));
 }
