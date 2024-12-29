@@ -27,6 +27,6 @@ members = [
   "tests/use_arc_self",
   "tests/default_stubs",
   "tests/deprecated_methods",
-  "tests/skip_debug", "benchamark",
+  "tests/skip_debug", "benchmark",
 ]
 resolver = "2"

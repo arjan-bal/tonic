@@ -4,6 +4,12 @@ use tonic::{
     Status,
 };
 
+#[derive(Debug, Copy, Clone)]
+pub enum PayloadType {
+    ByteBuf,
+    Protobuf,
+}
+
 #[derive(Debug)]
 pub struct BytesEncoder {}
 

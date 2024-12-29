@@ -19,6 +19,7 @@ hdrhistogram = "7.5.4"
 bytes = "1.9.0"
 rand = "0.8.5"
 nix = { version = "0.29.0", features = ["resource"] }
+tokio-util = "0.7.13"
 
 [build-dependencies]
 tonic-build = {path = "../tonic-build", features = ["prost"]}

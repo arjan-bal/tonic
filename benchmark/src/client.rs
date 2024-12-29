@@ -1,7 +1,6 @@
 use std::{
-    str::FromStr,
+    env,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
     usize,
 };
 
@@ -11,16 +10,16 @@ use nix::sys::{
     resource::{getrusage, Usage, UsageWho},
     time::TimeValLike,
 };
-use rand::thread_rng;
 use rand_distr::{Distribution, Exp};
-use tokio::{runtime::Runtime, time};
+use tokio_util::sync::CancellationToken;
 use tonic::{
-    transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Uri},
-    Code, Request, Status,
+    transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
+    Request, Status,
 };
 
 use crate::{
     bytebuf_benchmark_service,
+    common::PayloadType,
     protobuf_benchmark_service::{self, Payload, SimpleRequest},
     worker::{
         self,
@@ -32,26 +31,12 @@ use crate::{
 pub struct BenchmarkClient {
     histograms: Vec<Arc<Mutex<Histogram<u64>>>>,
     histogram_params: HistogramParams,
-    runtime: Option<Runtime>,
-    last_reset_time: Instant,
+    last_reset_time: std::time::Instant,
     last_rusage: Usage,
-}
-
-#[derive(Debug, Copy, Clone)]
-enum PayloadType {
-    ByteBuf,
-    Protobuf,
+    cancellation_token: CancellationToken,
 }
 
 impl BenchmarkClient {
-    pub fn shutdown(&mut self) -> Result<(), Status> {
-        // Dropping the runtime will stop all the futures when they yield.
-        if let Some(runtime) = self.runtime.take() {
-            drop(runtime);
-        }
-        Ok(())
-    }
-
     pub fn start(config: ClientConfig) -> Result<BenchmarkClient, Status> {
         println!("{:?}", config);
         // Parse and validate the config.
@@ -59,14 +44,14 @@ impl BenchmarkClient {
         match config.client_type() {
             worker::ClientType::SyncClient => (),
             worker::ClientType::AsyncClient => (),
-            _ => return Err(Status::new(Code::InvalidArgument, "Invalid client_type")),
+            _ => return Err(Status::invalid_argument("Invalid client_type")),
         };
 
         let payload_type = config
             .payload_config
-            .ok_or(Status::new(Code::InvalidArgument, "payload_config missing"))?
+            .ok_or(Status::invalid_argument("payload_config missing"))?
             .payload
-            .ok_or(Status::new(Code::InvalidArgument, "payload missing"))?;
+            .ok_or(Status::invalid_argument("payload missing"))?;
 
         let (payload_req_size, payload_resp_size, payload_type) = match payload_type {
             BytebufParams(params) => (
@@ -80,18 +65,18 @@ impl BenchmarkClient {
                 PayloadType::Protobuf,
             ),
             _ => {
-                return Err(Status::new(
-                    tonic::Code::InvalidArgument,
-                    format!("unknown payload type: {:?}", payload_type),
-                ))
+                return Err(Status::invalid_argument(format!(
+                    "unknown payload type: {:?}",
+                    payload_type
+                )))
             }
         };
 
         let load = config
             .load_params
-            .ok_or(Status::new(Code::InvalidArgument, "load_params missing"))?
+            .ok_or(Status::invalid_argument("load_params missing"))?
             .load
-            .ok_or(Status::new(Code::InvalidArgument, "load missing"))?;
+            .ok_or(Status::invalid_argument("load missing"))?;
 
         // If set, perform an open loop, if not perform a closed loop. An open
         // loop asynchronously starts RPCs based on random start times derived
@@ -105,69 +90,73 @@ impl BenchmarkClient {
             worker::load_params::Load::ClosedLoop(_) => None,
             worker::load_params::Load::Poisson(poisson_params) => {
                 Some(Exp::new(poisson_params.offered_load).map_err(|err| {
-                    Status::new(
-                        Code::InvalidArgument,
-                        format!(
-                            "failed to create exponential distribution: {}",
-                            err.to_string()
-                        ),
-                    )
+                    Status::invalid_argument(format!(
+                        "failed to create exponential distribution: {}",
+                        err.to_string()
+                    ))
                 })?)
             }
         };
 
         let channel_count = config.client_channels as usize;
-        let histogram_params = config.histogram_params.unwrap();
+        let histogram_params = config
+            .histogram_params
+            .ok_or(Status::invalid_argument("missing histogram_params"))?;
 
         // Check and set security options.
         let tls = if let Some(params) = &config.security_params {
-            Some(if params.use_test_ca {
-                let data_dir =
-                    std::path::PathBuf::from_iter([std::env!("CARGO_MANIFEST_DIR"), "data"]);
+            let tls_config = if params.use_test_ca {
+                let data_path = env::var("DATA_PATH")
+                    .unwrap_or_else(|_| std::env!("CARGO_MANIFEST_DIR").to_string());
+                let data_dir = std::path::PathBuf::from_iter([data_path, "data".to_string()]);
+                println!("Loading TLS certs from {:?}", data_dir);
                 let pem = std::fs::read_to_string(data_dir.join("tls/ca.pem"))?;
                 let ca = Certificate::from_pem(pem);
                 ClientTlsConfig::new()
                     .ca_certificate(ca)
                     .domain_name(params.server_host_override.to_string())
+                    .assume_http2(true)
             } else {
                 ClientTlsConfig::new()
-            })
+            };
+            Some(tls_config)
         } else {
             None
         };
 
         let rpc_count_per_conn = config.outstanding_rpcs_per_channel as usize;
 
-        let thread_count = std::cmp::max(config.async_client_threads as usize, num_cpus::get());
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .thread_name("client-pool")
-            .worker_threads(thread_count)
-            .enable_all()
-            .build()
-            .map_err(|err| Status::new(Code::Internal, err.to_string()))?;
-
         let rpc_type = match config.rpc_type() {
             worker::RpcType::Unary => RpcType::Unary,
             worker::RpcType::Streaming => RpcType::Streaming,
-            _ => return Err(Status::new(Code::InvalidArgument, "invalid rpc_type")),
+            _ => return Err(Status::invalid_argument("invalid rpc_type")),
         };
 
         let num_servers = config.server_targets.len();
         let mut histograms = Vec::with_capacity(channel_count * rpc_count_per_conn);
+        let cancellation_token = CancellationToken::new();
+        let server_targets: Vec<String> = config
+            .server_targets
+            .iter()
+            .map(|s| {
+                if tls.is_some() {
+                    format!("https://{}", s)
+                } else {
+                    format!("http://{}", s)
+                }
+            })
+            .collect();
         for i in 0..channel_count {
-            let uri = Uri::from_str(&config.server_targets[i % num_servers]).map_err(|err| {
-                Status::new(
-                    Code::InvalidArgument,
-                    format!("failed to parse URI: {}", err.to_string()),
-                )
-            })?;
-            let endpoint = Channel::builder(uri);
+            let endpoint =
+                Channel::from_shared(server_targets[i % num_servers].clone()).map_err(|err| {
+                    Status::invalid_argument(format!(
+                        "failed to create channel: {}",
+                        err.to_string()
+                    ))
+                })?;
             let endpoint = if let Some(tls) = tls.as_ref() {
                 endpoint.tls_config(tls.clone()).map_err(|err| {
-                    Status::new(
-                        Code::InvalidArgument,
-                        format!("bad TLS config: {}", err.to_string()),
-                    )
+                    Status::invalid_argument(format!("bad TLS config: {}", err.to_string()))
                 })?
             } else {
                 endpoint
@@ -180,13 +169,10 @@ impl BenchmarkClient {
             for _ in 0..rpc_count_per_conn {
                 let histogram = Histogram::new_with_max(histogram_params.max_possible as u64, 3)
                     .map_err(|err| {
-                        Status::new(
-                            Code::InvalidArgument,
-                            format!(
-                                "failed to build histogram with given max_possible value: {}",
-                                err
-                            ),
-                        )
+                        Status::invalid_argument(format!(
+                            "failed to build histogram with given max_possible value: {}",
+                            err
+                        ))
                     })?;
                 let histogram = Arc::new(Mutex::new(histogram));
                 channel_histograms.push(histogram.clone());
@@ -202,19 +188,20 @@ impl BenchmarkClient {
                 rpc_type: rpc_type.clone(),
                 payload_type,
             };
-            runtime.spawn(perform_rpcs(args));
+            let cloned_token = cancellation_token.clone();
+            tokio::spawn(perform_rpcs(args, cloned_token));
         }
 
         Ok(BenchmarkClient {
             histograms,
             histogram_params,
-            runtime: Some(runtime),
-            last_reset_time: Instant::now(),
+            last_reset_time: std::time::Instant::now(),
+            cancellation_token,
             last_rusage: getrusage(UsageWho::RUSAGE_SELF).map_err(|err| {
-                Status::new(
-                    Code::Internal,
-                    format!("failed to query system resource usage: {}", err.to_string()),
-                )
+                Status::internal(format!(
+                    "failed to query system resource usage: {}",
+                    err.to_string()
+                ))
             })?,
         })
     }
@@ -233,10 +220,10 @@ impl BenchmarkClient {
                 let old = std::mem::replace(&mut *lock, new);
                 drop(lock);
                 aggregated.add(old).map_err(|err| {
-                    Status::new(
-                        Code::Internal,
-                        format!("error while merging histograms: {}", err.to_string()),
-                    )
+                    Status::internal(format!(
+                        "error while merging histograms: {}",
+                        err.to_string()
+                    ))
                 })?;
             }
         } else {
@@ -244,21 +231,21 @@ impl BenchmarkClient {
             for histogram in self.histograms.iter() {
                 let lock = histogram.lock().unwrap();
                 aggregated.add(&*lock).map_err(|err| {
-                    Status::new(
-                        Code::Internal,
-                        format!("error while merging histograms: {}", err.to_string()),
-                    )
+                    Status::internal(format!(
+                        "error while merging histograms: {}",
+                        err.to_string()
+                    ))
                 })?;
             }
         }
 
-        let now = Instant::now();
+        let now = std::time::Instant::now();
         let wall_time_elapsed = now.duration_since(self.last_reset_time);
         let latest_rusage = getrusage(UsageWho::RUSAGE_SELF).map_err(|err| {
-            Status::new(
-                Code::Internal,
-                format!("failed to query system resource usage: {}", err.to_string()),
-            )
+            Status::internal(format!(
+                "failed to query system resource usage: {}",
+                err.to_string()
+            ))
         })?;
         let user_time = latest_rusage.user_time() - self.last_rusage.user_time();
         let system_time = latest_rusage.system_time() - self.last_rusage.system_time();
@@ -283,6 +270,7 @@ impl BenchmarkClient {
                 + aggregated.len() as f64 * mean * mean,
             count: aggregated.len() as f64,
         };
+
         for freq in aggregated.iter_log(1, resolution).skip(1) {
             histogram_data
                 .bucket
@@ -299,13 +287,20 @@ impl BenchmarkClient {
 
         Ok(ClientStats {
             latencies: Some(histogram_data),
-            time_elapsed: wall_time_elapsed.as_nanos() as f64,
-            time_user: user_time.num_nanoseconds() as f64,
-            time_system: system_time.num_nanoseconds() as f64,
+            time_elapsed: wall_time_elapsed.as_nanos() as f64 / 1e9,
+            time_user: user_time.num_nanoseconds() as f64 / 1e9,
+            time_system: system_time.num_nanoseconds() as f64 / 1e9,
             // The following fields are not set by Java and Go.
             request_results: Vec::new(),
             cq_poll_count: 0,
         })
+    }
+}
+
+impl Drop for BenchmarkClient {
+    fn drop(&mut self) {
+        println!("Client is being closed");
+        self.cancellation_token.cancel();
     }
 }
 
@@ -327,24 +322,32 @@ enum RpcType {
     Streaming,
 }
 
-async fn perform_rpcs(args: TestArgs) {
-    let client = Client::new(&args).await;
+async fn perform_rpcs(args: TestArgs, cancellation_token: CancellationToken) {
+    let client = match Client::new(&args).await {
+        Ok(client) => client,
+        Err(err) => {
+            println!("Failed to create client: {:?}", err);
+            return;
+        }
+    };
     match args.rpc_type {
         RpcType::Unary => {
             for i in 0..args.rpc_count_per_conn {
                 let histogram = args.histograms[i].clone();
+                let token_copy = cancellation_token.clone();
                 match &args.distribution {
                     Some(distibution) => {
                         // Open loop.
                         tokio::spawn(poisson_unary(
                             client.clone(),
                             distibution.clone(),
-                            histogram.clone(),
+                            histogram,
+                            token_copy,
                         ));
                     }
                     None => {
                         // Closed loop.
-                        tokio::spawn(blocking_unary(client.clone(), histogram.clone()));
+                        tokio::spawn(blocking_unary(client.clone(), histogram, token_copy));
                     }
                 }
             }
@@ -360,20 +363,19 @@ enum Client {
 }
 
 impl Client {
-    async fn new(args: &TestArgs) -> Self {
-        match args.payload_type {
+    async fn new(args: &TestArgs) -> Result<Self, tonic::transport::Error> {
+        let channel = args.endpoint.connect().await?;
+        Ok(match args.payload_type {
             PayloadType::ByteBuf => Client::ByteBufClient(ByteBufClient{
-               client: bytebuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient::connect(args.endpoint.clone()).await.unwrap(),
+               client: bytebuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient::new(channel),
             payload_req_size: args.payload_req_size,
             }),
             PayloadType::Protobuf => Client::ProtoClient(ProtoClient{
-                client: protobuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient::connect(args.endpoint.clone())
-                .await
-                .unwrap(),
+                client: protobuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient::new(channel),
             payload_req_size: args.payload_req_size,
             payload_resp_size: args.payload_resp_size,
             }),
-        }
+        })
     }
 
     async fn unary_call(&mut self) -> Result<(), Status> {
@@ -432,19 +434,28 @@ impl ByteBufClient {
     }
 }
 
-async fn blocking_unary(client: Client, histogram: Arc<Mutex<Histogram<u64>>>) {
+async fn blocking_unary(
+    client: Client,
+    histogram: Arc<Mutex<Histogram<u64>>>,
+    cancellation_token: CancellationToken,
+) {
+    let mut client = client;
+    let mut histogram = histogram;
     loop {
-        let mut client = client.clone();
-        let mut histogram = histogram.clone();
-        let start = time::Instant::now();
-        if let Ok(_) = (&mut client).unary_call().await {
-            let elapsed = time::Instant::now().duration_since(start);
-            (&mut histogram)
-                .lock()
-                .unwrap()
-                .record(elapsed.as_nanos() as u64)
-                .unwrap();
+        if cancellation_token.is_cancelled() {
+            return;
         }
+        let start = std::time::Instant::now();
+        let res = (&mut client).unary_call().await;
+        if res.is_err() {
+            continue;
+        }
+        let elapsed = std::time::Instant::now().duration_since(start);
+        (&mut histogram)
+            .lock()
+            .unwrap()
+            .record(elapsed.as_nanos() as u64)
+            .expect("Recorded value greater than configured maximum");
     }
 }
 
@@ -452,23 +463,29 @@ async fn poisson_unary(
     client: Client,
     distribution: Exp<f64>,
     histogram: Arc<Mutex<Histogram<u64>>>,
+    cancellation_token: CancellationToken,
 ) {
     loop {
-        let time_between_rpcs = distribution.sample(&mut thread_rng()) * 1e9;
-        time::sleep(Duration::from_nanos(time_between_rpcs.round() as u64)).await;
+        let time_between_rpcs = distribution.sample(&mut rand::thread_rng()) * 1e9;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_nanos(time_between_rpcs.round() as u64)) => {}
+            _ = cancellation_token.cancelled() => {
+                return
+            }
+        }
 
         let histogram_copy = histogram.clone();
         let mut client_copy = client.clone();
-        tokio::spawn(async move {
-            let start = time::Instant::now();
-            if let Ok(_) = client_copy.unary_call().await {
-                let elapsed = time::Instant::now().duration_since(start);
-                histogram_copy
-                    .lock()
-                    .unwrap()
-                    .record(elapsed.as_nanos() as u64)
-                    .unwrap();
-            }
-        });
+        let start = std::time::Instant::now();
+        let res = client_copy.unary_call().await;
+        if res.is_err() {
+            return;
+        }
+        let elapsed = std::time::Instant::now().duration_since(start);
+        histogram_copy
+            .lock()
+            .unwrap()
+            .record(elapsed.as_nanos() as u64)
+            .expect("Recorded value greater than configured maximum");
     }
 }
