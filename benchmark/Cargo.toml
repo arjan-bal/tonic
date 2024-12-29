@@ -14,9 +14,7 @@ tokio-stream = "0.1"
 tonic = {path = "../tonic", features = ["tls-ring"]}
 tower = "0.5"
 async-stream = "0.2"
-rand_distr = "0.4.3"
 hdrhistogram = "7.5.4"
-rand = "0.8.5"
 nix = { version = "0.29.0", features = ["resource"] }
 tokio-util = "0.7.13"
 

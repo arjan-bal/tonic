@@ -9,7 +9,6 @@ use nix::sys::{
     resource::{getrusage, Usage, UsageWho},
     time::TimeValLike,
 };
-use rand_distr::{Distribution, Exp};
 use tokio_util::sync::CancellationToken;
 use tonic::{
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
@@ -72,18 +71,15 @@ impl BenchmarkClient {
         // from a Poisson distribution. A closed loop performs RPCs in a
         // blocking manner, and runs the next RPC after the previous RPC
         // completes and returns.
-        // The time between two events (rpcs) in a Poisson process follows an
-        // exponential distribution with parameter λ, where λ represents the
-        // number of events per unit time for the poisson process.
-        let distribution: Option<Exp<f64>> = match load {
-            worker::load_params::Load::ClosedLoop(_) => None,
-            worker::load_params::Load::Poisson(poisson_params) => {
-                Some(Exp::new(poisson_params.offered_load).map_err(|err| {
-                    Status::invalid_argument(format!(
-                        "failed to create exponential distribution: {}",
-                        err.to_string()
-                    ))
-                })?)
+        match load {
+            worker::load_params::Load::ClosedLoop(_) => {}
+            worker::load_params::Load::Poisson(_) => {
+                // There don't seem to be any test scenarios in the new
+                // framework that use this. It can be implemented if the need
+                // arises in the future.
+                return Err(Status::unimplemented(
+                    "Poisson load generation not supported",
+                ));
             }
         };
 
@@ -169,7 +165,6 @@ impl BenchmarkClient {
             }
             let args = TestArgs {
                 histograms: channel_histograms,
-                distribution: distribution.clone(),
                 payload_req_size,
                 payload_resp_size,
                 endpoint,
@@ -295,7 +290,6 @@ impl Drop for BenchmarkClient {
 #[derive(Debug)]
 struct TestArgs {
     histograms: Vec<Arc<Mutex<Histogram<u64>>>>,
-    distribution: Option<Exp<f64>>,
     payload_req_size: usize,
     payload_resp_size: usize,
     endpoint: Endpoint,
@@ -322,21 +316,7 @@ async fn perform_rpcs(args: TestArgs, cancellation_token: CancellationToken) {
             for i in 0..args.rpc_count_per_conn {
                 let histogram = args.histograms[i].clone();
                 let token_copy = cancellation_token.clone();
-                match &args.distribution {
-                    Some(distibution) => {
-                        // Open loop.
-                        tokio::spawn(poisson_unary(
-                            client.clone(),
-                            distibution.clone(),
-                            histogram,
-                            token_copy,
-                        ));
-                    }
-                    None => {
-                        // Closed loop.
-                        tokio::spawn(blocking_unary(client.clone(), histogram, token_copy));
-                    }
-                }
+                tokio::spawn(blocking_unary(client.clone(), histogram, token_copy));
             }
         }
         RpcType::Streaming => todo!(),
@@ -406,37 +386,6 @@ async fn blocking_unary(
         }
         let elapsed = std::time::Instant::now().duration_since(start);
         (&mut histogram)
-            .lock()
-            .unwrap()
-            .record(elapsed.as_nanos() as u64)
-            .expect("Recorded value greater than configured maximum");
-    }
-}
-
-async fn poisson_unary(
-    client: ProtoClient,
-    distribution: Exp<f64>,
-    histogram: Arc<Mutex<Histogram<u64>>>,
-    cancellation_token: CancellationToken,
-) {
-    loop {
-        let time_between_rpcs = distribution.sample(&mut rand::thread_rng()) * 1e9;
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_nanos(time_between_rpcs.round() as u64)) => {}
-            _ = cancellation_token.cancelled() => {
-                return
-            }
-        }
-
-        let histogram_copy = histogram.clone();
-        let mut client_copy = client.clone();
-        let start = std::time::Instant::now();
-        let res = client_copy.unary_call().await;
-        if res.is_err() {
-            return;
-        }
-        let elapsed = std::time::Instant::now().duration_since(start);
-        histogram_copy
             .lock()
             .unwrap()
             .record(elapsed.as_nanos() as u64)
