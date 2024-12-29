@@ -1,8 +1,4 @@
-use std::{
-    env,
-    sync::{Arc, Mutex},
-    usize,
-};
+use std::sync::{Arc, Mutex};
 
 use hdrhistogram::Histogram;
 use nix::sys::{
@@ -91,7 +87,7 @@ impl BenchmarkClient {
         // Check and set security options.
         let tls = if let Some(params) = &config.security_params {
             let tls_config = if params.use_test_ca {
-                let data_path = env::var("DATA_PATH")
+                let data_path = std::env::var("DATA_PATH")
                     .unwrap_or_else(|_| std::env!("CARGO_MANIFEST_DIR").to_string());
                 let data_dir = std::path::PathBuf::from_iter([data_path, "data".to_string()]);
                 println!("Loading TLS certs from {:?}", data_dir);
@@ -111,9 +107,12 @@ impl BenchmarkClient {
 
         let rpc_count_per_conn = config.outstanding_rpcs_per_channel as usize;
 
-        let rpc_type = match config.rpc_type() {
-            worker::RpcType::Unary => RpcType::Unary,
-            worker::RpcType::Streaming => RpcType::Streaming,
+        match config.rpc_type() {
+            worker::RpcType::Unary => {}
+            worker::RpcType::Streaming => {
+                // TODO: Support streaming RPCs.
+                return Err(Status::unimplemented("streaming RPCs not supported"));
+            }
             _ => return Err(Status::invalid_argument("invalid rpc_type")),
         };
 
@@ -131,6 +130,7 @@ impl BenchmarkClient {
                 }
             })
             .collect();
+
         for i in 0..channel_count {
             let endpoint =
                 Channel::from_shared(server_targets[i % num_servers].clone()).map_err(|err| {
@@ -147,7 +147,7 @@ impl BenchmarkClient {
                 endpoint
             };
 
-            // Create one histogram per client rpc to minimise contention for
+            // Create one histogram per client RPC to minimise contention for
             // the lock. These histograms will be merged when querying stats.
             let mut channel_histograms = Vec::with_capacity(rpc_count_per_conn);
 
@@ -169,7 +169,6 @@ impl BenchmarkClient {
                 payload_resp_size,
                 endpoint,
                 rpc_count_per_conn,
-                rpc_type: rpc_type.clone(),
             };
             let cloned_token = cancellation_token.clone();
             tokio::spawn(perform_rpcs(args, cloned_token));
@@ -294,13 +293,6 @@ struct TestArgs {
     payload_resp_size: usize,
     endpoint: Endpoint,
     rpc_count_per_conn: usize,
-    rpc_type: RpcType,
-}
-
-#[derive(Debug, Clone)]
-enum RpcType {
-    Unary,
-    Streaming,
 }
 
 async fn perform_rpcs(args: TestArgs, cancellation_token: CancellationToken) {
@@ -311,16 +303,11 @@ async fn perform_rpcs(args: TestArgs, cancellation_token: CancellationToken) {
             return;
         }
     };
-    match args.rpc_type {
-        RpcType::Unary => {
-            for i in 0..args.rpc_count_per_conn {
-                let histogram = args.histograms[i].clone();
-                let token_copy = cancellation_token.clone();
-                tokio::spawn(blocking_unary(client.clone(), histogram, token_copy));
-            }
-        }
-        RpcType::Streaming => todo!(),
-    };
+    for i in 0..args.rpc_count_per_conn {
+        let histogram = args.histograms[i].clone();
+        let token_copy = cancellation_token.clone();
+        tokio::spawn(blocking_unary(client.clone(), histogram, token_copy));
+    }
 }
 
 #[derive(Clone, Debug)]

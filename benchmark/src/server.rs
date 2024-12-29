@@ -1,4 +1,4 @@
-use std::{env, pin::Pin};
+use std::pin::Pin;
 
 use nix::sys::{
     resource::{getrusage, Usage, UsageWho},
@@ -36,7 +36,7 @@ impl BenchmarkServer {
         // Parse security config.
         if let Some(securit_params) = config.security_params {
             let tls_config = if securit_params.use_test_ca {
-                let data_path = env::var("DATA_PATH")
+                let data_path = std::env::var("DATA_PATH")
                     .unwrap_or_else(|_| std::env!("CARGO_MANIFEST_DIR").to_string());
                 let data_dir = std::path::PathBuf::from_iter([data_path, "data".to_string()]);
                 println!("Loading TLS certs from {:?}", data_dir);
