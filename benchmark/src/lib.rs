@@ -1,7 +1,6 @@
 #![recursion_limit = "1024"]
 
 pub mod client;
-pub mod common;
 pub mod server;
 
 pub mod worker {
@@ -12,12 +11,5 @@ pub mod protobuf_benchmark_service {
     include!(concat!(
         env!("OUT_DIR"),
         "/benchmark_service/protobuf/grpc.testing.rs"
-    ));
-}
-
-pub mod bytebuf_benchmark_service {
-    include!(concat!(
-        env!("OUT_DIR"),
-        "/bytebuf.grpc.testing.BenchmarkService.rs"
     ));
 }

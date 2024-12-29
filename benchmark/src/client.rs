@@ -4,7 +4,6 @@ use std::{
     usize,
 };
 
-use bytes::Bytes;
 use hdrhistogram::Histogram;
 use nix::sys::{
     resource::{getrusage, Usage, UsageWho},
@@ -18,9 +17,7 @@ use tonic::{
 };
 
 use crate::{
-    bytebuf_benchmark_service,
-    common::PayloadType,
-    protobuf_benchmark_service::{self, Payload, SimpleRequest},
+    protobuf_benchmark_service::{self, Payload, PayloadType, SimpleRequest},
     worker::{
         self,
         payload_config::Payload::{BytebufParams, SimpleParams},
@@ -53,17 +50,9 @@ impl BenchmarkClient {
             .payload
             .ok_or(Status::invalid_argument("payload missing"))?;
 
-        let (payload_req_size, payload_resp_size, payload_type) = match payload_type {
-            BytebufParams(params) => (
-                params.req_size as usize,
-                params.resp_size as usize,
-                PayloadType::ByteBuf,
-            ),
-            SimpleParams(params) => (
-                params.req_size as usize,
-                params.resp_size as usize,
-                PayloadType::Protobuf,
-            ),
+        let (payload_req_size, payload_resp_size) = match payload_type {
+            BytebufParams(_) => return Err(Status::unimplemented("bytebuf codec not implemented")),
+            SimpleParams(params) => (params.req_size as usize, params.resp_size as usize),
             _ => {
                 return Err(Status::invalid_argument(format!(
                     "unknown payload type: {:?}",
@@ -186,7 +175,6 @@ impl BenchmarkClient {
                 endpoint,
                 rpc_count_per_conn,
                 rpc_type: rpc_type.clone(),
-                payload_type,
             };
             let cloned_token = cancellation_token.clone();
             tokio::spawn(perform_rpcs(args, cloned_token));
@@ -313,7 +301,6 @@ struct TestArgs {
     endpoint: Endpoint,
     rpc_count_per_conn: usize,
     rpc_type: RpcType,
-    payload_type: PayloadType,
 }
 
 #[derive(Debug, Clone)]
@@ -323,7 +310,7 @@ enum RpcType {
 }
 
 async fn perform_rpcs(args: TestArgs, cancellation_token: CancellationToken) {
-    let client = match Client::new(&args).await {
+    let client = match ProtoClient::new(&args).await {
         Ok(client) => client,
         Err(err) => {
             println!("Failed to create client: {:?}", err);
@@ -357,36 +344,6 @@ async fn perform_rpcs(args: TestArgs, cancellation_token: CancellationToken) {
 }
 
 #[derive(Clone, Debug)]
-enum Client {
-    ProtoClient(ProtoClient),
-    ByteBufClient(ByteBufClient),
-}
-
-impl Client {
-    async fn new(args: &TestArgs) -> Result<Self, tonic::transport::Error> {
-        let channel = args.endpoint.connect().await?;
-        Ok(match args.payload_type {
-            PayloadType::ByteBuf => Client::ByteBufClient(ByteBufClient{
-               client: bytebuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient::new(channel),
-            payload_req_size: args.payload_req_size,
-            }),
-            PayloadType::Protobuf => Client::ProtoClient(ProtoClient{
-                client: protobuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient::new(channel),
-            payload_req_size: args.payload_req_size,
-            payload_resp_size: args.payload_resp_size,
-            }),
-        })
-    }
-
-    async fn unary_call(&mut self) -> Result<(), Status> {
-        match self {
-            Client::ProtoClient(client) => client.unary_call().await,
-            Client::ByteBufClient(client) => client.unary_call().await,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
 struct ProtoClient {
     client: protobuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient<Channel>,
     payload_req_size: usize,
@@ -394,9 +351,21 @@ struct ProtoClient {
 }
 
 impl ProtoClient {
+    async fn new(args: &TestArgs) -> Result<Self, tonic::transport::Error> {
+        let channel = args.endpoint.connect().await?;
+        Ok(ProtoClient {
+            client:
+                protobuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient::new(
+                    channel,
+                ),
+            payload_req_size: args.payload_req_size,
+            payload_resp_size: args.payload_resp_size,
+        })
+    }
+
     fn new_payload(&self) -> Payload {
         Payload {
-            r#type: PayloadType::Protobuf as i32,
+            r#type: PayloadType::Compressable as i32,
             body: vec![0; self.payload_req_size],
         }
     }
@@ -419,23 +388,8 @@ impl ProtoClient {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ByteBufClient {
-    client: bytebuf_benchmark_service::benchmark_service_client::BenchmarkServiceClient<Channel>,
-    payload_req_size: usize,
-}
-
-impl ByteBufClient {
-    async fn unary_call(&mut self) -> Result<(), Status> {
-        self.client
-            .unary_call(Request::new(Bytes::from(vec![0u8; self.payload_req_size])))
-            .await?;
-        Ok(())
-    }
-}
-
 async fn blocking_unary(
-    client: Client,
+    client: ProtoClient,
     histogram: Arc<Mutex<Histogram<u64>>>,
     cancellation_token: CancellationToken,
 ) {
@@ -460,7 +414,7 @@ async fn blocking_unary(
 }
 
 async fn poisson_unary(
-    client: Client,
+    client: ProtoClient,
     distribution: Exp<f64>,
     histogram: Arc<Mutex<Histogram<u64>>>,
     cancellation_token: CancellationToken,

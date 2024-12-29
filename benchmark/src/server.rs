@@ -12,8 +12,7 @@ use tonic::{
 };
 
 use crate::{
-    common::PayloadType,
-    protobuf_benchmark_service::{Payload, SimpleRequest, SimpleResponse},
+    protobuf_benchmark_service::{Payload, PayloadType, SimpleRequest, SimpleResponse},
     worker::{
         payload_config::Payload::{BytebufParams, ComplexParams, SimpleParams},
         ServerConfig, ServerStats, SimpleProtoParams,
@@ -135,12 +134,12 @@ struct ProtoServer {}
 impl crate::protobuf_benchmark_service::benchmark_service_server::BenchmarkService for ProtoServer {
     async fn unary_call(
         &self,
-        _request: Request<SimpleRequest>,
+        request: Request<SimpleRequest>,
     ) -> Result<Response<SimpleResponse>, Status> {
         Ok(Response::new(SimpleResponse {
             payload: Some(Payload {
-                r#type: PayloadType::Protobuf as i32,
-                body: vec![0; _request.into_inner().response_size as usize],
+                r#type: PayloadType::Compressable as i32,
+                body: vec![0; request.into_inner().response_size as usize],
             }),
             username: String::new(),
             oauth_scope: String::new(),

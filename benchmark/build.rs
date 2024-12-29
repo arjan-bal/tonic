@@ -16,33 +16,13 @@ fn main() {
     let behchmark_service_path = out_dir.join("benchmark_service");
     let _ = std::fs::create_dir(behchmark_service_path.clone());
 
-    let protobuf_copy = behchmark_service_path.join("protobuf");
-    let _ = std::fs::create_dir(protobuf_copy.clone());
+    let protobuf_service_dir = behchmark_service_path.join("protobuf");
+    let _ = std::fs::create_dir(protobuf_service_dir.clone());
     tonic_build::configure()
-        .out_dir(protobuf_copy)
+        .out_dir(protobuf_service_dir)
         .compile_protos(
             &["proto/grpc/testing/benchmark_service.proto"],
             &["proto/grpc/testing/"],
         )
         .unwrap();
-
-    build_bytebuf_codec_service();
-}
-
-fn build_bytebuf_codec_service() {
-    let benchmark_service = tonic_build::manual::Service::builder()
-        .name("BenchmarkService")
-        .package("bytebuf.grpc.testing")
-        .method(
-            tonic_build::manual::Method::builder()
-                .name("unary_call")
-                .route_name("UnaryCall")
-                .input_type("bytes::Bytes")
-                .output_type("bytes::Bytes")
-                .codec_path("crate::common::BytesCodec")
-                .build(),
-        )
-        .build();
-
-    tonic_build::manual::Builder::new().compile(&[benchmark_service]);
 }
