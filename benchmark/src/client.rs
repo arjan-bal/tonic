@@ -5,6 +5,7 @@ use nix::sys::{
     resource::{getrusage, Usage, UsageWho},
     time::TimeValLike,
 };
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tonic::{
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
@@ -12,7 +13,7 @@ use tonic::{
 };
 
 use crate::{
-    protobuf_benchmark_service::{self, Payload, PayloadType, SimpleRequest},
+    protobuf_benchmark_service::{self, Payload, PayloadType, SimpleRequest, SimpleResponse},
     worker::{
         self,
         payload_config::Payload::{BytebufParams, SimpleParams},
@@ -107,12 +108,9 @@ impl BenchmarkClient {
 
         let rpc_count_per_conn = config.outstanding_rpcs_per_channel as usize;
 
-        match config.rpc_type() {
-            worker::RpcType::Unary => {}
-            worker::RpcType::Streaming => {
-                // TODO: Support streaming RPCs.
-                return Err(Status::unimplemented("streaming RPCs not supported"));
-            }
+        let rpc_type = match config.rpc_type() {
+            worker::RpcType::Unary => RPCType::Unary,
+            worker::RpcType::Streaming => RPCType::Streaming,
             _ => return Err(Status::invalid_argument("invalid rpc_type")),
         };
 
@@ -161,7 +159,7 @@ impl BenchmarkClient {
                     })?;
                 let histogram = Arc::new(Mutex::new(histogram));
                 channel_histograms.push(histogram.clone());
-                histograms.push(histogram.clone());
+                histograms.push(histogram);
             }
             let args = TestArgs {
                 histograms: channel_histograms,
@@ -169,6 +167,7 @@ impl BenchmarkClient {
                 payload_resp_size,
                 endpoint,
                 rpc_count_per_conn,
+                rpc_type,
             };
             let cloned_token = cancellation_token.clone();
             tokio::spawn(perform_rpcs(args, cloned_token));
@@ -293,6 +292,7 @@ struct TestArgs {
     payload_resp_size: usize,
     endpoint: Endpoint,
     rpc_count_per_conn: usize,
+    rpc_type: RPCType,
 }
 
 async fn perform_rpcs(args: TestArgs, cancellation_token: CancellationToken) {
@@ -306,7 +306,12 @@ async fn perform_rpcs(args: TestArgs, cancellation_token: CancellationToken) {
     for i in 0..args.rpc_count_per_conn {
         let histogram = args.histograms[i].clone();
         let token_copy = cancellation_token.clone();
-        tokio::spawn(blocking_unary(client.clone(), histogram, token_copy));
+        match args.rpc_type {
+            RPCType::Streaming => {
+                tokio::spawn(blocking_streaming(client.clone(), histogram, token_copy))
+            }
+            RPCType::Unary => tokio::spawn(blocking_unary(client.clone(), histogram, token_copy)),
+        };
     }
 }
 
@@ -339,6 +344,13 @@ impl ProtoClient {
 
     async fn unary_call(&mut self, req: SimpleRequest) -> Result<(), Status> {
         self.client.unary_call(Request::new(req)).await.and(Ok(()))
+    }
+
+    async fn stream(
+        &mut self,
+        req: impl tonic::IntoStreamingRequest<Message = SimpleRequest>,
+    ) -> Result<tonic::Response<tonic::codec::Streaming<SimpleResponse>>, Status> {
+        self.client.streaming_call(req).await
     }
 }
 
@@ -379,4 +391,74 @@ async fn blocking_unary(
             .record(elapsed.as_nanos() as u64)
             .expect("Recorded value greater than configured maximum");
     }
+}
+
+async fn blocking_streaming(
+    client: ProtoClient,
+    histogram: Arc<Mutex<Histogram<u64>>>,
+    cancellation_token: CancellationToken,
+) {
+    let mut client = client;
+    let mut histogram = histogram;
+    let req = SimpleRequest {
+        response_type: protobuf_benchmark_service::PayloadType::Compressable as i32,
+        response_size: client.payload_resp_size as i32,
+        payload: Some(client.new_payload()),
+        fill_username: false,
+        fill_oauth_scope: false,
+        response_compressed: None,
+        response_status: None,
+        expect_compressed: None,
+        fill_server_id: false,
+        fill_grpclb_route_type: false,
+        orca_per_query_report: None,
+    };
+    let (tx, rx) = oneshot::channel::<tonic::Streaming<SimpleResponse>>();
+
+    let outbound = async_stream::stream! {
+        let mut inbound = match rx.await {
+            Err(_) => {
+                println!("Inbound stream sender dropped unexpectedly");
+                return;
+            },
+            Ok(stream) => stream,
+        };
+
+        loop {
+            if cancellation_token.is_cancelled() {
+                println!("Client stream is closed.");
+                return;
+            }
+            let start = std::time::Instant::now();
+            // Perform a single ping-pong.
+            yield req.clone();
+            if let Err(status) = inbound.message().await {
+                println!("Stream failed with status: {:?}", status);
+                return;
+            };
+            let elapsed = std::time::Instant::now().duration_since(start);
+            (&mut histogram)
+                .lock()
+                .unwrap()
+                .record(elapsed.as_nanos() as u64)
+                .expect("Recorded value greater than configured maximum");
+        }
+    };
+
+    let inbound = match client.stream(Request::new(outbound)).await {
+        Ok(resp) => resp.into_inner(),
+        Err(err) => {
+            println!("Failed to create stream: {}", err.message());
+            return;
+        }
+    };
+    if let Err(_) = tx.send(inbound) {
+        println!("Inbound stream receiver dropped unexpectedly.");
+    };
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RPCType {
+    Streaming,
+    Unary,
 }

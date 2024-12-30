@@ -4,7 +4,7 @@ use nix::sys::{
     resource::{getrusage, Usage, UsageWho},
     time::TimeValLike,
 };
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tonic::{
     transport::{Identity, Server, ServerTlsConfig},
@@ -154,9 +154,28 @@ impl crate::protobuf_benchmark_service::benchmark_service_server::BenchmarkServi
 
     async fn streaming_call(
         &self,
-        _request: Request<tonic::Streaming<SimpleRequest>>,
+        request: Request<tonic::Streaming<SimpleRequest>>,
     ) -> Result<Response<Self::StreamingCallStream>, Status> {
-        Err(Status::unimplemented("method unimplemented"))
+        let mut inbound = request.into_inner();
+
+        let output = async_stream::try_stream! {
+            while let Some(simple_request) = inbound.next().await {
+                let request = simple_request?;
+                yield SimpleResponse {
+                    payload: Some(Payload {
+                        r#type: PayloadType::Compressable as i32,
+                        body: vec![0; request.response_size as usize],
+                    }),
+                    username: String::new(),
+                    oauth_scope: String::new(),
+                    server_id: String::new(),
+                    grpclb_route_type: 0,
+                    hostname: String::new(),
+                };
+            }
+        };
+
+        Ok(Response::new(Box::pin(output) as Self::StreamingCallStream))
     }
 
     async fn streaming_from_client(
