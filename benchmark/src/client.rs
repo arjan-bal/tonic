@@ -426,7 +426,6 @@ async fn blocking_streaming(
 
         loop {
             if cancellation_token.is_cancelled() {
-                println!("Client stream is closed.");
                 return;
             }
             let start = std::time::Instant::now();
