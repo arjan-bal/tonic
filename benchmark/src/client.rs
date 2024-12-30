@@ -337,20 +337,7 @@ impl ProtoClient {
         }
     }
 
-    async fn unary_call(&mut self) -> Result<(), Status> {
-        let req = SimpleRequest {
-            response_type: protobuf_benchmark_service::PayloadType::Compressable as i32,
-            response_size: self.payload_resp_size as i32,
-            payload: Some(self.new_payload()),
-            fill_username: false,
-            fill_oauth_scope: false,
-            response_compressed: None,
-            response_status: None,
-            expect_compressed: None,
-            fill_server_id: false,
-            fill_grpclb_route_type: false,
-            orca_per_query_report: None,
-        };
+    async fn unary_call(&mut self, req: SimpleRequest) -> Result<(), Status> {
         self.client.unary_call(Request::new(req)).await.and(Ok(()))
     }
 }
@@ -362,12 +349,26 @@ async fn blocking_unary(
 ) {
     let mut client = client;
     let mut histogram = histogram;
+    let req = SimpleRequest {
+        response_type: protobuf_benchmark_service::PayloadType::Compressable as i32,
+        response_size: client.payload_resp_size as i32,
+        payload: Some(client.new_payload()),
+        fill_username: false,
+        fill_oauth_scope: false,
+        response_compressed: None,
+        response_status: None,
+        expect_compressed: None,
+        fill_server_id: false,
+        fill_grpclb_route_type: false,
+        orca_per_query_report: None,
+    };
+
     loop {
         if cancellation_token.is_cancelled() {
             return;
         }
         let start = std::time::Instant::now();
-        let res = (&mut client).unary_call().await;
+        let res = (&mut client).unary_call(req.clone()).await;
         if res.is_err() {
             continue;
         }

@@ -182,6 +182,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TODO: Figure out a way to set thread count based on client/server
     // configs, possibly by using separate runtimes for the worker and
     // client/server.
+    // Tests run on k8s use specific machine sizes and don't depend on the
+    // clients/servers to restrict their resource usage.
     let core_count = num_cpus::get();
     println!("Creating a runtime with {} threads", core_count);
     let runtime = tokio::runtime::Builder::new_multi_thread()
