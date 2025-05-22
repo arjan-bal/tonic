@@ -82,7 +82,7 @@ impl Target {
     }
 
     /// The port part of the authority.
-    pub fn aythority_port(&self) -> Option<u16> {
+    pub fn authority_port(&self) -> Option<u16> {
         self.url.port()
     }
 
@@ -90,7 +90,7 @@ impl Target {
     /// in the authority.
     pub fn authority_host_port(&self) -> String {
         let host = self.authority_host();
-        let port = self.aythority_port();
+        let port = self.authority_port();
         if let Some(port) = port {
             format!("{}:{}", host, port)
         } else {
@@ -361,7 +361,7 @@ mod test {
             let target: Target = tc.input.parse().unwrap();
             assert_eq!(target.scheme(), tc.want_scheme);
             assert_eq!(target.authority_host(), tc.want_host);
-            assert_eq!(target.aythority_port(), tc.want_port);
+            assert_eq!(target.authority_port(), tc.want_port);
             assert_eq!(target.authority_host_port(), tc.want_host_port);
             assert_eq!(target.path(), tc.want_path);
         }
