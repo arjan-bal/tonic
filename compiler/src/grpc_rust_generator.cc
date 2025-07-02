@@ -241,15 +241,15 @@ static void GenerateMethods(Context &ctx, const Service &service,
     pub async fn $ident$(
         &mut self,
         request: impl tonic::IntoRequest<$request$>,
-    ) -> std::result::Result<tonic::Response<tonic::codec::Streaming<$response$>>, tonic::Status> {
-        self.inner.ready().await.map_err(|e| {
-            tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-        })?;
-        let codec = $codec_name$::default();
-        let path = http::uri::PathAndQuery::from_static("$path$");
-        let mut req = request.into_request();
-        req.extensions_mut().insert(GrpcMethod::new("$service_name$", "$method_name$"));
-        self.inner.server_streaming(req, path, codec).await
+    ) -> std::result::Result<tonic::Response<$response$>, tonic::Status> {
+       self.inner.ready().await.map_err(|e| {
+           tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+       })?;
+       let codec = $codec_name$::default();
+       let path = http::uri::PathAndQuery::from_static("$path$");
+       let mut req = request.into_request();
+       req.extensions_mut().insert(GrpcMethod::new("$service_name$", "$method_name$"));
+       self.inner.unary(req, path, codec).await
     }
     )rs";
 

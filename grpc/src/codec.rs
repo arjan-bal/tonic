@@ -89,9 +89,6 @@ impl<U: Message + Default> Decoder for ProtoDecoder<U> {
     type Error = Status;
 
     fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
-        if !buf.has_remaining() {
-            return Ok(None);
-        }
         let slice = buf.chunk();
         let item = U::parse(&slice).map_err(from_decode_error)?;
         buf.advance(slice.len());
