@@ -28,6 +28,7 @@
 #include <google/protobuf/compiler/rust/context.h>
 #include <google/protobuf/compiler/rust/crate_mapping.h>
 #include <google/protobuf/compiler/rust/naming.h>
+#include <vector>
 
 namespace protobuf = google::protobuf;
 namespace rust = google::protobuf::compiler::rust;
@@ -74,13 +75,29 @@ public:
     }
     std::vector<std::pair<std::string, std::string>> options;
     protobuf::compiler::ParseGeneratorParameter(parameter, &options);
+
+    // Filter out GRPC options.
+    std::vector<std::pair<std::string, std::string>> protobuf_options;
+    rust_grpc_generator::GrpcOpts grpc_opts;
+    for (auto opt : options) {
+      if (opt.first == "message_module_path") {
+        grpc_opts.message_module_path = opt.second;
+      } else {
+        protobuf_options.push_back(opt);
+      }
+    }
+
+    if (grpc_opts.message_module_path.empty()) {
+      grpc_opts.message_module_path = "self";
+    }
+
     // The kernel isn't used by gRPC, it is there to pass Rust protobuf's
     // validation.
-    options.emplace_back("kernel", "upb");
+    protobuf_options.emplace_back("kernel", "upb");
 
     // Copied from protobuf rust's generator.cc.
     absl::StatusOr<rust::Options> opts =
-        rust::Options::Parse(ReconstructParameterList(options));
+        rust::Options::Parse(ReconstructParameterList(protobuf_options));
     if (!opts.ok()) {
       *error = std::string(opts.status().message());
       return false;
@@ -98,11 +115,9 @@ public:
 
     rust::RustGeneratorContext rust_generator_context(
         &files_in_current_crate, &*import_path_to_crate_name);
-    std::vector<std::string> modules;
 
-    modules.emplace_back(rust::RustInternalModuleName(*file));
     rust::Context ctx_without_printer(&*opts, &rust_generator_context, nullptr,
-                                      std::move(modules));
+                                      std::vector<std::string>());
     auto outfile = absl::WrapUnique(
         context->Open(rust_grpc_generator::GetRsGrpcFile(*file)));
     protobuf::io::Printer printer(outfile.get());
@@ -110,7 +125,7 @@ public:
 
     for (int i = 0; i < file->service_count(); ++i) {
       const protobuf::ServiceDescriptor *service = file->service(i);
-      rust_grpc_generator::GenerateService(ctx, service);
+      rust_grpc_generator::GenerateService(ctx, service, grpc_opts);
     }
     return true;
   }

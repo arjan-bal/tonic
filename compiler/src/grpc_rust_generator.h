@@ -25,33 +25,11 @@
 #ifndef NET_GRPC_COMPILER_RUST_GENERATOR_H_
 #define NET_GRPC_COMPILER_RUST_GENERATOR_H_
 
-#include <iostream>
 #include <stdlib.h> // for abort()
 
 #include <google/protobuf/compiler/rust/context.h>
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/io/zero_copy_stream.h>
-
-class LogHelper {
-  std::ostream *os;
-
-public:
-  LogHelper(std::ostream *os) : os(os) {}
-  [[noreturn]] ~LogHelper() {
-    *os << std::endl;
-    ::abort();
-  }
-  std::ostream &get_os() { return *os; }
-};
-
-// Abort the program after logging the message if the given condition is not
-// true. Otherwise, do nothing.
-#define GRPC_CODEGEN_CHECK(x)                                                  \
-  !(x) && LogHelper(&std::cerr).get_os()                                       \
-              << "CHECK FAILED: " << __FILE__ << ":" << __LINE__ << ": "
-
-// Abort the program after logging the message.
-#define GRPC_CODEGEN_FAIL GRPC_CODEGEN_CHECK(false)
 
 namespace rust_grpc_generator {
 
@@ -59,10 +37,18 @@ namespace impl {
 namespace protobuf = google::protobuf;
 } // namespace impl
 
+class GrpcOpts {
+  /// Path the module containing the generated message code. Defaults to
+  /// "self", i.e. the message code and service code is present in the same
+  /// module.
+public:
+  std::string message_module_path;
+};
+
 // Writes the generated service interface into the given ZeroCopyOutputStream
 void GenerateService(
     impl::protobuf::compiler::rust::Context &rust_generator_context,
-    const impl::protobuf::ServiceDescriptor *service);
+    const impl::protobuf::ServiceDescriptor *service, const GrpcOpts &opts);
 
 std::string GetRsGrpcFile(const impl::protobuf::FileDescriptor &file);
 } // namespace rust_grpc_generator

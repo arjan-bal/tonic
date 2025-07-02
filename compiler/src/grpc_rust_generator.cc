@@ -34,7 +34,6 @@
 #include <google/protobuf/io/zero_copy_stream.h>
 #include <google/protobuf/stubs/common.h>
 
-#include <utility>
 #include <vector>
 
 namespace rust_grpc_generator {
@@ -56,6 +55,28 @@ GrpcGetCommentsForDescriptor(const DescriptorType *descriptor) {
                                              : location.leading_comments;
   }
   return std::string();
+}
+
+/// Returns the path of a generated message struct relative to the module in the
+/// generated service code.
+static std::string RsTypePath(Context &ctx,
+                              const absl::string_view &path_within_module,
+                              const GrpcOpts &opts, int depth) {
+  // If the message type is defined in an external crate using the crate
+  // mapping, the path must begin ::. If the message type is in the same
+  // crate, add the relative path to the message module.
+  if (absl::StartsWith(path_within_module, "::")) {
+    return std::string(path_within_module);
+  }
+  std::string prefix = "";
+  for (int i = 0; i < depth; ++i) {
+    prefix += "super::";
+  }
+  std::string path_to_message_module = opts.message_module_path + "::";
+  if (path_to_message_module == "self::") {
+    path_to_message_module = "";
+  }
+  return prefix + path_to_message_module + std::string(path_within_module);
 }
 
 /**
@@ -97,18 +118,25 @@ public:
   bool is_deprecated() const { return method_->options().deprecated(); }
 
   /**
-   * Type name of request and response.
+   * Type name of request.
    * @param proto_path The path to the proto file, for context.
-   * @return A pair of strings representing the generated request and response
-   * type names.
+   * @return A string representing the qualified name for the generated request
+   * struct.
    */
-  std::pair<std::string, std::string>
-  request_response_name(rust::Context &ctx) const {
+  std::string request_name(rust::Context &ctx) const {
     const Descriptor *input = method_->input_type();
+    return rust::RsTypePath(ctx, *input);
+  };
+
+  /**
+   * Type name of response.
+   * @param proto_path The path to the proto file, for context.
+   * @return A string representing the qualified name for the generated response
+   * struct.
+   */
+  std::string response_name(rust::Context &ctx) const {
     const Descriptor *output = method_->output_type();
-    const std::string request_type = rust::RsTypePath(ctx, *input);
-    const std::string response_type = rust::RsTypePath(ctx, *output);
-    return std::make_pair(request_type, response_type);
+    return rust::RsTypePath(ctx, *output);
   };
 };
 
@@ -207,7 +235,8 @@ static void GenerateDeprecated(Context &ctx) { ctx.Emit("#[deprecated]\n"); }
 
 namespace client {
 
-static void GenerateMethods(const Service &service, Context &ctx) {
+static void GenerateMethods(Context &ctx, const Service &service,
+                            const GrpcOpts &opts) {
   static std::string unary_format = R"rs(
     pub async fn $ident$(
         &mut self,
@@ -278,14 +307,16 @@ static void GenerateMethods(const Service &service, Context &ctx) {
     if (method.is_deprecated()) {
       GenerateDeprecated(ctx);
     }
-    std::pair<std::string, std::string> request_response_types =
-        method.request_response_name(ctx);
+    const std::string request_type =
+        RsTypePath(ctx, method.request_name(ctx), opts, 1);
+    const std::string response_type =
+        RsTypePath(ctx, method.response_name(ctx), opts, 1);
     {
       auto vars =
           ctx.printer().WithVars({{"codec_name", "grpc::codec::ProtoCodec"},
                                   {"ident", method.name()},
-                                  {"request", request_response_types.first},
-                                  {"response", request_response_types.second},
+                                  {"request", request_type},
+                                  {"response", response_type},
                                   {"service_name", service.full_name()},
                                   {"path", FormatMethodPath(service, method)},
                                   {"method_name", method.proto_field_name()}});
@@ -308,7 +339,8 @@ static void GenerateMethods(const Service &service, Context &ctx) {
   }
 }
 
-static void generate_client(const Service &service, Context &ctx) {
+static void generate_client(const Service &service, Context &ctx,
+                            const GrpcOpts &opts) {
   std::string service_ident = absl::StrFormat("%sClient", service.name());
   std::string client_mod =
       absl::StrFormat("%s_client", rust::CamelToSnakeCase(service.name()));
@@ -318,7 +350,7 @@ static void generate_client(const Service &service, Context &ctx) {
           {"service_ident", service_ident},
           {"service_doc",
            [&] { ctx.Emit(ProtoCommentToRustDoc(service.comment())); }},
-          {"methods", [&] { GenerateMethods(service, ctx); }},
+          {"methods", [&] { GenerateMethods(ctx, service, opts); }},
       },
       R"rs(
       /// Generated client implementations.
@@ -425,9 +457,11 @@ namespace server {} // namespace server
 // Writes the generated service interface into the given
 // ZeroCopyOutputStream.
 void GenerateService(Context &rust_generator_context,
-                     const ServiceDescriptor *service_desc) {
+                     const ServiceDescriptor *service_desc,
+                     const GrpcOpts &opts) {
   const Service service = Service(service_desc);
-  client::generate_client(service, rust_generator_context);
+
+  client::generate_client(service, rust_generator_context, opts);
 }
 
 std::string GetRsGrpcFile(const protobuf::FileDescriptor &file) {
