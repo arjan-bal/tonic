@@ -153,8 +153,12 @@ jobs:
         path: ${{ runner.temp }}/protoc-plugin
         key: ${{ runner.os }}-protoc-plugin-${{ hashFiles('compiler/src/**', 'compiler/.bazelrc', 'compiler/MODULE.bazel') }}
     - name: Add protoc plugin to PATH
+      shell: bash
       run: |
         echo "${{ runner.temp }}/protoc-plugin" >> $GITHUB_PATH
+    - name: Check protoc plugin to PATH
+      run: |
+        which protoc-gen-rust-grpc
     - uses: Swatinem/rust-cache@v2
     - name: Check features
       run: cargo hack check --workspace --no-private --each-feature --no-dev-deps
