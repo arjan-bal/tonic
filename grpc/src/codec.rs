@@ -1,106 +1,58 @@
-use bytes::{Buf, BufMut};
-use protobuf::Message;
-use std::marker::PhantomData;
+use bytes::{Buf, BufMut, Bytes};
 use tonic::{
-    codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder},
+    codec::{Codec, Decoder, EncodeBuf, Encoder},
     Status,
 };
 
-/// A [`Codec`] that implements `application/grpc+proto` via the protobuf
-/// library.
-#[derive(Debug, Clone)]
-pub struct ProtoCodec<T, U> {
-    _pd: PhantomData<(T, U)>,
-}
+/// An adapter for sending and receiving messages as bytes using tonic.
+/// Coding/decoding is handled within gRPC.
+/// TODO: Remove this when tonic allows access to bytes without requiring a
+/// codec.
+pub(crate) struct BytesCodec {}
 
-impl<T, U> ProtoCodec<T, U> {
-    /// Configure a ProstCodec with encoder/decoder buffer settings. This is used to control
-    /// how memory is allocated and grows per RPC.
-    pub fn new() -> Self {
-        Self { _pd: PhantomData }
-    }
-}
+impl Codec for BytesCodec {
+    type Encode = Bytes;
 
-impl<T, U> Default for ProtoCodec<T, U> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+    type Decode = Bytes;
 
-impl<T, U> Codec for ProtoCodec<T, U>
-where
-    T: Message + Send + 'static,
-    U: Message + Default + Send + 'static,
-{
-    type Encode = T;
-    type Decode = U;
+    type Encoder = BytesEncoder;
 
-    type Encoder = ProtoEncoder<T>;
-    type Decoder = ProtoDecoder<U>;
+    type Decoder = BytesDecoder;
 
     fn encoder(&mut self) -> Self::Encoder {
-        ProtoEncoder { _pd: PhantomData }
+        BytesEncoder {}
     }
 
     fn decoder(&mut self) -> Self::Decoder {
-        ProtoDecoder { _pd: PhantomData }
+        BytesDecoder {}
     }
 }
 
-/// A [`Encoder`] that knows how to encode `T`.
-#[derive(Debug, Clone, Default)]
-pub struct ProtoEncoder<T> {
-    _pd: PhantomData<T>,
-}
+pub struct BytesEncoder {}
 
-impl<T> ProtoEncoder<T> {
-    /// Get a new encoder with explicit buffer settings
-    pub fn new() -> Self {
-        Self { _pd: PhantomData }
-    }
-}
+impl Encoder for BytesEncoder {
+    type Item = Bytes;
 
-impl<T: Message> Encoder for ProtoEncoder<T> {
-    type Item = T;
     type Error = Status;
 
-    fn encode(&mut self, item: Self::Item, buf: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
-        let serialized = item.serialize().map_err(from_decode_error)?;
-        buf.put_slice(&serialized.as_slice());
+    fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+        dst.put_slice(&item);
         Ok(())
     }
 }
 
-/// A [`Decoder`] that knows how to decode `U`.
-#[derive(Debug, Clone, Default)]
-pub struct ProtoDecoder<U> {
-    _pd: PhantomData<U>,
-}
+#[derive(Debug)]
+pub struct BytesDecoder {}
 
-impl<U> ProtoDecoder<U> {
-    /// Get a new decoder.
-    pub fn new() -> Self {
-        Self { _pd: PhantomData }
-    }
-}
+impl Decoder for BytesDecoder {
+    type Item = Bytes;
 
-impl<U: Message + Default> Decoder for ProtoDecoder<U> {
-    type Item = U;
     type Error = Status;
 
-    fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
-        if !buf.has_remaining() {
-            return Ok(None);
-        }
-        let slice = buf.chunk();
-        let item = U::parse(&slice).map_err(from_decode_error)?;
-        buf.advance(slice.len());
-        Ok(Some(item))
+    fn decode(
+        &mut self,
+        src: &mut tonic::codec::DecodeBuf<'_>,
+    ) -> Result<Option<Self::Item>, Self::Error> {
+        Ok(Some(src.copy_to_bytes(src.remaining())))
     }
-}
-
-fn from_decode_error(error: impl std::error::Error) -> tonic::Status {
-    // Map Protobuf parse errors to an INTERNAL status code, as per
-    // https://github.com/grpc/grpc/blob/master/doc/statuscodes.md
-    Status::internal(error.to_string())
 }

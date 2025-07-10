@@ -9,7 +9,7 @@ struct TODO;
 
 pub type Request = TonicRequest<Pin<Box<dyn Stream<Item = Box<dyn Message>> + Send + Sync>>>;
 pub type Response =
-    TonicResponse<Pin<Box<dyn Stream<Item = Result<Box<dyn Message>, Status>> + Send + Sync>>>;
+    TonicResponse<Pin<Box<dyn Stream<Item = Result<Box<dyn Message>, Status>> + Send>>>;
 
 #[async_trait]
 pub trait Service: Send + Sync {
@@ -17,3 +17,5 @@ pub trait Service: Send + Sync {
 }
 
 pub trait Message: Any + Send + Sync {}
+
+impl<T> Message for T where T: Any + Send + Sync {}

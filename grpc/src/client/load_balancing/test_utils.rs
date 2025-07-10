@@ -18,7 +18,7 @@ use tokio::{
 };
 
 pub(crate) struct EmptyMessage {}
-impl Message for EmptyMessage {}
+
 pub(crate) fn new_request() -> Request {
     Request::new(Box::pin(tokio_stream::once(
         Box::new(EmptyMessage {}) as Box<dyn Message>

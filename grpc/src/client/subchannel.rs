@@ -2,11 +2,12 @@ use super::{
     channel::{InternalChannelController, WorkQueueTx},
     load_balancing::{self, ExternalSubchannel, Picker, Subchannel, SubchannelState},
     name_resolution::Address,
-    transport::{self, ConnectedTransport, Transport, TransportRegistry},
+    transport::{self, Transport, TransportRegistry},
     ConnectivityState,
 };
 use crate::{
-    client::{channel::WorkQueueItem, subchannel},
+    client::{channel::WorkQueueItem, subchannel, transport::TransportOptions},
+    rt::tokio::TokioRuntime,
     service::{Request, Response, Service},
 };
 use core::panic;
@@ -18,13 +19,13 @@ use std::{
     sync::{Arc, Mutex, RwLock, Weak},
 };
 use tokio::{
-    sync::{mpsc, watch, Notify},
+    sync::{mpsc, oneshot, watch, Notify},
     task::{AbortHandle, JoinHandle},
     time::{Duration, Instant},
 };
 use tonic::async_trait;
 
-type SharedService = Arc<dyn ConnectedTransport>;
+type SharedService = Arc<dyn Service>;
 
 pub trait Backoff: Send + Sync {
     fn backoff_until(&self) -> Instant;
@@ -204,7 +205,7 @@ impl Service for InternalSubchannel {
 
 enum SubchannelStateMachineEvent {
     ConnectionRequested,
-    ConnectionSucceeded(SharedService),
+    ConnectionSucceeded(SharedService, oneshot::Receiver<Result<(), String>>),
     ConnectionTimedOut,
     ConnectionFailed(String),
     ConnectionTerminated,
@@ -214,7 +215,7 @@ impl Debug for SubchannelStateMachineEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ConnectionRequested => write!(f, "ConnectionRequested"),
-            Self::ConnectionSucceeded(_) => write!(f, "ConnectionSucceeded"),
+            Self::ConnectionSucceeded(_, _) => write!(f, "ConnectionSucceeded"),
             Self::ConnectionTimedOut => write!(f, "ConnectionTimedOut"),
             Self::ConnectionFailed(_) => write!(f, "ConnectionFailed"),
             Self::ConnectionTerminated => write!(f, "ConnectionTerminated"),
@@ -259,8 +260,8 @@ impl InternalSubchannel {
                     SubchannelStateMachineEvent::ConnectionRequested => {
                         arc_to_self.move_to_connecting();
                     }
-                    SubchannelStateMachineEvent::ConnectionSucceeded(svc) => {
-                        arc_to_self.move_to_ready(svc);
+                    SubchannelStateMachineEvent::ConnectionSucceeded(svc, rx) => {
+                        arc_to_self.move_to_ready(svc, rx);
                     }
                     SubchannelStateMachineEvent::ConnectionTimedOut => {
                         arc_to_self.move_to_transient_failure("connect timeout expired".into());
@@ -345,15 +346,19 @@ impl InternalSubchannel {
         let transport = self.transport.clone();
         let address = self.address().address;
         let state_machine_tx = self.state_machine_event_sender.clone();
+        // TODO: All these options to be configured by users.
+        let transport_opts = TransportOptions::default();
+        // TODO: Plumb the runtime here.
+        let runtime = Arc::new(TokioRuntime {});
         let connect_task = tokio::task::spawn(async move {
             tokio::select! {
                 _ = tokio::time::sleep(min_connect_timeout) => {
                     let _ = state_machine_tx.send(SubchannelStateMachineEvent::ConnectionTimedOut);
                 }
-                result = transport.connect(address.clone()) => {
+                result = transport.connect(address.clone(), runtime.clone(), &transport_opts) => {
                     match result {
                         Ok(s) => {
-                            let _ = state_machine_tx.send(SubchannelStateMachineEvent::ConnectionSucceeded(Arc::from(s)));
+                            let _ = state_machine_tx.send(SubchannelStateMachineEvent::ConnectionSucceeded(Arc::from(s.service), s.disconnection_listener));
                         }
                         Err(e) => {
                             let _ = state_machine_tx.send(SubchannelStateMachineEvent::ConnectionFailed(e));
@@ -368,7 +373,7 @@ impl InternalSubchannel {
         });
     }
 
-    fn move_to_ready(&self, svc: SharedService) {
+    fn move_to_ready(&self, svc: SharedService, closed_rx: oneshot::Receiver<Result<(), String>>) {
         let svc2 = svc.clone();
         {
             let mut inner = self.inner.lock().unwrap();
@@ -388,7 +393,9 @@ impl InternalSubchannel {
             // error string containing information about why the connection
             // terminated? But what can we do with that error other than logging
             // it, which the transport can do as well?
-            svc.disconnected().await;
+            if let Err(e) = closed_rx.await {
+                eprintln!("Transport closed with error: {}", e.to_string())
+            };
             let _ = state_machine_tx.send(SubchannelStateMachineEvent::ConnectionTerminated);
         });
         let mut inner = self.inner.lock().unwrap();

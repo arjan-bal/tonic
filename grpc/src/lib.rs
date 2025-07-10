@@ -33,3 +33,10 @@ pub mod inmemory;
 pub mod rt;
 pub mod server;
 pub mod service;
+#[cfg(test)]
+pub(crate) mod echo_pb {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/generated/grpc_examples_echo.rs"
+    ));
+}

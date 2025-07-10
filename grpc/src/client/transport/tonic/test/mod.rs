@@ -1,18 +1,24 @@
-mod routeguide {
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/generated/routeguide.rs"
-    ));
-}
+use crate::client::transport::tonic::TCP_NETWORK_TYPE;
+use crate::client::transport::GLOBAL_TRANSPORT_REGISTRY;
+use crate::echo_pb::echo_server::{Echo, EchoServer};
+use crate::service::Request as GrpcRequest;
 
-use routeguide::route_guide_server::{RouteGuide, RouteGuideServer};
+use crate::echo_pb::{EchoRequest, EchoResponse};
+use crate::service::Message;
 
-use routeguide::protos::{Feature, Point, PointView, Rectangle, RouteNote, RouteSummary};
-
+use bytes::Bytes;
+use futures::stream;
+use hyper_util::server::conn;
+use prost::Message as ProstMessage;
+use std::any::Any;
+use std::sync::mpsc::TryRecvError;
 use std::{collections::HashMap, hash::Hash, pin::Pin, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
+use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::time::timeout;
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 
+use tonic::async_trait;
 use tonic::{
     codec::ProstCodec,
     transport::{server::Router, Server},
@@ -20,155 +26,163 @@ use tonic::{
 };
 
 use crate::{
-    client::transport::tonic::{SubchannelConfig, TonicTransportBuilder},
-    codec::ProtoCodec,
+    client::transport::tonic::{TonicTransportBuilder, TransportOptions},
     rt::tokio::TokioRuntime,
 };
-use protobuf::proto;
+
+const DEFAULT_TEST_DURATION: Duration = Duration::from_secs(10);
+const DEFAULT_TEST_SHORT_DURATION: Duration = Duration::from_millis(10);
 
 #[tokio::test]
-pub async fn test_rpc() {
+pub async fn tonic_transport_rpc() {
+    super::reg();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap(); // get the assigned address
-    println!("RouteGuideServer listening on: {}", addr);
-    let handle = tokio::spawn(async {
-        let route_guide = RouteGuideService {};
-
-        let svc = RouteGuideServer::new(route_guide);
-
+    let shutdown_notify = Arc::new(Notify::new());
+    let shutdown_notify_copy = shutdown_notify.clone();
+    println!("EchoServer listening on: {}", addr);
+    let server_handle = tokio::spawn(async move {
+        let echo_server = EchoService {};
+        let svc = EchoServer::new(echo_server);
         let _ = Server::builder()
             .add_service(svc)
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                shutdown_notify_copy.notified(),
+            )
             .await;
     });
 
-    let builder = TonicTransportBuilder {};
-    let config = Arc::new(SubchannelConfig {
-        address: addr.to_string(),
-        runtime: Arc::new(TokioRuntime {}),
-        init_stream_window_size: None,
-        init_connection_window_size: None,
-        http2_keep_alive_interval: None,
-        http2_keep_alive_timeout: None,
-        http2_keep_alive_while_idle: None,
-        http2_max_header_list_size: None,
-        http2_adaptive_window: None,
-        concurrency_limit: Some(10),
-        rate_limit: None,
-        tcp_keepalive: Some(Duration::from_secs(60)),
-        tcp_nodelay: false,
-        connect_timeout: Some(Duration::from_secs(60)),
+    let builder = GLOBAL_TRANSPORT_REGISTRY
+        .get_transport(TCP_NETWORK_TYPE)
+        .unwrap();
+    let config = Arc::new(TransportOptions::default());
+    let mut connected_transport = builder
+        .connect(addr.to_string(), Arc::new(TokioRuntime {}), &config)
+        .await
+        .unwrap();
+    let conn = connected_transport.service;
+
+    let (tx, rx) = mpsc::channel::<Box<dyn Message>>(1);
+
+    // Convert the mpsc receiver into a Stream
+    let outbound: GrpcRequest =
+        Request::new(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)));
+
+    let mut inbound = conn
+        .call(
+            "/grpc.examples.echo.Echo/BidirectionalStreamingEcho".to_string(),
+            outbound,
+        )
+        .await
+        .into_inner();
+
+    // Spawn a sender task
+    let client_handle = tokio::spawn(async move {
+        for i in 0..5 {
+            let message = format!("message {}", i);
+            let request = EchoRequest {
+                message: message.clone(),
+            };
+
+            let bytes = Bytes::from(request.encode_to_vec());
+
+            println!("Sent request: {:?}", request);
+            if let Err(_) = tx.send(Box::new(bytes)).await {
+                panic!("Receiver dropped");
+            }
+
+            // Wait for the reply
+            match inbound.next().await {
+                Some(Ok(resp)) => {
+                    let bytes = (resp as Box<dyn Any>).downcast::<Bytes>().unwrap();
+                    let echo_reponse = EchoResponse::decode(bytes).unwrap();
+                    println!("Got response: {:?}", echo_reponse);
+                    assert_eq!(echo_reponse.message, message);
+                }
+                Some(Err(status)) => {
+                    panic!("Error from server: {:?}", status);
+                }
+                None => {
+                    panic!("Server closed the stream");
+                }
+            }
+        }
     });
-    let mut conn = builder.connect(config.clone()).await.unwrap();
-    let outbound = tokio_stream::once(proto! {RouteNote {
-         location: Point {
-            latitude: 12,
-            longitude: 13,
-        },
-        message: "Note 1".to_string(),
-    }});
-    let mut inbound: tonic::Streaming<RouteNote> = conn
-        .call(
-            "/routeguide.RouteGuide/RouteChat".to_string(),
-            Request::new(outbound),
-            ProtoCodec::default(),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-    while let Some(note) = inbound.message().await.unwrap() {
-        println!("NOTE = {note:?}");
-    }
 
-    let outbound = tokio_stream::once(proto! {Point {
-        latitude: 12,
-        longitude: 13,
-    }});
-    let mut inbound: tonic::Streaming<Feature> = conn
-        .call(
-            "/routeguide.RouteGuide/GetFeature".to_string(),
-            Request::new(outbound),
-            ProtoCodec::default(),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-    while let Some(feature) = inbound.message().await.unwrap() {
-        println!("Feature = {feature:?}");
-    }
-
-    handle.abort();
+    client_handle.await.unwrap();
+    // The connection should break only after the server is stopped.
+    assert_eq!(
+        connected_transport.disconnection_listener.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty),
+    );
+    shutdown_notify.notify_waiters();
+    let res = timeout(
+        DEFAULT_TEST_DURATION,
+        connected_transport.disconnection_listener,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(res, Ok(()));
+    server_handle.await.unwrap();
 }
 
 #[derive(Debug)]
-pub struct RouteGuideService {}
+pub struct EchoService {}
 
-#[tonic::async_trait]
-impl RouteGuide for RouteGuideService {
-    async fn get_feature(&self, request: Request<Point>) -> Result<Response<Feature>, Status> {
-        println!("GetFeature = {:?}", request);
-        let mut resp = Feature::default();
-        resp.set_name("some feature".to_string());
-        Ok(Response::new(resp))
-    }
-
-    type ListFeaturesStream = ReceiverStream<Result<Feature, Status>>;
-
-    async fn list_features(
+#[async_trait]
+impl Echo for EchoService {
+    /// UnaryEcho is unary echo.
+    async fn unary_echo(
         &self,
-        request: Request<Rectangle>,
-    ) -> Result<Response<Self::ListFeaturesStream>, Status> {
-        Err(Status::unimplemented("This method is not implemented"))
+        request: tonic::Request<EchoRequest>,
+    ) -> std::result::Result<tonic::Response<EchoResponse>, tonic::Status> {
+        unimplemented!()
     }
+    /// Server streaming response type for the ServerStreamingEcho method.
+    type ServerStreamingEchoStream = ReceiverStream<Result<EchoResponse, Status>>;
 
-    async fn record_route(
+    /// ServerStreamingEcho is server side streaming.
+    async fn server_streaming_echo(
         &self,
-        request: Request<tonic::Streaming<Point>>,
-    ) -> Result<Response<RouteSummary>, Status> {
-        Err(Status::unimplemented("This method is not implemented"))
+        request: tonic::Request<EchoRequest>,
+    ) -> std::result::Result<tonic::Response<Self::ServerStreamingEchoStream>, tonic::Status> {
+        unimplemented!()
     }
-
-    type RouteChatStream = Pin<Box<dyn Stream<Item = Result<RouteNote, Status>> + Send + 'static>>;
-
-    async fn route_chat(
+    /// ClientStreamingEcho is client side streaming.
+    async fn client_streaming_echo(
         &self,
-        request: Request<tonic::Streaming<RouteNote>>,
-    ) -> Result<Response<Self::RouteChatStream>, Status> {
-        println!("RouteChat");
+        request: tonic::Request<tonic::Streaming<EchoRequest>>,
+    ) -> std::result::Result<tonic::Response<EchoResponse>, tonic::Status> {
+        unimplemented!()
+    }
+    /// Server streaming response type for the BidirectionalStreamingEcho method.
+    type BidirectionalStreamingEchoStream =
+        Pin<Box<dyn Stream<Item = Result<EchoResponse, Status>> + Send + 'static>>;
 
-        let mut notes = HashMap::new();
-        let mut stream = request.into_inner();
+    /// BidirectionalStreamingEcho is bidi streaming.
+    async fn bidirectional_streaming_echo(
+        &self,
+        request: tonic::Request<tonic::Streaming<EchoRequest>>,
+    ) -> std::result::Result<tonic::Response<Self::BidirectionalStreamingEchoStream>, tonic::Status>
+    {
+        let mut inbound = request.into_inner();
 
-        let output = async_stream::try_stream! {
-            while let Some(note) = stream.next().await {
-                let note = note?;
-
-                let location = note.location().to_owned();
-
-                let location_notes = notes.entry(location).or_insert(vec![]);
-                location_notes.push(note);
-
-                for note in location_notes {
-                    yield note.clone();
-                }
+        // Map each request to a corresponding EchoResponse
+        let outbound = async_stream::try_stream! {
+            while let Some(req) = inbound.next().await {
+                let req = req?; // Return Err(Status) if stream item is error
+                let reply = EchoResponse {
+                    message: req.message.clone(),
+                };
+                yield reply;
             }
+            println!("Server closing stream");
         };
 
-        Ok(Response::new(Box::pin(output) as Self::RouteChatStream))
-    }
-}
-
-impl PartialEq for Point {
-    fn eq(&self, other: &Self) -> bool {
-        self.latitude() == other.latitude() && self.longitude() == other.longitude()
-    }
-}
-
-impl Eq for Point {}
-
-impl Hash for Point {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.latitude().hash(state);
-        self.longitude().hash(state);
+        Ok(Response::new(
+            Box::pin(outbound) as Self::BidirectionalStreamingEchoStream
+        ))
     }
 }
