@@ -8,6 +8,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Instant,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -59,16 +60,19 @@ impl Timer for HyperCompatTimer {
         Box::pin(HyperCompatSleep { inner: sleep })
     }
 
-    fn sleep_until(&self, deadline: std::time::Instant) -> Pin<Box<dyn hyper::rt::Sleep>> {
-        let now = std::time::Instant::now();
+    fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        let now = Instant::now();
         let duration = deadline.saturating_duration_since(now);
         self.sleep(duration)
     }
 }
 
+// The following adapters are copied from hyper:
+// https://github.com/hyperium/hyper/blob/v1.6.0/benches/support/tokiort.rs
+
 pin_project! {
-/// A wrapper to make any `TcpStream` compatible with Hyper. It implements
-/// Tokio's async IO traits. Callers are expected to use
+    /// A wrapper to make any `TcpStream` compatible with Hyper. It implements
+    /// Tokio's async IO traits.
     pub(crate) struct HyperStream {
         #[pin]
         inner: Box<dyn TcpStream>,
@@ -76,7 +80,7 @@ pin_project! {
 }
 
 impl HyperStream {
-    /// Creates a new `HyperStream` from a type implementing `MyTcpStream`.
+    /// Creates a new `HyperStream` from a type implementing `TcpStream`.
     pub fn new(stream: Box<dyn TcpStream>) -> Self {
         Self { inner: stream }
     }
@@ -116,7 +120,7 @@ impl hyper::rt::Read for HyperStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         mut buf: hyper::rt::ReadBufCursor<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+    ) -> Poll<Result<(), io::Error>> {
         let n = unsafe {
             let mut tbuf = tokio::io::ReadBuf::uninit(buf.as_mut());
             match tokio::io::AsyncRead::poll_read(self.project().inner, cx, &mut tbuf) {
@@ -137,30 +141,27 @@ impl hyper::rt::Write for HyperStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        tokio::io::AsyncWrite::poll_write(self.project().inner, cx, buf)
+    ) -> Poll<Result<usize, io::Error>> {
+        AsyncWrite::poll_write(self.project().inner, cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        tokio::io::AsyncWrite::poll_flush(self.project().inner, cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        AsyncWrite::poll_flush(self.project().inner, cx)
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        tokio::io::AsyncWrite::poll_shutdown(self.project().inner, cx)
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        AsyncWrite::poll_shutdown(self.project().inner, cx)
     }
 
     fn is_write_vectored(&self) -> bool {
-        tokio::io::AsyncWrite::is_write_vectored(&self.inner)
+        AsyncWrite::is_write_vectored(&self.inner)
     }
 
     fn poll_write_vectored(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        tokio::io::AsyncWrite::poll_write_vectored(self.project().inner, cx, bufs)
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<Result<usize, io::Error>> {
+        AsyncWrite::poll_write_vectored(self.project().inner, cx, bufs)
     }
 }

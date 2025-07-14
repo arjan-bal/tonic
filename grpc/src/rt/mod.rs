@@ -21,7 +21,7 @@ use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 use ::tokio::io::{AsyncRead, AsyncWrite};
 
 pub(crate) mod hyper_wrapper;
-pub mod tokio;
+pub(crate) mod tokio;
 
 /// An abstraction over an asynchronous runtime.
 ///
@@ -30,7 +30,7 @@ pub mod tokio;
 /// time-based operations such as sleeping. It provides a uniform interface
 /// that can be implemented for various async runtimes, enabling pluggable
 /// and testable infrastructure.
-pub trait Runtime: Send + Sync {
+pub(crate) trait Runtime: Send + Sync {
     /// Spawns the given asynchronous task to run in the background.
     fn spawn(
         &self,
@@ -43,8 +43,10 @@ pub trait Runtime: Send + Sync {
     fn get_dns_resolver(&self, opts: ResolverOptions) -> Result<Box<dyn DnsResolver>, String>;
 
     /// Returns a future that completes after the specified duration.
-    fn sleep(&self, duration: std::time::Duration) -> Pin<Box<dyn Sleep>>;
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Sleep>>;
 
+    /// Establishes a TCP connection to the given `target` address with the
+    /// specified `opts`.
     fn tcp_stream(
         &self,
         target: SocketAddr,
@@ -52,15 +54,15 @@ pub trait Runtime: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn TcpStream>, String>> + Send>>;
 }
 
-pub trait Sleep: Send + Sync + Future<Output = ()> {}
+pub(crate) trait Sleep: Send + Sync + Future<Output = ()> {}
 
-pub trait TaskHandle: Send + Sync {
+pub(crate) trait TaskHandle: Send + Sync {
     /// Abort the associated task.
     fn abort(&self);
 }
 
 #[tonic::async_trait]
-pub trait DnsResolver: Send + Sync {
+pub(crate) trait DnsResolver: Send + Sync {
     /// Resolve an address
     async fn lookup_host_name(&self, name: &str) -> Result<Vec<std::net::IpAddr>, String>;
     /// Perform a TXT record lookup. If a txt record contains multiple strings,
@@ -69,16 +71,16 @@ pub trait DnsResolver: Send + Sync {
 }
 
 #[derive(Default)]
-pub struct ResolverOptions {
+pub(crate) struct ResolverOptions {
     /// The address of the DNS server in "IP:port" format. If None, the
     /// system's default DNS server will be used.
-    pub server_addr: Option<std::net::SocketAddr>,
+    pub(crate) server_addr: Option<std::net::SocketAddr>,
 }
 
 #[derive(Default)]
-pub struct TcpOptions {
-    pub enable_nodelay: bool,
-    pub keepalive: Option<Duration>,
+pub(crate) struct TcpOptions {
+    pub(crate) enable_nodelay: bool,
+    pub(crate) keepalive: Option<Duration>,
 }
 
-pub trait TcpStream: AsyncRead + AsyncWrite + Send + Unpin {}
+pub(crate) trait TcpStream: AsyncRead + AsyncWrite + Send + Unpin {}

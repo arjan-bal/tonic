@@ -25,14 +25,12 @@ use tonic::{
     Request, Response, Status,
 };
 
-use crate::{
-    client::transport::tonic::{TonicTransportBuilder, TransportOptions},
-    rt::tokio::TokioRuntime,
-};
+use crate::{client::transport::TransportOptions, rt::tokio::TokioRuntime};
 
 const DEFAULT_TEST_DURATION: Duration = Duration::from_secs(10);
 const DEFAULT_TEST_SHORT_DURATION: Duration = Duration::from_millis(10);
 
+// Tests the tonic transport by creating a bi-di stream with a tonic server.
 #[tokio::test]
 pub async fn tonic_transport_rpc() {
     super::reg();
@@ -133,35 +131,31 @@ pub struct EchoService {}
 
 #[async_trait]
 impl Echo for EchoService {
-    /// UnaryEcho is unary echo.
     async fn unary_echo(
         &self,
         request: tonic::Request<EchoRequest>,
     ) -> std::result::Result<tonic::Response<EchoResponse>, tonic::Status> {
         unimplemented!()
     }
-    /// Server streaming response type for the ServerStreamingEcho method.
+
     type ServerStreamingEchoStream = ReceiverStream<Result<EchoResponse, Status>>;
 
-    /// ServerStreamingEcho is server side streaming.
     async fn server_streaming_echo(
         &self,
         request: tonic::Request<EchoRequest>,
     ) -> std::result::Result<tonic::Response<Self::ServerStreamingEchoStream>, tonic::Status> {
         unimplemented!()
     }
-    /// ClientStreamingEcho is client side streaming.
+
     async fn client_streaming_echo(
         &self,
         request: tonic::Request<tonic::Streaming<EchoRequest>>,
     ) -> std::result::Result<tonic::Response<EchoResponse>, tonic::Status> {
         unimplemented!()
     }
-    /// Server streaming response type for the BidirectionalStreamingEcho method.
     type BidirectionalStreamingEchoStream =
         Pin<Box<dyn Stream<Item = Result<EchoResponse, Status>> + Send + 'static>>;
 
-    /// BidirectionalStreamingEcho is bidi streaming.
     async fn bidirectional_streaming_echo(
         &self,
         request: tonic::Request<tonic::Streaming<EchoRequest>>,

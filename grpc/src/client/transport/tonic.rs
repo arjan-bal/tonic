@@ -2,18 +2,21 @@ use crate::client::transport::ConnectedTransport;
 use crate::client::transport::Transport;
 use crate::client::transport::TransportOptions;
 use crate::codec::BytesCodec;
+use crate::rt::TcpOptions;
 use crate::service::Message;
 use crate::service::Request as GrpcRequest;
 use crate::service::Response as GrpcResponse;
 use bytes::Bytes;
-use futures::stream::BoxStream;
 use futures::stream::{self, StreamExt};
 use futures::Stream;
+use http::uri::PathAndQuery;
+use http::Request as HttpRequest;
+use http::Response as HttpResponse;
 use http::Uri;
+use hyper::client::conn::http2::SendRequest;
 use hyper::{client::conn::http2::Builder, rt::Executor};
 use std::any::Any;
 use std::{
-    collections::HashMap,
     error::{self, Error},
     future::Future,
     net::SocketAddr,
@@ -28,6 +31,7 @@ use std::{
 };
 use tonic::Request as TonicRequest;
 use tonic::Response as TonicResponse;
+use tonic::Streaming;
 use tower::{
     buffer::{future::ResponseFuture as BufferResponseFuture, Buffer},
     limit::{ConcurrencyLimitLayer, RateLimitLayer},
@@ -67,43 +71,35 @@ type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub(crate) static TCP_NETWORK_TYPE: &str = "tcp";
 
 pub(crate) fn reg() {
-    GLOBAL_TRANSPORT_REGISTRY.add_transport(TCP_NETWORK_TYPE, TonicTransportBuilder {});
+    GLOBAL_TRANSPORT_REGISTRY.add_transport(TCP_NETWORK_TYPE, TransportBuilder {});
 }
 
-struct TonicTransportBuilder {}
+struct TransportBuilder {}
 
-impl TonicTransportBuilder {
-    fn new() -> Self {
-        Self {}
-    }
-}
-
-struct ConnectedTonicTransport {
+struct TonicTransport {
     grpc: Grpc<TonicService>,
     task_handle: Box<dyn rt::TaskHandle>,
 }
 
-impl Drop for ConnectedTonicTransport {
+impl Drop for TonicTransport {
     fn drop(&mut self) {
         self.task_handle.abort();
     }
 }
 
 #[async_trait]
-impl Service for ConnectedTonicTransport {
+impl Service for TonicTransport {
     async fn call(&self, method: String, request: GrpcRequest) -> GrpcResponse {
         let mut grpc = self.grpc.clone();
         if let Err(e) = grpc.ready().await {
-            let err = tonic::Status::unknown(format!("Service was not ready: {}", e.to_string()));
-            let stream = futures::stream::once(async { Err(err) });
-            return tonic::Response::new(Box::pin(stream));
+            let err = Status::unknown(format!("Service was not ready: {}", e.to_string()));
+            return create_error_response(err);
         };
-        let path = if let Ok(p) = http::uri::PathAndQuery::from_maybe_shared(method) {
+        let path = if let Ok(p) = PathAndQuery::from_maybe_shared(method) {
             p
         } else {
-            let err = tonic::Status::internal("Failed to parse path");
-            let stream = futures::stream::once(async { Err(err) });
-            return TonicResponse::new(Box::pin(stream));
+            let err = Status::internal("Failed to parse path");
+            return create_error_response(err);
         };
         let request = convert_request(request);
         let response = grpc.streaming(request, path, BytesCodec {}).await;
@@ -111,9 +107,13 @@ impl Service for ConnectedTonicTransport {
     }
 }
 
-fn convert_request(
-    req: GrpcRequest,
-) -> TonicRequest<Pin<Box<dyn Stream<Item = Bytes> + Send + Sync>>> {
+/// Helper function to create an error response stream.
+fn create_error_response(status: Status) -> GrpcResponse {
+    let stream = futures::stream::once(async { Err(status) });
+    TonicResponse::new(Box::pin(stream))
+}
+
+fn convert_request(req: GrpcRequest) -> TonicRequest<Pin<Box<dyn Stream<Item = Bytes> + Send>>> {
     let (metadata, extensions) = (req.metadata().clone(), req.extensions().clone());
     let stream = req.into_inner();
 
@@ -125,19 +125,19 @@ fn convert_request(
 
             // If it fails, log the error and return None to filter it out.
             Err(_) => {
-                println!("A message could not be downcast to Bytes and was skipped.");
+                eprintln!("A message could not be downcast to Bytes and was skipped.");
                 None
             }
         }
     }));
 
-    let mut new_req = TonicRequest::new(Box::pin(bytes_stream) as _);
+    let mut new_req = TonicRequest::new(bytes_stream as _);
     *new_req.metadata_mut() = metadata;
     *new_req.extensions_mut() = extensions;
     new_req
 }
 
-fn convert_response(res: Result<TonicResponse<tonic::Streaming<Bytes>>, Status>) -> GrpcResponse {
+fn convert_response(res: Result<TonicResponse<Streaming<Bytes>>, Status>) -> GrpcResponse {
     let response = match res {
         Ok(s) => s,
         Err(e) => {
@@ -162,7 +162,7 @@ fn convert_response(res: Result<TonicResponse<tonic::Streaming<Bytes>>, Status>)
 }
 
 #[async_trait]
-impl Transport for TonicTransportBuilder {
+impl Transport for TransportBuilder {
     async fn connect(
         &self,
         address: String,
@@ -200,7 +200,7 @@ impl Transport for TonicTransportBuilder {
         let addr: SocketAddr = SocketAddr::from_str(&address).map_err(|err| err.to_string())?;
         let tcp_stream_fut = runtime.tcp_stream(
             addr,
-            rt::TcpOptions {
+            TcpOptions {
                 enable_nodelay: opts.tcp_nodelay,
                 keepalive: opts.tcp_keepalive,
             },
@@ -230,7 +230,7 @@ impl Transport for TonicTransportBuilder {
                 let _ = tx.send(Ok(()));
             }
         }));
-        let sender = SendRequest::from(sender);
+        let sender = SendRequestWrapper::from(sender);
 
         let service = ServiceBuilder::new()
             .option_layer(opts.concurrency_limit.map(ConcurrencyLimitLayer::new))
@@ -245,7 +245,7 @@ impl Transport for TonicTransportBuilder {
             Uri::from_maybe_shared(format!("http://{}", &address)).map_err(|e| e.to_string())?; // TODO: err msg
         let grpc = Grpc::with_origin(TonicService { inner: service }, uri);
 
-        let service = ConnectedTonicTransport { grpc, task_handle };
+        let service = TonicTransport { grpc, task_handle };
         Ok(ConnectedTransport {
             service: Box::new(service),
             disconnection_listener: rx,
@@ -253,18 +253,18 @@ impl Transport for TonicTransportBuilder {
     }
 }
 
-struct SendRequest {
-    inner: hyper::client::conn::http2::SendRequest<Body>,
+struct SendRequestWrapper {
+    inner: SendRequest<Body>,
 }
 
-impl From<hyper::client::conn::http2::SendRequest<Body>> for SendRequest {
-    fn from(inner: hyper::client::conn::http2::SendRequest<Body>) -> Self {
+impl From<SendRequest<Body>> for SendRequestWrapper {
+    fn from(inner: SendRequest<Body>) -> Self {
         Self { inner }
     }
 }
 
-impl tower::Service<http::Request<Body>> for SendRequest {
-    type Response = http::Response<Body>;
+impl TowerService<HttpRequest<Body>> for SendRequestWrapper {
+    type Response = HttpResponse<Body>;
     type Error = BoxError;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -304,7 +304,7 @@ impl GrpcService<Body> for TonicService {
 ///
 /// This is returned by the `Service::call` on [`Channel`].
 pub struct ResponseFuture {
-    inner: BufferResponseFuture<BoxFuture<'static, Result<http::Response<Body>, BoxError>>>,
+    inner: BufferResponseFuture<BoxFuture<'static, Result<HttpResponse<Body>, BoxError>>>,
 }
 
 impl Future for ResponseFuture {
