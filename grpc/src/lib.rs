@@ -42,6 +42,7 @@ pub mod service;
 pub(crate) mod attributes;
 pub(crate) mod byte_str;
 pub(crate) mod codec;
+pub(crate) mod endpoint;
 #[cfg(test)]
 pub(crate) mod echo_pb {
     include!(concat!(
