@@ -18,107 +18,24 @@ use tonic::async_trait;
 
 use crate::byte_str::ByteStr;
 
-pub(crate) trait ReadHalf: AsyncRead + Send + Unpin {
-    fn set_read_options(&mut self, opts: ReadOptions) -> Result<(), String>;
-}
-
 #[derive(Clone, Default, Debug)]
 pub(crate) struct ReadOptions {
     min_progress_size: Option<u64>,
 }
 
-pub(crate) trait WriteHalf: AsyncWrite + Send + Unpin {}
-
-pub(crate) trait GrpcEndpoint: ReadHalf + WriteHalf {
-    fn split(self: Box<Self>) -> (Box<dyn ReadHalf>, Box<dyn WriteHalf>);
+pub(crate) trait GrpcEndpoint: AsyncRead + AsyncWrite + Send + Unpin {
+    fn set_read_options(&mut self, opts: ReadOptions) -> Result<(), String>;
 }
 
 pub(crate) type BoxGrpcEndpoint = Box<dyn GrpcEndpoint>;
 
-pub(crate) struct TokioReadHalf {
-    inner: tokio::net::tcp::OwnedReadHalf,
-}
-
-impl ReadHalf for TokioReadHalf {
-    fn set_read_options(&mut self, opts: ReadOptions) -> Result<(), String> {
-        if let Some(progress_size) = opts.min_progress_size {
-            self.inner.as_ref().as_fd();
-            // TODO: Set SO_RCVLOWAT.
-        }
-        Ok(())
-    }
-}
-
-impl AsyncRead for TokioReadHalf {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-pub(crate) struct TokioWriteHalf {
-    inner: tokio::net::tcp::OwnedWriteHalf,
-}
-
-impl WriteHalf for TokioWriteHalf {}
-
-impl AsyncWrite for TokioWriteHalf {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-
-    fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-}
-
-impl WriteHalf for TcpStream {}
-
-impl ReadHalf for TcpStream {
+impl GrpcEndpoint for TcpStream {
     fn set_read_options(&mut self, opts: ReadOptions) -> Result<(), String> {
         if let Some(progress_size) = opts.min_progress_size {
             self.as_fd();
             // TODO: Set SO_RCVLOWAT.
         }
         Ok(())
-    }
-}
-
-impl GrpcEndpoint for TcpStream {
-    fn split(self: Box<Self>) -> (Box<dyn ReadHalf>, Box<dyn WriteHalf>) {
-        let (r, w) = self.into_split();
-        let read_half = Box::new(TokioReadHalf { inner: r });
-        let write_half = Box::new(TokioWriteHalf { inner: w });
-        (read_half, write_half)
     }
 }
 
@@ -346,75 +263,9 @@ impl AsyncWrite for TlsStream {
     }
 }
 
-impl WriteHalf for TlsStream {}
-
-impl ReadHalf for TlsStream {
+impl GrpcEndpoint for TlsStream {
     fn set_read_options(&mut self, opts: ReadOptions) -> Result<(), String> {
         self.inner.get_mut().set_read_options(opts)
-    }
-}
-
-impl GrpcEndpoint for TlsStream {
-    fn split(self: Box<Self>) -> (Box<dyn ReadHalf>, Box<dyn WriteHalf>) {
-        let (left, right) = tokio::io::split(self.inner);
-        (
-            Box::new(TlsReadHalf { inner: left }),
-            Box::new(TlsWriteHalf { inner: right }),
-        )
-    }
-}
-
-pub(crate) struct TlsReadHalf {
-    inner: tokio::io::ReadHalf<SslStream<BoxGrpcEndpoint>>,
-}
-
-impl ReadHalf for TlsReadHalf {
-    fn set_read_options(&mut self, opts: ReadOptions) -> Result<(), String> {
-        // TODO: Implement a way to support setting ReadOptions on an SslStream's
-        // ReadHalf. This would probably require implementing our own split
-        // operation that allows getting a mutable reference to the underlying
-        // BoxGrpcEndpoint for delegation.
-        Ok(())
-    }
-}
-
-impl AsyncRead for TlsReadHalf {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-pub(crate) struct TlsWriteHalf {
-    inner: tokio::io::WriteHalf<SslStream<BoxGrpcEndpoint>>,
-}
-
-impl WriteHalf for TlsWriteHalf {}
-
-impl AsyncWrite for TlsWriteHalf {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
