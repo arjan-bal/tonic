@@ -251,6 +251,9 @@ pub(crate) fn new_server_tls_credentials(
         let pkey = PKey::private_key_from_pem(identity.private_key.as_bytes())
             .map_err(|e| e.to_string())?;
         context.set_private_key(&pkey).map_err(|e| e.to_string())?;
+        context
+            .set_alpn_protos(ALPN_H2)
+            .map_err(|e| e.to_string())?;
 
         match &config.request_type {
             TlsClientCertificateRequestType::DontRequestClientCertificate => {
@@ -351,6 +354,35 @@ pub(crate) fn new_server_tls_credentials(
     Ok(ServerTlsCredendials { acceptor })
 }
 
+pub(crate) struct ServerTlsContext {
+    peer_cert_chain: Option<Vec<X509>>,
+}
+
+fn get_full_peer_chain_server_side(stream: &SslStream<BoxGrpcEndpoint>) -> Option<Vec<X509>> {
+    let ssl = stream.ssl();
+    let mut full_chain = Vec::new();
+
+    // 1. Get the Leaf (The Client Identity)
+    // On the server, this is NOT included in peer_cert_chain()
+    if let Some(leaf) = ssl.peer_certificate() {
+        full_chain.push(leaf);
+    } else {
+        // If there is no leaf, there is no chain.
+        return None;
+    }
+
+    // 2. Get the rest of the chain (Intermediates)
+    if let Some(chain_stack) = ssl.peer_cert_chain() {
+        for cert in chain_stack {
+            // We must clone/to_owned because the stack returns references,
+            // but we want an owned Vector.
+            full_chain.push(cert.to_owned());
+        }
+    }
+
+    Some(full_chain)
+}
+
 #[async_trait]
 impl ServerChannelCredentials for ServerTlsCredendials {
     async fn accept(
@@ -360,11 +392,14 @@ impl ServerChannelCredentials for ServerTlsCredendials {
         let tls_stream = tokio_boring::accept(&self.acceptor, source)
             .await
             .map_err(|e| e.to_string())?;
+        let tls_ctx = ServerTlsContext {
+            peer_cert_chain: get_full_peer_chain_server_side(&tls_stream),
+        };
         let auth_info = ConnectionSecurityInfo {
             auth_type: ByteStr::from("tls".to_string()),
             validator: None,
             security_level: SecurityLevel::PrivacyAndIntegrity,
-            connection_security_context: Box::new(()),
+            connection_security_context: Box::new(tls_ctx),
         };
         let ep: BoxGrpcEndpoint = Box::new(TlsStream { inner: tls_stream });
         Ok((ep, auth_info))
