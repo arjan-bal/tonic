@@ -1,8 +1,8 @@
-use std::{any::Any, env, os::fd::AsFd, pin::Pin, sync::Arc};
+use std::{any::Any, env, net::IpAddr, os::fd::AsFd, pin::Pin, sync::Arc};
 
 use boring::{
     pkey::PKey,
-    ssl::{SslConnector, SslMethod, SslVerifyMode},
+    ssl::{NameType, SniError, SslAcceptor, SslConnector, SslContext, SslMethod, SslVerifyMode},
     x509::X509,
 };
 use socket2::SockRef;
@@ -25,6 +25,8 @@ pub(crate) struct ReadOptions {
 
 pub(crate) trait GrpcEndpoint: AsyncRead + AsyncWrite + Send + Unpin {
     fn set_read_options(&mut self, opts: ReadOptions) -> Result<(), String>;
+    fn get_local_address(&self) -> &ByteStr;
+    fn get_peer_address(&self) -> &ByteStr;
 }
 
 pub(crate) type BoxGrpcEndpoint = Box<dyn GrpcEndpoint>;
@@ -36,6 +38,15 @@ impl GrpcEndpoint for TcpStream {
             // TODO: Set SO_RCVLOWAT.
         }
         Ok(())
+    }
+
+    fn get_local_address(&self) -> &ByteStr {
+        // TODO: cache the address when the stream is created.
+        todo!()
+    }
+
+    fn get_peer_address(&self) -> &ByteStr {
+        todo!()
     }
 }
 
@@ -52,6 +63,7 @@ pub(crate) trait ClientChannelCredential: Send {
     fn clone(&self) -> Box<dyn ClientChannelCredential>;
 }
 
+#[async_trait]
 pub(crate) trait ServerChannelCredentials: Send {
     async fn accept(
         &self,
@@ -60,7 +72,7 @@ pub(crate) trait ServerChannelCredentials: Send {
 
     fn protocol_info(&self) -> ProtocolInfo;
 
-    fn clone(&self) -> Box<dyn ClientChannelCredential>;
+    fn clone(&self) -> Box<dyn ServerChannelCredentials>;
 }
 
 #[derive(Clone)]
@@ -189,19 +201,163 @@ impl ClientChannelCredential for ClientTlsCredendials {
     }
 }
 
-impl ServerChannelCredentials for ClientTlsCredendials {
+pub(crate) enum TlsClientCertificateRequestType {
+    DontRequestClientCertificate,
+    RequestClientCertificateButDontVerify,
+    RequestClientCertificateAndVerify { pem_root_certs: ByteStr },
+    RequestAndRequireClientCertificateButDontVerify,
+    RequestAndRequireClientCertificateAndVerify { pem_root_certs: ByteStr },
+}
+
+#[derive(Clone)]
+pub(crate) struct ServerTlsCredendials {
+    acceptor: SslAcceptor,
+}
+
+pub(crate) struct ServerTlsConfig {
+    pub(crate) identities: Vec<PemKeyCertPair>,
+    pub(crate) request_type: TlsClientCertificateRequestType,
+}
+
+pub(crate) fn new_server_tls_credentials(
+    config: &ServerTlsConfig,
+) -> Result<ServerTlsCredendials, String> {
+    if config.identities.len() < 1 {
+        return Err("need at least one server identity.".to_string());
+    }
+    let mut ssl_builder = boring::ssl::SslAcceptor::mozilla_modern(SslMethod::tls_server())
+        .map_err(|e| e.to_string())?;
+    let mut contexts = Vec::new();
+
+    for identity in &config.identities {
+        let mut context =
+            SslContext::builder(SslMethod::tls_server()).map_err(|e| e.to_string())?;
+        let mut chain =
+            X509::stack_from_pem(identity.cert_chain.as_bytes()).map_err(|e| e.to_string())?;
+        if chain.len() == 0 {
+            return Err("empty client cert chain".to_string());
+        }
+        let client_cert = chain.remove(0);
+        context
+            .set_certificate(&client_cert)
+            .map_err(|e| e.to_string())?;
+
+        for intermediate_cert in chain {
+            context
+                .add_extra_chain_cert(intermediate_cert)
+                .map_err(|e| e.to_string())?;
+        }
+
+        let pkey = PKey::private_key_from_pem(identity.private_key.as_bytes())
+            .map_err(|e| e.to_string())?;
+        context.set_private_key(&pkey).map_err(|e| e.to_string())?;
+
+        match &config.request_type {
+            TlsClientCertificateRequestType::DontRequestClientCertificate => {
+                context.set_verify(SslVerifyMode::NONE)
+            }
+            TlsClientCertificateRequestType::RequestClientCertificateButDontVerify => {
+                // Disable cryptographic verification.
+                // By default, OpenSSL attempts to verify the chain against trusted roots
+                // if a cert is presented. We override this to always say "valid".
+                context.set_custom_verify_callback(SslVerifyMode::PEER, |_ssl_ref| {
+                    // Return Ok(()) unconditionally to accept ANY certificate (expired, self-signed, etc.)
+                    Ok(())
+                });
+            }
+            TlsClientCertificateRequestType::RequestClientCertificateAndVerify {
+                pem_root_certs,
+            } => {
+                context.set_verify(SslVerifyMode::PEER);
+                let certs =
+                    X509::stack_from_pem(pem_root_certs.as_bytes()).map_err(|e| e.to_string())?;
+                let store = context.cert_store_mut();
+                for cert in certs {
+                    store.add_cert(cert).map_err(|e| e.to_string())?;
+                }
+            }
+            TlsClientCertificateRequestType::RequestAndRequireClientCertificateButDontVerify => {
+                // Disable cryptographic verification.
+                // By default, OpenSSL attempts to verify the chain against trusted roots
+                // if a cert is presented. We override this to always say "valid".
+                context.set_custom_verify_callback(
+                    SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
+                    |_ssl_ref| {
+                        // Return Ok(()) unconditionally to accept ANY certificate (expired, self-signed, etc.)
+                        Ok(())
+                    },
+                );
+            }
+            TlsClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
+                pem_root_certs,
+            } => {
+                context.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+                let certs =
+                    X509::stack_from_pem(pem_root_certs.as_bytes()).map_err(|e| e.to_string())?;
+                let store = context.cert_store_mut();
+                for cert in certs {
+                    store.add_cert(cert).map_err(|e| e.to_string())?;
+                }
+            }
+        };
+        contexts.push(context.build());
+    }
+
+    ssl_builder.set_servername_callback(move |ssl, _alert| {
+        let Some(requested_name) = ssl.servername(NameType::HOST_NAME) else {
+            if let Some(default_ctx) = contexts.first() {
+                ssl.set_ssl_context(default_ctx)
+                    .map_err(|_| SniError::ALERT_FATAL)?;
+                return Ok(());
+            }
+            return Err(SniError::ALERT_FATAL);
+        };
+
+        // 2. OPTIMIZATION: Parse the IP address ONLY ONCE here.
+        // This creates an Option<IpAddr> that we can reuse in the loop.
+        let parsed_ip = requested_name
+            .parse::<IpAddr>()
+            .ok()
+            .map(|ip| ip.to_string());
+
+        for ctx in &contexts {
+            let Some(cert) = ctx.certificate() else {
+                continue;
+            };
+            let is_match = if let Some(ip) = &parsed_ip {
+                cert.check_ip_asc(ip).unwrap_or(false)
+            } else {
+                // CASE B: It is a Hostname
+                // check_host(name, flags). 0 = default flags.
+                // It returns Ok(_) on match, Err on mismatch.
+                cert.check_host(requested_name).is_ok()
+            };
+
+            if is_match {
+                ssl.set_ssl_context(ctx)
+                    .map_err(|_| SniError::ALERT_FATAL)?;
+                return Ok(());
+            }
+        }
+        // No match found in any context.
+        Err(SniError::ALERT_FATAL)
+    });
+
+    ssl_builder
+        .set_default_verify_paths()
+        .map_err(|e| e.to_string())?;
+    ssl_builder.set_verify(SslVerifyMode::NONE);
+    let acceptor = ssl_builder.build();
+    Ok(ServerTlsCredendials { acceptor })
+}
+
+#[async_trait]
+impl ServerChannelCredentials for ServerTlsCredendials {
     async fn accept(
         &self,
         source: BoxGrpcEndpoint,
     ) -> Result<(BoxGrpcEndpoint, ConnectionSecurityInfo), String> {
-        let mut ssl_builder = boring::ssl::SslAcceptor::mozilla_modern(SslMethod::tls_server())
-            .map_err(|e| e.to_string())?;
-        ssl_builder
-            .set_default_verify_paths()
-            .map_err(|e| e.to_string())?;
-        ssl_builder.set_verify(SslVerifyMode::NONE);
-        let acceptor = ssl_builder.build();
-        let tls_stream = tokio_boring::accept(&acceptor, source)
+        let tls_stream = tokio_boring::accept(&self.acceptor, source)
             .await
             .map_err(|e| e.to_string())?;
         let auth_info = ConnectionSecurityInfo {
@@ -220,7 +376,7 @@ impl ServerChannelCredentials for ClientTlsCredendials {
         }
     }
 
-    fn clone(&self) -> Box<dyn ClientChannelCredential> {
+    fn clone(&self) -> Box<dyn ServerChannelCredentials> {
         Box::new(Clone::clone(self))
     }
 }
@@ -266,6 +422,14 @@ impl AsyncWrite for TlsStream {
 impl GrpcEndpoint for TlsStream {
     fn set_read_options(&mut self, opts: ReadOptions) -> Result<(), String> {
         self.inner.get_mut().set_read_options(opts)
+    }
+
+    fn get_local_address(&self) -> &ByteStr {
+        self.inner.get_ref().get_local_address()
+    }
+
+    fn get_peer_address(&self) -> &ByteStr {
+        self.inner.get_ref().get_peer_address()
     }
 }
 
