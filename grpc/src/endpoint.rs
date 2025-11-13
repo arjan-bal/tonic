@@ -15,6 +15,7 @@ use tokio::{
 };
 use tokio_boring::SslStream;
 use tonic::async_trait;
+use tower::builder;
 
 use crate::byte_str::ByteStr;
 
@@ -225,21 +226,23 @@ pub(crate) fn new_server_tls_credentials(
     if config.identities.len() < 1 {
         return Err("need at least one server identity.".to_string());
     }
-    let mut ssl_builder = boring::ssl::SslAcceptor::mozilla_modern(SslMethod::tls_server())
-        .map_err(|e| e.to_string())?;
     let mut contexts = Vec::new();
+    let mut verify_mode = SslVerifyMode::NONE;
+    let mut bypass_cert_verification = false;
 
     for identity in &config.identities {
         let mut context =
             SslContext::builder(SslMethod::tls_server()).map_err(|e| e.to_string())?;
+        context.set_alpn_select_callback(|_ssl_ref, a| Ok(b"h2"));
+
         let mut chain =
             X509::stack_from_pem(identity.cert_chain.as_bytes()).map_err(|e| e.to_string())?;
         if chain.len() == 0 {
             return Err("empty client cert chain".to_string());
         }
-        let client_cert = chain.remove(0);
+        let server_cert = chain.remove(0);
         context
-            .set_certificate(&client_cert)
+            .set_certificate(&server_cert)
             .map_err(|e| e.to_string())?;
 
         for intermediate_cert in chain {
@@ -251,19 +254,19 @@ pub(crate) fn new_server_tls_credentials(
         let pkey = PKey::private_key_from_pem(identity.private_key.as_bytes())
             .map_err(|e| e.to_string())?;
         context.set_private_key(&pkey).map_err(|e| e.to_string())?;
-        context
-            .set_alpn_protos(ALPN_H2)
-            .map_err(|e| e.to_string())?;
 
         match &config.request_type {
             TlsClientCertificateRequestType::DontRequestClientCertificate => {
-                context.set_verify(SslVerifyMode::NONE)
+                verify_mode = SslVerifyMode::NONE;
+                context.set_verify(verify_mode)
             }
             TlsClientCertificateRequestType::RequestClientCertificateButDontVerify => {
+                verify_mode = SslVerifyMode::PEER;
+                bypass_cert_verification = true;
                 // Disable cryptographic verification.
                 // By default, OpenSSL attempts to verify the chain against trusted roots
                 // if a cert is presented. We override this to always say "valid".
-                context.set_custom_verify_callback(SslVerifyMode::PEER, |_ssl_ref| {
+                context.set_custom_verify_callback(verify_mode, |_ssl_ref| {
                     // Return Ok(()) unconditionally to accept ANY certificate (expired, self-signed, etc.)
                     Ok(())
                 });
@@ -271,7 +274,8 @@ pub(crate) fn new_server_tls_credentials(
             TlsClientCertificateRequestType::RequestClientCertificateAndVerify {
                 pem_root_certs,
             } => {
-                context.set_verify(SslVerifyMode::PEER);
+                verify_mode = SslVerifyMode::PEER;
+                context.set_verify(verify_mode);
                 let certs =
                     X509::stack_from_pem(pem_root_certs.as_bytes()).map_err(|e| e.to_string())?;
                 let store = context.cert_store_mut();
@@ -283,13 +287,12 @@ pub(crate) fn new_server_tls_credentials(
                 // Disable cryptographic verification.
                 // By default, OpenSSL attempts to verify the chain against trusted roots
                 // if a cert is presented. We override this to always say "valid".
-                context.set_custom_verify_callback(
-                    SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
-                    |_ssl_ref| {
-                        // Return Ok(()) unconditionally to accept ANY certificate (expired, self-signed, etc.)
-                        Ok(())
-                    },
-                );
+                verify_mode = SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT;
+                bypass_cert_verification = true;
+                context.set_custom_verify_callback(verify_mode, |_ssl_ref| {
+                    // Return Ok(()) unconditionally to accept ANY certificate (expired, self-signed, etc.)
+                    Ok(())
+                });
             }
             TlsClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
                 pem_root_certs,
@@ -306,6 +309,9 @@ pub(crate) fn new_server_tls_credentials(
         contexts.push(context.build());
     }
 
+    let mut ssl_builder = boring::ssl::SslAcceptor::mozilla_modern(SslMethod::tls_server())
+        .map_err(|e| e.to_string())?;
+
     ssl_builder.set_servername_callback(move |ssl, _alert| {
         let Some(requested_name) = ssl.servername(NameType::HOST_NAME) else {
             if let Some(default_ctx) = contexts.first() {
@@ -315,7 +321,6 @@ pub(crate) fn new_server_tls_credentials(
             }
             return Err(SniError::ALERT_FATAL);
         };
-
         // 2. OPTIMIZATION: Parse the IP address ONLY ONCE here.
         // This creates an Option<IpAddr> that we can reuse in the loop.
         let parsed_ip = requested_name
@@ -333,23 +338,31 @@ pub(crate) fn new_server_tls_credentials(
                 // CASE B: It is a Hostname
                 // check_host(name, flags). 0 = default flags.
                 // It returns Ok(_) on match, Err on mismatch.
-                cert.check_host(requested_name).is_ok()
+                cert.check_host(requested_name).unwrap_or(false)
             };
 
-            if is_match {
-                ssl.set_ssl_context(ctx)
-                    .map_err(|_| SniError::ALERT_FATAL)?;
-                return Ok(());
+            if !is_match {
+                continue;
             }
+            // Switch the Context (Loads certs, keys, CAs).
+            ssl.set_ssl_context(ctx)
+                .map_err(|_| SniError::ALERT_FATAL)?;
+            ssl.set_verify(ctx.verify_mode());
+            if bypass_cert_verification {
+                ssl.set_custom_verify_callback(verify_mode, |_ssl_ref| {
+                    // Return Ok(()) unconditionally to accept ANY certificate (expired, self-signed, etc.)
+                    println!("Verification skipped");
+                    Ok(())
+                });
+            } else {
+                ssl.set_verify(verify_mode);
+            }
+            return Ok(());
         }
         // No match found in any context.
         Err(SniError::ALERT_FATAL)
     });
 
-    ssl_builder
-        .set_default_verify_paths()
-        .map_err(|e| e.to_string())?;
-    ssl_builder.set_verify(SslVerifyMode::NONE);
     let acceptor = ssl_builder.build();
     Ok(ServerTlsCredendials { acceptor })
 }
@@ -474,10 +487,13 @@ mod test {
     use crate::{
         byte_str::ByteStr,
         endpoint::{
-            new_client_tls_credentials, BoxGrpcEndpoint, ClientChannelCredential, ClientTlsConfig,
-            ClientTlsCredendials,
+            new_client_tls_credentials, new_server_tls_credentials, BoxGrpcEndpoint,
+            ClientChannelCredential, ClientTlsConfig, ClientTlsCredendials, PemKeyCertPair,
+            ServerChannelCredentials, ServerTlsConfig, TlsClientCertificateRequestType,
         },
     };
+    use std::{env, fs, path::PathBuf};
+    use tokio::net::{TcpListener, TcpStream};
 
     #[tokio::test]
     pub async fn test_tls() {
@@ -491,5 +507,65 @@ mod test {
             .connect(ByteStr::from("google.com".to_string()), ge)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mtls_handshake() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let base = PathBuf::from(env::var("GRPC_GO_HOME").unwrap()).join("testdata/x509/");
+        let base_copy = base.clone();
+        let server = tokio::spawn(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tx.send(addr).unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+
+            let ca = fs::read(base.join("client_ca_cert.pem")).unwrap();
+            let cert = fs::read(base.join("server1_cert.pem")).unwrap();
+            let key = fs::read(base.join("server1_key.pem")).unwrap();
+
+            let config = ServerTlsConfig {
+                identities: vec![PemKeyCertPair {
+                    private_key: ByteStr::from(String::from_utf8(key).unwrap()),
+                    cert_chain: ByteStr::from(String::from_utf8(cert).unwrap()),
+                }],
+                request_type:
+                    TlsClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
+                        pem_root_certs: ByteStr::from(String::from_utf8(ca).unwrap()),
+                    },
+            };
+            let creds = new_server_tls_credentials(&config).unwrap();
+            let stream = creds.accept(Box::new(stream)).await.unwrap();
+        });
+
+        let client = tokio::spawn(async move {
+            let addr = rx.await.unwrap();
+
+            let socket = TcpStream::connect(addr).await.unwrap();
+
+            let ca = fs::read(base_copy.join("server_ca_cert.pem")).unwrap();
+            let cert = fs::read(base_copy.join("client1_cert.pem")).unwrap();
+            let key = fs::read(base_copy.join("client1_key.pem")).unwrap();
+
+            let config = ClientTlsConfig {
+                pem_root_certs: Some(ByteStr::from(String::from_utf8(ca).unwrap())),
+                identity: Some(PemKeyCertPair {
+                    private_key: ByteStr::from(String::from_utf8(key).unwrap()),
+                    cert_chain: ByteStr::from(String::from_utf8(cert).unwrap()),
+                }),
+            };
+            let creds = new_client_tls_credentials(&config).unwrap();
+            let stream = creds
+                .connect(
+                    ByteStr::from("abc.test.example.com".to_string()),
+                    Box::new(socket),
+                )
+                .await
+                .unwrap();
+        });
+
+        client.await.unwrap();
+        server.await.unwrap();
     }
 }
