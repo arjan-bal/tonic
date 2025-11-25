@@ -11,7 +11,7 @@ use tokio::{
 use tokio_boring::SslStream;
 use tonic::async_trait;
 
-use crate::{attributes::Attributes, byte_str::ByteStr};
+use crate::{attributes::Attributes, byte_str::ByteStr, rt::Runtime};
 
 #[derive(Clone, Default, Debug)]
 #[non_exhaustive]
@@ -80,6 +80,7 @@ pub(crate) trait ClientChannelCredential: Send + Sync {
         authority: &http::uri::Authority,
         source: BoxGrpcEndpoint,
         info: ClientHandshakeInfo,
+        runtime: Arc<dyn Runtime>,
     ) -> Result<(BoxGrpcEndpoint, ClientConnectionSecurityInfo), String>;
 
     //// Provides the ProtocolInfo of this ClientChannelCredential.
@@ -104,6 +105,7 @@ pub(crate) trait ServerChannelCredentials: Send + Sync {
     async fn accept(
         &self,
         source: BoxGrpcEndpoint,
+        runtime: Arc<dyn Runtime>,
     ) -> Result<(BoxGrpcEndpoint, ServerConnectionSecurityInfo), String>;
 
     //// Provides the ProtocolInfo of this ServerChannelCredentials.
@@ -180,7 +182,7 @@ pub(crate) struct ProtocolInfo {
 }
 
 pub(crate) mod tls {
-    use std::{any::Any, borrow::Cow, env, net::IpAddr, pin::Pin};
+    use std::{any::Any, borrow::Cow, env, net::IpAddr, pin::Pin, sync::Arc};
 
     use boring::{
         pkey::PKey,
@@ -201,6 +203,7 @@ pub(crate) mod tls {
             ReadOptions, SecurityLevel, ServerChannelCredentials, ServerConnectionSecurityContext,
             ServerConnectionSecurityInfo,
         },
+        rt::Runtime,
     };
 
     /// Represents a X509 certificate.
@@ -370,6 +373,7 @@ pub(crate) mod tls {
             authority: &http::uri::Authority,
             source: BoxGrpcEndpoint,
             _info: ClientHandshakeInfo,
+            _rt: Arc<dyn Runtime>,
         ) -> Result<(BoxGrpcEndpoint, ClientConnectionSecurityInfo), String> {
             let tls_stream = tokio_boring::connect(
                 self.connector.configure().unwrap(),
@@ -649,6 +653,7 @@ pub(crate) mod tls {
         async fn accept(
             &self,
             source: BoxGrpcEndpoint,
+            _rt: Arc<dyn Runtime>,
         ) -> Result<(BoxGrpcEndpoint, ServerConnectionSecurityInfo), String> {
             let tls_stream = tokio_boring::accept(&self.acceptor, source)
                 .await
@@ -740,6 +745,7 @@ mod test {
             BoxGrpcEndpoint, ClientChannelCredential, ClientHandshakeInfo,
             ServerChannelCredentials,
         },
+        rt,
     };
     use http::uri::Authority;
     use std::{env, fs, path::PathBuf};
@@ -755,7 +761,12 @@ mod test {
         let creds = ClientTlsCredendials::new(&ClientTlsConfig::default()).unwrap();
         let authority: Authority = "google.com".parse().unwrap();
         let authenticated = creds
-            .connect(&authority, ge, ClientHandshakeInfo::default())
+            .connect(
+                &authority,
+                ge,
+                ClientHandshakeInfo::default(),
+                rt::default_runtime(),
+            )
             .await
             .unwrap();
     }
@@ -787,7 +798,10 @@ mod test {
                     },
             };
             let creds = ServerTlsCredendials::new(&config).unwrap();
-            let stream = creds.accept(Box::new(stream)).await.unwrap();
+            let stream = creds
+                .accept(Box::new(stream), rt::default_runtime())
+                .await
+                .unwrap();
         });
 
         let client = tokio::spawn(async move {
@@ -812,6 +826,7 @@ mod test {
                     &"abc.test.example.com".parse().unwrap(),
                     Box::new(socket),
                     ClientHandshakeInfo::default(),
+                    rt::default_runtime(),
                 )
                 .await
                 .unwrap();
