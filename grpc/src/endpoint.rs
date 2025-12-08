@@ -1,8 +1,18 @@
-use std::{any::Any, borrow::Cow, env, net::IpAddr, os::fd::AsFd, pin::Pin, sync::Arc};
+use std::{
+    any::Any,
+    borrow::Cow,
+    env,
+    io::IoSlice,
+    net::IpAddr,
+    os::fd::AsFd,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use http::uri::Authority;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpStream,
@@ -13,28 +23,137 @@ use tonic::async_trait;
 
 use crate::{attributes::Attributes, byte_str::ByteStr, rt::Runtime};
 
-#[derive(Clone, Default, Debug)]
-#[non_exhaustive]
-pub(crate) struct ReadOptions {}
+mod private {
+    pub struct Token;
+}
 
 /// Conn is a generic stream-oriented network connection.
-pub(crate) trait GrpcEndpoint: AsyncRead + AsyncWrite + Send + Unpin {
-    /// Allows configuring how data is read. For example, this could be used to
-    /// set socket options for TCP connections.
-    fn set_read_options(&mut self, opts: ReadOptions) -> Result<(), String>;
+pub(crate) trait GrpcEndpoint: Send + Unpin {
     /// Returns the local address that this stream is bound to.
     fn get_local_address(&self) -> ByteStr;
+
     /// Returns the remote address that this stream is connected to.
     fn get_peer_address(&self) -> ByteStr;
+
+    #[doc(hidden)]
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+        _: private::Token,
+    ) -> Poll<std::io::Result<()>>;
+
+    #[doc(hidden)]
+    fn poll_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        _: private::Token,
+    ) -> Poll<Result<usize, std::io::Error>>;
+
+    #[doc(hidden)]
+    fn poll_flush(
+        &mut self,
+        cx: &mut Context<'_>,
+        _: private::Token,
+    ) -> Poll<Result<(), std::io::Error>>;
+
+    #[doc(hidden)]
+    fn poll_shutdown(
+        &mut self,
+        cx: &mut Context<'_>,
+        _: private::Token,
+    ) -> Poll<Result<(), std::io::Error>>;
+
+    #[doc(hidden)]
+    fn poll_write_vectored(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        token: private::Token,
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let buf = bufs
+            .iter()
+            .find(|b| !b.is_empty())
+            .map_or(&[][..], |b| &**b);
+        self.poll_write(cx, buf, token)
+    }
+
+    #[doc(hidden)]
+    fn is_write_vectored(&self, _: private::Token) -> bool {
+        false
+    }
 }
 
 pub(crate) type BoxGrpcEndpoint = Box<dyn GrpcEndpoint>;
 
-impl GrpcEndpoint for TcpStream {
-    fn set_read_options(&mut self, opts: ReadOptions) -> Result<(), String> {
-        Ok(())
+/// This wrapper is pub(crate). It is the only place authorized to
+/// mint the PrivateToken.
+pub(crate) struct GrpcStreamWrapper {
+    inner: BoxGrpcEndpoint,
+}
+
+impl GrpcStreamWrapper {
+    pub fn new(inner: BoxGrpcEndpoint) -> Self {
+        Self { inner }
     }
 
+    /// Helper to get the token.
+    /// Since we are in the same crate, we can construct it.
+    fn token() -> private::Token {
+        private::Token {}
+    }
+
+    fn get_ref(&self) -> &BoxGrpcEndpoint {
+        &self.inner
+    }
+}
+
+// -------------------------------------------------------------------------
+// 4. Implementing Standard AsyncRead/AsyncWrite for the Wrapper
+// -------------------------------------------------------------------------
+
+impl AsyncRead for GrpcStreamWrapper {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.inner.poll_read(cx, buf, Self::token())
+    }
+}
+
+impl AsyncWrite for GrpcStreamWrapper {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.inner.poll_write(cx, buf, Self::token())
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.inner.poll_flush(cx, Self::token())
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.inner.poll_shutdown(cx, Self::token())
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        self.inner.poll_write_vectored(cx, bufs, Self::token())
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored(Self::token())
+    }
+}
+
+impl GrpcEndpoint for TcpStream {
     fn get_local_address(&self) -> ByteStr {
         // TODO: cache the address when the stream is created.
         todo!()
@@ -42,6 +161,58 @@ impl GrpcEndpoint for TcpStream {
 
     fn get_peer_address(&self) -> ByteStr {
         todo!()
+    }
+
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+        _: private::Token,
+    ) -> Poll<std::io::Result<()>> {
+        let pinned = std::pin::Pin::new(self);
+        AsyncRead::poll_read(pinned, cx, buf)
+    }
+
+    fn poll_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        _: private::Token,
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let pinned = std::pin::Pin::new(self);
+        AsyncWrite::poll_write(pinned, cx, buf)
+    }
+
+    fn poll_flush(
+        &mut self,
+        cx: &mut Context<'_>,
+        _: private::Token,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let pinned = std::pin::Pin::new(self);
+        AsyncWrite::poll_flush(pinned, cx)
+    }
+
+    fn poll_shutdown(
+        &mut self,
+        cx: &mut Context<'_>,
+        _: private::Token,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let pinned = std::pin::Pin::new(self);
+        AsyncWrite::poll_shutdown(pinned, cx)
+    }
+
+    fn poll_write_vectored(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        token: private::Token,
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let pinned = std::pin::Pin::new(self);
+        AsyncWrite::poll_write_vectored(pinned, cx, bufs)
+    }
+
+    fn is_write_vectored(&self, _: private::Token) -> bool {
+        AsyncWrite::is_write_vectored(self)
     }
 }
 
@@ -182,7 +353,16 @@ pub(crate) struct ProtocolInfo {
 }
 
 pub(crate) mod tls {
-    use std::{any::Any, borrow::Cow, env, net::IpAddr, pin::Pin, sync::Arc};
+    use std::{
+        any::Any,
+        borrow::Cow,
+        env,
+        io::IoSlice,
+        net::IpAddr,
+        pin::Pin,
+        sync::Arc,
+        task::{Context, Poll},
+    };
 
     use boring::{
         pkey::PKey,
@@ -191,16 +371,16 @@ pub(crate) mod tls {
         },
         x509::X509,
     };
-    use tokio::io::{AsyncRead, AsyncWrite};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use tokio_boring::SslStream;
     use tonic::async_trait;
 
     use crate::{
         byte_str::ByteStr,
         endpoint::{
-            BoxGrpcEndpoint, ClientChannelCredential, ClientConnectionSecurityContext,
-            ClientConnectionSecurityInfo, ClientHandshakeInfo, GrpcEndpoint, ProtocolInfo,
-            ReadOptions, SecurityLevel, ServerChannelCredentials, ServerConnectionSecurityContext,
+            private, BoxGrpcEndpoint, ClientChannelCredential, ClientConnectionSecurityContext,
+            ClientConnectionSecurityInfo, ClientHandshakeInfo, GrpcEndpoint, GrpcStreamWrapper,
+            ProtocolInfo, SecurityLevel, ServerChannelCredentials, ServerConnectionSecurityContext,
             ServerConnectionSecurityInfo,
         },
         rt::Runtime,
@@ -375,10 +555,11 @@ pub(crate) mod tls {
             _info: ClientHandshakeInfo,
             _rt: Arc<dyn Runtime>,
         ) -> Result<(BoxGrpcEndpoint, ClientConnectionSecurityInfo), String> {
+            let wrapper = GrpcStreamWrapper::new(source);
             let tls_stream = tokio_boring::connect(
                 self.connector.configure().unwrap(),
                 authority.host(),
-                source,
+                wrapper,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -623,7 +804,7 @@ pub(crate) mod tls {
         }
     }
 
-    fn get_full_peer_chain_server_side(stream: &SslStream<BoxGrpcEndpoint>) -> Option<Vec<X509>> {
+    fn get_full_peer_chain_server_side(stream: &SslStream<GrpcStreamWrapper>) -> Option<Vec<X509>> {
         let ssl = stream.ssl();
         let mut full_chain = Vec::new();
 
@@ -655,7 +836,8 @@ pub(crate) mod tls {
             source: BoxGrpcEndpoint,
             _rt: Arc<dyn Runtime>,
         ) -> Result<(BoxGrpcEndpoint, ServerConnectionSecurityInfo), String> {
-            let tls_stream = tokio_boring::accept(&self.acceptor, source)
+            let wrapper = GrpcStreamWrapper::new(source);
+            let tls_stream = tokio_boring::accept(&self.acceptor, wrapper)
                 .await
                 .map_err(|e| e.to_string())?;
             let tls_ctx = ServerSecContext {
@@ -680,54 +862,68 @@ pub(crate) mod tls {
     }
 
     struct TlsStream {
-        inner: SslStream<BoxGrpcEndpoint>,
-    }
-
-    impl AsyncRead for TlsStream {
-        fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            Pin::new(&mut self.inner).poll_read(cx, buf)
-        }
-    }
-
-    impl AsyncWrite for TlsStream {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &[u8],
-        ) -> std::task::Poll<Result<usize, std::io::Error>> {
-            Pin::new(&mut self.inner).poll_write(cx, buf)
-        }
-
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), std::io::Error>> {
-            Pin::new(&mut self.inner).poll_flush(cx)
-        }
-
-        fn poll_shutdown(
-            mut self: Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), std::io::Error>> {
-            Pin::new(&mut self.inner).poll_shutdown(cx)
-        }
+        inner: SslStream<GrpcStreamWrapper>,
     }
 
     impl GrpcEndpoint for TlsStream {
-        fn set_read_options(&mut self, opts: ReadOptions) -> Result<(), String> {
-            self.inner.get_mut().set_read_options(opts)
-        }
-
         fn get_local_address(&self) -> ByteStr {
-            self.inner.get_ref().get_local_address()
+            self.inner.get_ref().get_ref().get_local_address()
         }
 
         fn get_peer_address(&self) -> ByteStr {
-            self.inner.get_ref().get_peer_address()
+            self.inner.get_ref().get_ref().get_peer_address()
+        }
+
+        fn poll_read(
+            &mut self,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+            _: private::Token,
+        ) -> Poll<std::io::Result<()>> {
+            let pinned = Pin::new(&mut self.inner);
+            AsyncRead::poll_read(pinned, cx, buf)
+        }
+
+        fn poll_write(
+            &mut self,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+            _: private::Token,
+        ) -> Poll<Result<usize, std::io::Error>> {
+            let pinned = Pin::new(&mut self.inner);
+            AsyncWrite::poll_write(pinned, cx, buf)
+        }
+
+        fn poll_flush(
+            &mut self,
+            cx: &mut Context<'_>,
+            _: private::Token,
+        ) -> Poll<Result<(), std::io::Error>> {
+            let pinned = Pin::new(&mut self.inner);
+            AsyncWrite::poll_flush(pinned, cx)
+        }
+
+        fn poll_shutdown(
+            &mut self,
+            cx: &mut Context<'_>,
+            _: private::Token,
+        ) -> Poll<Result<(), std::io::Error>> {
+            let pinned = Pin::new(&mut self.inner);
+            AsyncWrite::poll_shutdown(pinned, cx)
+        }
+
+        fn poll_write_vectored(
+            &mut self,
+            cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+            token: private::Token,
+        ) -> Poll<Result<usize, std::io::Error>> {
+            let pinned = Pin::new(&mut self.inner);
+            AsyncWrite::poll_write_vectored(pinned, cx, bufs)
+        }
+
+        fn is_write_vectored(&self, _: private::Token) -> bool {
+            AsyncWrite::is_write_vectored(&self.inner)
         }
     }
 }
