@@ -386,20 +386,20 @@ pub(crate) mod tls {
         rt::Runtime,
     };
 
-    /// Represents a X509 certificate.
+    /// Represents a X509 certificate chain.
     #[derive(Debug, Clone)]
-    pub struct Certificate {
+    pub struct Certificats {
         pub(crate) pem: Vec<u8>,
     }
 
     /// Represents a private key and X509 certificate.
     #[derive(Debug, Clone)]
     pub struct Identity {
-        pub(crate) cert: Certificate,
+        pub(crate) cert: Certificats,
         pub(crate) key: Vec<u8>,
     }
 
-    impl Certificate {
+    impl Certificats {
         /// Parse a PEM encoded X509 Certificate.
         ///
         /// The provided PEM should include at least one PEM encoded certificate.
@@ -424,13 +424,13 @@ pub(crate) mod tls {
         }
     }
 
-    impl AsRef<[u8]> for Certificate {
+    impl AsRef<[u8]> for Certificats {
         fn as_ref(&self) -> &[u8] {
             self.pem.as_ref()
         }
     }
 
-    impl AsMut<[u8]> for Certificate {
+    impl AsMut<[u8]> for Certificats {
         fn as_mut(&mut self) -> &mut [u8] {
             self.pem.as_mut()
         }
@@ -441,7 +441,7 @@ pub(crate) mod tls {
         ///
         /// The provided cert must contain at least one PEM encoded certificate.
         pub fn from_pem(cert: impl AsRef<[u8]>, key: impl AsRef<[u8]>) -> Self {
-            let cert = Certificate::from_pem(cert);
+            let cert = Certificats::from_pem(cert);
             let key = key.as_ref().into();
             Self { cert, key }
         }
@@ -455,7 +455,7 @@ pub(crate) mod tls {
         /// If `Some`, these certificates are used to validate the server's
         /// certificate chain. If `None`, the client generally defaults to using
         /// the system's native certificate store.
-        pub(crate) pem_root_certs: Option<Certificate>,
+        pub(crate) pem_root_certs: Option<Certificats>,
 
         /// The client's identity for Mutual TLS (mTLS).
         ///
@@ -613,7 +613,7 @@ pub(crate) mod tls {
         ///
         /// The client's key certificate pair must be valid for the SSL connection to
         /// be established.
-        RequestClientCertificateAndVerify { pem_root_certs: Certificate },
+        RequestClientCertificateAndVerify { pem_root_certs: Certificats },
 
         /// Server requests client certificate and enforces that the client presents a
         /// certificate.
@@ -635,7 +635,7 @@ pub(crate) mod tls {
         ///
         /// The client's key certificate pair must be valid for the SSL connection to
         /// be established.
-        RequestAndRequireClientCertificateAndVerify { pem_root_certs: Certificate },
+        RequestAndRequireClientCertificateAndVerify { pem_root_certs: Certificats },
     }
 
     #[derive(Clone)]
@@ -935,7 +935,7 @@ mod test {
         byte_str::ByteStr,
         endpoint::{
             tls::{
-                Certificate, ClientTlsConfig, ClientTlsCredendials, Identity, ServerTlsConfig,
+                Certificats, ClientTlsConfig, ClientTlsCredendials, Identity, ServerTlsConfig,
                 ServerTlsCredendials, TlsClientCertificateRequestType,
             },
             BoxGrpcEndpoint, ClientChannelCredential, ClientHandshakeInfo,
@@ -986,11 +986,11 @@ mod test {
             let config = ServerTlsConfig {
                 identities: vec![Identity {
                     key: key,
-                    cert: crate::endpoint::tls::Certificate { pem: cert },
+                    cert: crate::endpoint::tls::Certificats { pem: cert },
                 }],
                 request_type:
                     TlsClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
-                        pem_root_certs: Certificate::from_pem(ca),
+                        pem_root_certs: Certificats::from_pem(ca),
                     },
             };
             let creds = ServerTlsCredendials::new(&config).unwrap();
@@ -1010,10 +1010,10 @@ mod test {
             let key = fs::read(base_copy.join("client1_key.pem")).unwrap();
 
             let config = ClientTlsConfig {
-                pem_root_certs: Some(Certificate { pem: ca }),
+                pem_root_certs: Some(Certificats { pem: ca }),
                 identity: Some(Identity {
                     key: key,
-                    cert: crate::endpoint::tls::Certificate { pem: cert },
+                    cert: crate::endpoint::tls::Certificats { pem: cert },
                 }),
             };
             let creds = ClientTlsCredendials::new(&config).unwrap();
