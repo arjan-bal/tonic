@@ -1,10 +1,8 @@
 use std::{
     any::Any,
-    borrow::Cow,
     env,
     io::IoSlice,
     net::IpAddr,
-    os::fd::AsFd,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -24,71 +22,20 @@ use tonic::async_trait;
 use crate::{attributes::Attributes, byte_str::ByteStr, rt::Runtime};
 
 mod private {
-    pub struct Token;
+    pub trait Sealed: tokio::io::AsyncRead + tokio::io::AsyncWrite {}
 }
 
-/// Conn is a generic stream-oriented network connection.
-pub(crate) trait GrpcEndpoint: Send + Unpin {
+/// GrpcEndpoint is a generic stream-oriented network connection.
+pub(crate) trait GrpcEndpoint: private::Sealed + Send + Unpin {
     /// Returns the local address that this stream is bound to.
     fn get_local_address(&self) -> ByteStr;
 
     /// Returns the remote address that this stream is connected to.
     fn get_peer_address(&self) -> ByteStr;
-
-    #[doc(hidden)]
-    fn poll_read(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-        _: private::Token,
-    ) -> Poll<std::io::Result<()>>;
-
-    #[doc(hidden)]
-    fn poll_write(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-        _: private::Token,
-    ) -> Poll<Result<usize, std::io::Error>>;
-
-    #[doc(hidden)]
-    fn poll_flush(
-        &mut self,
-        cx: &mut Context<'_>,
-        _: private::Token,
-    ) -> Poll<Result<(), std::io::Error>>;
-
-    #[doc(hidden)]
-    fn poll_shutdown(
-        &mut self,
-        cx: &mut Context<'_>,
-        _: private::Token,
-    ) -> Poll<Result<(), std::io::Error>>;
-
-    #[doc(hidden)]
-    fn poll_write_vectored(
-        &mut self,
-        cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-        token: private::Token,
-    ) -> Poll<Result<usize, std::io::Error>> {
-        let buf = bufs
-            .iter()
-            .find(|b| !b.is_empty())
-            .map_or(&[][..], |b| &**b);
-        self.poll_write(cx, buf, token)
-    }
-
-    #[doc(hidden)]
-    fn is_write_vectored(&self, _: private::Token) -> bool {
-        false
-    }
 }
 
 pub(crate) type BoxGrpcEndpoint = Box<dyn GrpcEndpoint>;
 
-/// This wrapper is pub(crate). It is the only place authorized to
-/// mint the PrivateToken.
 pub(crate) struct GrpcStreamWrapper {
     inner: BoxGrpcEndpoint,
 }
@@ -98,16 +45,12 @@ impl GrpcStreamWrapper {
         Self { inner }
     }
 
-    /// Helper to get the token.
-    /// Since we are in the same crate, we can construct it.
-    fn token() -> private::Token {
-        private::Token {}
-    }
-
     fn get_ref(&self) -> &BoxGrpcEndpoint {
         &self.inner
     }
 }
+
+impl private::Sealed for GrpcStreamWrapper {}
 
 // -------------------------------------------------------------------------
 // 4. Implementing Standard AsyncRead/AsyncWrite for the Wrapper
@@ -119,7 +62,7 @@ impl AsyncRead for GrpcStreamWrapper {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        self.inner.poll_read(cx, buf, Self::token())
+        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
@@ -129,15 +72,21 @@ impl AsyncWrite for GrpcStreamWrapper {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        self.inner.poll_write(cx, buf, Self::token())
+        Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.inner.poll_flush(cx, Self::token())
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        self.inner.poll_shutdown(cx, Self::token())
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 
     fn poll_write_vectored(
@@ -145,13 +94,15 @@ impl AsyncWrite for GrpcStreamWrapper {
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<Result<usize, std::io::Error>> {
-        self.inner.poll_write_vectored(cx, bufs, Self::token())
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
     }
 
     fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored(Self::token())
+        self.inner.is_write_vectored()
     }
 }
+
+impl private::Sealed for TcpStream {}
 
 impl GrpcEndpoint for TcpStream {
     fn get_local_address(&self) -> ByteStr {
@@ -161,58 +112,6 @@ impl GrpcEndpoint for TcpStream {
 
     fn get_peer_address(&self) -> ByteStr {
         todo!()
-    }
-
-    fn poll_read(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-        _: private::Token,
-    ) -> Poll<std::io::Result<()>> {
-        let pinned = std::pin::Pin::new(self);
-        AsyncRead::poll_read(pinned, cx, buf)
-    }
-
-    fn poll_write(
-        &mut self,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-        _: private::Token,
-    ) -> Poll<Result<usize, std::io::Error>> {
-        let pinned = std::pin::Pin::new(self);
-        AsyncWrite::poll_write(pinned, cx, buf)
-    }
-
-    fn poll_flush(
-        &mut self,
-        cx: &mut Context<'_>,
-        _: private::Token,
-    ) -> Poll<Result<(), std::io::Error>> {
-        let pinned = std::pin::Pin::new(self);
-        AsyncWrite::poll_flush(pinned, cx)
-    }
-
-    fn poll_shutdown(
-        &mut self,
-        cx: &mut Context<'_>,
-        _: private::Token,
-    ) -> Poll<Result<(), std::io::Error>> {
-        let pinned = std::pin::Pin::new(self);
-        AsyncWrite::poll_shutdown(pinned, cx)
-    }
-
-    fn poll_write_vectored(
-        &mut self,
-        cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-        token: private::Token,
-    ) -> Poll<Result<usize, std::io::Error>> {
-        let pinned = std::pin::Pin::new(self);
-        AsyncWrite::poll_write_vectored(pinned, cx, bufs)
-    }
-
-    fn is_write_vectored(&self, _: private::Token) -> bool {
-        AsyncWrite::is_write_vectored(self)
     }
 }
 
@@ -388,18 +287,18 @@ pub(crate) mod tls {
 
     /// Represents a X509 certificate chain.
     #[derive(Debug, Clone)]
-    pub struct Certificats {
+    pub struct Certificates {
         pub(crate) pem: Vec<u8>,
     }
 
-    /// Represents a private key and X509 certificate.
+    /// Represents a private key and X509 certificate chain.
     #[derive(Debug, Clone)]
     pub struct Identity {
-        pub(crate) cert: Certificats,
+        pub(crate) cert: Certificates,
         pub(crate) key: Vec<u8>,
     }
 
-    impl Certificats {
+    impl Certificates {
         /// Parse a PEM encoded X509 Certificate.
         ///
         /// The provided PEM should include at least one PEM encoded certificate.
@@ -424,13 +323,13 @@ pub(crate) mod tls {
         }
     }
 
-    impl AsRef<[u8]> for Certificats {
+    impl AsRef<[u8]> for Certificates {
         fn as_ref(&self) -> &[u8] {
             self.pem.as_ref()
         }
     }
 
-    impl AsMut<[u8]> for Certificats {
+    impl AsMut<[u8]> for Certificates {
         fn as_mut(&mut self) -> &mut [u8] {
             self.pem.as_mut()
         }
@@ -441,7 +340,7 @@ pub(crate) mod tls {
         ///
         /// The provided cert must contain at least one PEM encoded certificate.
         pub fn from_pem(cert: impl AsRef<[u8]>, key: impl AsRef<[u8]>) -> Self {
-            let cert = Certificats::from_pem(cert);
+            let cert = Certificates::from_pem(cert);
             let key = key.as_ref().into();
             Self { cert, key }
         }
@@ -455,7 +354,7 @@ pub(crate) mod tls {
         /// If `Some`, these certificates are used to validate the server's
         /// certificate chain. If `None`, the client generally defaults to using
         /// the system's native certificate store.
-        pub(crate) pem_root_certs: Option<Certificats>,
+        pub(crate) pem_root_certs: Option<Certificates>,
 
         /// The client's identity for Mutual TLS (mTLS).
         ///
@@ -463,6 +362,15 @@ pub(crate) mod tls {
         /// the client will not present a certificate to the server
         /// (standard one-way TLS).
         pub(crate) identity: Option<Identity>,
+
+        /// Enables the key logging that writes to a file whose name is
+        /// given by the `SSLKEYLOGFILE` environment variable.
+        ///
+        /// If `SSLKEYLOGFILE` is not set, this does nothing.
+        ///
+        /// If such a file cannot be opened, or cannot be written then
+        /// this does nothing but logs errors at warning-level.
+        pub(crate) use_key_log: bool,
     }
 
     #[derive(Clone)]
@@ -613,7 +521,7 @@ pub(crate) mod tls {
         ///
         /// The client's key certificate pair must be valid for the SSL connection to
         /// be established.
-        RequestClientCertificateAndVerify { pem_root_certs: Certificats },
+        RequestClientCertificateAndVerify { pem_root_certs: Certificates },
 
         /// Server requests client certificate and enforces that the client presents a
         /// certificate.
@@ -635,7 +543,7 @@ pub(crate) mod tls {
         ///
         /// The client's key certificate pair must be valid for the SSL connection to
         /// be established.
-        RequestAndRequireClientCertificateAndVerify { pem_root_certs: Certificats },
+        RequestAndRequireClientCertificateAndVerify { pem_root_certs: Certificates },
     }
 
     #[derive(Clone)]
@@ -646,6 +554,14 @@ pub(crate) mod tls {
     pub(crate) struct ServerTlsConfig {
         pub(crate) identities: Vec<Identity>,
         pub(crate) request_type: TlsClientCertificateRequestType,
+        /// Enables the key logging that writes to a file whose name is
+        /// given by the `SSLKEYLOGFILE` environment variable.
+        ///
+        /// If `SSLKEYLOGFILE` is not set, this does nothing.
+        ///
+        /// If such a file cannot be opened, or cannot be written then
+        /// this does nothing but logs errors at warning-level.
+        pub(crate) use_key_log: bool,
     }
 
     pub(crate) struct ServerSecContext {
@@ -865,6 +781,59 @@ pub(crate) mod tls {
         inner: SslStream<GrpcStreamWrapper>,
     }
 
+    impl AsyncRead for TlsStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let pinned = Pin::new(&mut self.get_mut().inner);
+            AsyncRead::poll_read(pinned, cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TlsStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            let pinned = Pin::new(&mut self.get_mut().inner);
+            AsyncWrite::poll_write(pinned, cx, buf)
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            let pinned = Pin::new(&mut self.get_mut().inner);
+            AsyncWrite::poll_flush(pinned, cx)
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            let pinned = Pin::new(&mut self.get_mut().inner);
+            AsyncWrite::poll_shutdown(pinned, cx)
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            let pinned = Pin::new(&mut self.get_mut().inner);
+            AsyncWrite::poll_write_vectored(pinned, cx, bufs)
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            AsyncWrite::is_write_vectored(&self.inner)
+        }
+    }
+
+    impl private::Sealed for TlsStream {}
+
     impl GrpcEndpoint for TlsStream {
         fn get_local_address(&self) -> ByteStr {
             self.inner.get_ref().get_ref().get_local_address()
@@ -872,58 +841,6 @@ pub(crate) mod tls {
 
         fn get_peer_address(&self) -> ByteStr {
             self.inner.get_ref().get_ref().get_peer_address()
-        }
-
-        fn poll_read(
-            &mut self,
-            cx: &mut Context<'_>,
-            buf: &mut ReadBuf<'_>,
-            _: private::Token,
-        ) -> Poll<std::io::Result<()>> {
-            let pinned = Pin::new(&mut self.inner);
-            AsyncRead::poll_read(pinned, cx, buf)
-        }
-
-        fn poll_write(
-            &mut self,
-            cx: &mut Context<'_>,
-            buf: &[u8],
-            _: private::Token,
-        ) -> Poll<Result<usize, std::io::Error>> {
-            let pinned = Pin::new(&mut self.inner);
-            AsyncWrite::poll_write(pinned, cx, buf)
-        }
-
-        fn poll_flush(
-            &mut self,
-            cx: &mut Context<'_>,
-            _: private::Token,
-        ) -> Poll<Result<(), std::io::Error>> {
-            let pinned = Pin::new(&mut self.inner);
-            AsyncWrite::poll_flush(pinned, cx)
-        }
-
-        fn poll_shutdown(
-            &mut self,
-            cx: &mut Context<'_>,
-            _: private::Token,
-        ) -> Poll<Result<(), std::io::Error>> {
-            let pinned = Pin::new(&mut self.inner);
-            AsyncWrite::poll_shutdown(pinned, cx)
-        }
-
-        fn poll_write_vectored(
-            &mut self,
-            cx: &mut Context<'_>,
-            bufs: &[IoSlice<'_>],
-            token: private::Token,
-        ) -> Poll<Result<usize, std::io::Error>> {
-            let pinned = Pin::new(&mut self.inner);
-            AsyncWrite::poll_write_vectored(pinned, cx, bufs)
-        }
-
-        fn is_write_vectored(&self, _: private::Token) -> bool {
-            AsyncWrite::is_write_vectored(&self.inner)
         }
     }
 }
@@ -935,7 +852,7 @@ mod test {
         byte_str::ByteStr,
         endpoint::{
             tls::{
-                Certificats, ClientTlsConfig, ClientTlsCredendials, Identity, ServerTlsConfig,
+                Certificates, ClientTlsConfig, ClientTlsCredendials, Identity, ServerTlsConfig,
                 ServerTlsCredendials, TlsClientCertificateRequestType,
             },
             BoxGrpcEndpoint, ClientChannelCredential, ClientHandshakeInfo,
@@ -984,13 +901,14 @@ mod test {
             let key = fs::read(base.join("server1_key.pem")).unwrap();
 
             let config = ServerTlsConfig {
+                use_key_log: false,
                 identities: vec![Identity {
                     key: key,
-                    cert: crate::endpoint::tls::Certificats { pem: cert },
+                    cert: crate::endpoint::tls::Certificates { pem: cert },
                 }],
                 request_type:
                     TlsClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
-                        pem_root_certs: Certificats::from_pem(ca),
+                        pem_root_certs: Certificates::from_pem(ca),
                     },
             };
             let creds = ServerTlsCredendials::new(&config).unwrap();
@@ -1010,11 +928,12 @@ mod test {
             let key = fs::read(base_copy.join("client1_key.pem")).unwrap();
 
             let config = ClientTlsConfig {
-                pem_root_certs: Some(Certificats { pem: ca }),
+                pem_root_certs: Some(Certificates { pem: ca }),
                 identity: Some(Identity {
                     key: key,
-                    cert: crate::endpoint::tls::Certificats { pem: cert },
+                    cert: crate::endpoint::tls::Certificates { pem: cert },
                 }),
+                use_key_log: false,
             };
             let creds = ClientTlsCredendials::new(&config).unwrap();
             let stream = creds
