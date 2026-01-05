@@ -138,7 +138,7 @@ pub(crate) struct ClientHandshakeInfo {
 /// Defines the common interface for all live gRPC wire protocols and supported
 /// transport security protocols (e.g., TLS, SSL).
 #[async_trait]
-pub(crate) trait ClientChannelCredential: Send + Sync + Clone {
+pub(crate) trait ClientChannelCredential: Send + Sync {
     type ContextType;
     type Output<I>;
     /// Performs the client-side authentication handshake on a raw endpoint.
@@ -172,7 +172,7 @@ pub(crate) trait ClientChannelCredential: Send + Sync + Clone {
 }
 
 #[async_trait]
-pub(crate) trait ServerChannelCredentials: Send + Sync + Clone {
+pub(crate) trait ServerChannelCredentials: Send + Sync {
     type Output<I>;
     /// Performs the server-side authentication handshake.
     ///
