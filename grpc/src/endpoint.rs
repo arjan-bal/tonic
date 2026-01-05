@@ -36,27 +36,30 @@ pub(crate) trait GrpcEndpoint: private::Sealed + Send + Unpin {
 
 pub(crate) type BoxGrpcEndpoint = Box<dyn GrpcEndpoint>;
 
-pub(crate) struct GrpcStreamWrapper {
-    inner: BoxGrpcEndpoint,
+pub(crate) struct GrpcStreamWrapper<T> {
+    inner: T,
 }
 
-impl GrpcStreamWrapper {
-    pub fn new(inner: BoxGrpcEndpoint) -> Self {
+impl<T> GrpcStreamWrapper<T> {
+    pub fn new(inner: T) -> Self {
         Self { inner }
     }
 
-    fn get_ref(&self) -> &BoxGrpcEndpoint {
+    fn get_ref(&self) -> &T {
         &self.inner
     }
 }
 
-impl private::Sealed for GrpcStreamWrapper {}
+impl<T> private::Sealed for GrpcStreamWrapper<T> where T: AsyncRead + AsyncWrite + Unpin {}
 
 // -------------------------------------------------------------------------
 // 4. Implementing Standard AsyncRead/AsyncWrite for the Wrapper
 // -------------------------------------------------------------------------
 
-impl AsyncRead for GrpcStreamWrapper {
+impl<T> AsyncRead for GrpcStreamWrapper<T>
+where
+    T: AsyncRead + Unpin,
+{
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -66,7 +69,10 @@ impl AsyncRead for GrpcStreamWrapper {
     }
 }
 
-impl AsyncWrite for GrpcStreamWrapper {
+impl<T> AsyncWrite for GrpcStreamWrapper<T>
+where
+    T: AsyncWrite + Unpin,
+{
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -132,7 +138,9 @@ pub(crate) struct ClientHandshakeInfo {
 /// Defines the common interface for all live gRPC wire protocols and supported
 /// transport security protocols (e.g., TLS, SSL).
 #[async_trait]
-pub(crate) trait ClientChannelCredential: Send + Sync {
+pub(crate) trait ClientChannelCredential: Send + Sync + Clone {
+    type ContextType;
+    type Output<I>;
     /// Performs the client-side authentication handshake on a raw endpoint.
     ///
     /// This method wraps the provided `source` endpoint with the security protocol
@@ -145,23 +153,28 @@ pub(crate) trait ClientChannelCredential: Send + Sync {
     ///   (e.g., for SNI) during the handshake.
     /// * `source` - The raw connection handle.
     /// * `info` - Additional context passed from the resolver or load balancer.
-    async fn connect(
+    async fn connect<Input: GrpcEndpoint>(
         &self,
         authority: &http::uri::Authority,
-        source: BoxGrpcEndpoint,
+        source: Input,
         info: ClientHandshakeInfo,
         runtime: Arc<dyn Runtime>,
-    ) -> Result<(BoxGrpcEndpoint, ClientConnectionSecurityInfo), String>;
+    ) -> Result<
+        (
+            Self::Output<Input>,
+            ClientConnectionSecurityInfo<Self::ContextType>,
+        ),
+        String,
+    >;
 
     //// Provides the ProtocolInfo of this ClientChannelCredential.
     fn info(&self) -> &ProtocolInfo;
-
-    /// Clones these credentials.
-    fn clone(&self) -> Box<dyn ClientChannelCredential>;
 }
 
 #[async_trait]
-pub(crate) trait ServerChannelCredentials: Send + Sync {
+pub(crate) trait ServerChannelCredentials: Send + Sync + Clone {
+    type ContextType;
+    type Output<I>;
     /// Performs the server-side authentication handshake.
     ///
     /// This method wraps the incoming raw `source` connection with the configured
@@ -172,17 +185,20 @@ pub(crate) trait ServerChannelCredentials: Send + Sync {
     /// A tuple containing:
     /// 1. The authenticated endpoint (ready for reading/writing frames).
     /// 2. The security context describing the connection (e.g., peer certificates).
-    async fn accept(
+    async fn accept<Input: GrpcEndpoint>(
         &self,
-        source: BoxGrpcEndpoint,
+        source: Input,
         runtime: Arc<dyn Runtime>,
-    ) -> Result<(BoxGrpcEndpoint, ServerConnectionSecurityInfo), String>;
+    ) -> Result<
+        (
+            Self::Output<Input>,
+            ServerConnectionSecurityInfo<Self::ContextType>,
+        ),
+        String,
+    >;
 
     //// Provides the ProtocolInfo of this ServerChannelCredentials.
     fn info(&self) -> &ProtocolInfo;
-
-    /// Clones these credentials.
-    fn clone(&self) -> Box<dyn ServerChannelCredentials>;
 }
 
 /// Defines the level of protection provided by an established connection.
@@ -226,10 +242,10 @@ pub(crate) trait ClientConnectionSecurityContext: Send + Sync + 'static {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub(crate) struct ClientConnectionSecurityInfo {
+pub(crate) struct ClientConnectionSecurityInfo<C> {
     pub(crate) security_protocol: &'static str,
     pub(crate) security_level: SecurityLevel,
-    pub(crate) security_context: Box<dyn ClientConnectionSecurityContext>,
+    pub(crate) security_context: C,
 }
 
 /// Represents the security state of an established server-side connection.
@@ -240,10 +256,10 @@ pub(crate) trait ServerConnectionSecurityContext: Send + Sync + 'static {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub(crate) struct ServerConnectionSecurityInfo {
+pub(crate) struct ServerConnectionSecurityInfo<C> {
     pub(crate) security_protocol: &'static str,
     pub(crate) security_level: SecurityLevel,
-    pub(crate) security_context: Box<dyn ServerConnectionSecurityContext>,
+    pub(crate) security_context: C,
 }
 
 #[non_exhaustive]
@@ -385,9 +401,7 @@ pub(crate) mod tls {
     const ALPN_H2: &[u8] = b"\x02h2";
 
     impl ClientTlsCredendials {
-        pub(crate) fn new(
-            config: &ClientTlsConfig,
-        ) -> Result<Box<dyn ClientChannelCredential>, String> {
+        pub(crate) fn new(config: &ClientTlsConfig) -> Result<ClientTlsCredendials, String> {
             let mut builder =
                 SslConnector::builder(SslMethod::tls_client()).map_err(|e| e.to_string())?;
             builder.set_verify(SslVerifyMode::PEER);
@@ -431,11 +445,11 @@ pub(crate) mod tls {
                 builder.set_private_key(&pkey).map_err(|e| e.to_string())?;
             }
             let connector = builder.build();
-            Ok(Box::new(ClientTlsCredendials { connector }))
+            Ok(ClientTlsCredendials { connector })
         }
     }
 
-    struct ClientTlsSecContext {
+    pub(crate) struct ClientTlsSecContext {
         peer_cert_chain: Vec<X509>,
     }
 
@@ -456,13 +470,21 @@ pub(crate) mod tls {
 
     #[async_trait]
     impl ClientChannelCredential for ClientTlsCredendials {
-        async fn connect(
+        type ContextType = ClientTlsSecContext;
+        type Output<I> = TlsStream<I>;
+        async fn connect<Input: GrpcEndpoint>(
             &self,
             authority: &http::uri::Authority,
-            source: BoxGrpcEndpoint,
+            source: Input,
             _info: ClientHandshakeInfo,
             _rt: Arc<dyn Runtime>,
-        ) -> Result<(BoxGrpcEndpoint, ClientConnectionSecurityInfo), String> {
+        ) -> Result<
+            (
+                TlsStream<Input>,
+                ClientConnectionSecurityInfo<ClientTlsSecContext>,
+            ),
+            String,
+        > {
             let wrapper = GrpcStreamWrapper::new(source);
             let tls_stream = tokio_boring::connect(
                 self.connector.configure().unwrap(),
@@ -475,20 +497,16 @@ pub(crate) mod tls {
             let cs_info = ClientConnectionSecurityInfo {
                 security_protocol: "tls",
                 security_level: SecurityLevel::PrivacyAndIntegrity,
-                security_context: Box::new(ClientTlsSecContext {
+                security_context: ClientTlsSecContext {
                     peer_cert_chain: Vec::new(),
-                }),
+                },
             };
-            let ep: BoxGrpcEndpoint = Box::new(TlsStream { inner: tls_stream });
+            let ep = TlsStream { inner: tls_stream };
             Ok((ep, cs_info))
         }
 
         fn info(&self) -> &ProtocolInfo {
             &TLS_PROTO_INFO
-        }
-
-        fn clone(&self) -> Box<dyn ClientChannelCredential> {
-            Box::new(Clone::clone(self))
         }
     }
 
@@ -720,7 +738,9 @@ pub(crate) mod tls {
         }
     }
 
-    fn get_full_peer_chain_server_side(stream: &SslStream<GrpcStreamWrapper>) -> Option<Vec<X509>> {
+    fn get_full_peer_chain_server_side<T>(
+        stream: &SslStream<GrpcStreamWrapper<T>>,
+    ) -> Option<Vec<X509>> {
         let ssl = stream.ssl();
         let mut full_chain = Vec::new();
 
@@ -747,11 +767,20 @@ pub(crate) mod tls {
 
     #[async_trait]
     impl ServerChannelCredentials for ServerTlsCredendials {
-        async fn accept(
+        type ContextType = ServerSecContext;
+        type Output<Input> = TlsStream<Input>;
+
+        async fn accept<Input: GrpcEndpoint>(
             &self,
-            source: BoxGrpcEndpoint,
+            source: Input,
             _rt: Arc<dyn Runtime>,
-        ) -> Result<(BoxGrpcEndpoint, ServerConnectionSecurityInfo), String> {
+        ) -> Result<
+            (
+                TlsStream<Input>,
+                ServerConnectionSecurityInfo<ServerSecContext>,
+            ),
+            String,
+        > {
             let wrapper = GrpcStreamWrapper::new(source);
             let tls_stream = tokio_boring::accept(&self.acceptor, wrapper)
                 .await
@@ -762,26 +791,25 @@ pub(crate) mod tls {
             let auth_info = ServerConnectionSecurityInfo {
                 security_protocol: "tls",
                 security_level: SecurityLevel::PrivacyAndIntegrity,
-                security_context: Box::new(tls_ctx),
+                security_context: tls_ctx,
             };
-            let ep: BoxGrpcEndpoint = Box::new(TlsStream { inner: tls_stream });
+            let ep = TlsStream { inner: tls_stream };
             Ok((ep, auth_info))
         }
 
         fn info(&self) -> &ProtocolInfo {
             &TLS_PROTO_INFO
         }
-
-        fn clone(&self) -> Box<dyn ServerChannelCredentials> {
-            Box::new(Clone::clone(self))
-        }
     }
 
-    struct TlsStream {
-        inner: SslStream<GrpcStreamWrapper>,
+    pub(crate) struct TlsStream<T> {
+        inner: SslStream<GrpcStreamWrapper<T>>,
     }
 
-    impl AsyncRead for TlsStream {
+    impl<T> AsyncRead for TlsStream<T>
+    where
+        T: GrpcEndpoint,
+    {
         fn poll_read(
             self: Pin<&mut Self>,
             cx: &mut Context<'_>,
@@ -792,7 +820,10 @@ pub(crate) mod tls {
         }
     }
 
-    impl AsyncWrite for TlsStream {
+    impl<T> AsyncWrite for TlsStream<T>
+    where
+        T: GrpcEndpoint,
+    {
         fn poll_write(
             self: Pin<&mut Self>,
             cx: &mut Context<'_>,
@@ -832,9 +863,12 @@ pub(crate) mod tls {
         }
     }
 
-    impl private::Sealed for TlsStream {}
+    impl<T> private::Sealed for TlsStream<T> where T: GrpcEndpoint {}
 
-    impl GrpcEndpoint for TlsStream {
+    impl<T> GrpcEndpoint for TlsStream<T>
+    where
+        T: GrpcEndpoint,
+    {
         fn get_local_address(&self) -> ByteStr {
             self.inner.get_ref().get_ref().get_local_address()
         }
@@ -845,6 +879,43 @@ pub(crate) mod tls {
     }
 }
 
+// pub(crate) mod call_credentials {
+//     use super::ClientConnectionSecurityInfo;
+//     use crate::{byte_str::ByteStr, endpoint::SecurityLevel};
+//     use tonic::{async_trait, metadata::MetadataMap, Status};
+//
+//     pub(crate) struct CallDetails {
+//         service_url: ByteStr,
+//         /// The fully qualified name of the method being called (e.g., `/package.Service/Method`).
+//         method_name: ByteStr,
+//     }
+//
+//     /// Defines the interface for credentials that need to attach security information
+//     /// to every individual RPC (e.g., OAuth2 tokens, JWTs).
+//     #[async_trait]
+//     pub(crate) trait CallCredentials {
+//         /// Generates the authentication metadata for a specific RPC call.
+//         ///
+//         /// This method is called by the transport layer on each request.
+//         /// Implementations should populate the provided `metadata` map with the
+//         /// necessary authorization headers (e.g., `authorization: Bearer <token>`).
+//         ///
+//         /// If this returns an `Err`, the RPC will fail immediately with a status
+//         /// derived from the error if the status code is in the range defined in
+//         /// gRFC A54. Otherwise, the RPC is failed with an internal status.
+//         async fn get_metadata(
+//             &self,
+//             call_details: &CallDetails,
+//             auth_info: &ClientConnectionSecurityInfo,
+//             metadata: &mut MetadataMap,
+//         ) -> Result<(), Status>;
+//
+//         /// Indicates the minimum transport security level required to send
+//         /// these credentials.
+//         fn minimum_channel_security_level(&self) -> SecurityLevel;
+//     }
+// }
+//
 #[cfg(test)]
 mod test {
 
@@ -870,7 +941,7 @@ mod test {
         let stream = tokio::net::TcpStream::connect((hostname, 443))
             .await
             .unwrap();
-        let ge: BoxGrpcEndpoint = Box::new(stream);
+        let ge = stream;
         let creds = ClientTlsCredendials::new(&ClientTlsConfig::default()).unwrap();
         let authority: Authority = "google.com".parse().unwrap();
         let authenticated = creds
@@ -912,10 +983,7 @@ mod test {
                     },
             };
             let creds = ServerTlsCredendials::new(&config).unwrap();
-            let stream = creds
-                .accept(Box::new(stream), rt::default_runtime())
-                .await
-                .unwrap();
+            let stream = creds.accept(stream, rt::default_runtime()).await.unwrap();
         });
 
         let client = tokio::spawn(async move {
@@ -939,7 +1007,7 @@ mod test {
             let stream = creds
                 .connect(
                     &"abc.test.example.com".parse().unwrap(),
-                    Box::new(socket),
+                    socket,
                     ClientHandshakeInfo::default(),
                     rt::default_runtime(),
                 )
