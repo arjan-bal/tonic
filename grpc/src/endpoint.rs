@@ -173,7 +173,6 @@ pub(crate) trait ClientChannelCredential: Send + Sync + Clone {
 
 #[async_trait]
 pub(crate) trait ServerChannelCredentials: Send + Sync + Clone {
-    type ContextType;
     type Output<I>;
     /// Performs the server-side authentication handshake.
     ///
@@ -189,13 +188,7 @@ pub(crate) trait ServerChannelCredentials: Send + Sync + Clone {
         &self,
         source: Input,
         runtime: Arc<dyn Runtime>,
-    ) -> Result<
-        (
-            Self::Output<Input>,
-            ServerConnectionSecurityInfo<Self::ContextType>,
-        ),
-        String,
-    >;
+    ) -> Result<(Self::Output<Input>, ServerConnectionSecurityInfo), String>;
 
     //// Provides the ProtocolInfo of this ServerChannelCredentials.
     fn info(&self) -> &ProtocolInfo;
@@ -234,32 +227,21 @@ pub(crate) trait ClientConnectionSecurityContext: Send + Sync + 'static {
     fn validate_authority(&self, authority: &Authority) -> bool {
         false
     }
-
-    /// Upcasts the reference to [`Any`] to enable downcasting to the concrete implementation.
-    ///
-    /// This allows access to protocol-specific fields (e.g., accessing the raw `SSL` object)
-    /// that are not part of the generic interface.
-    fn as_any(&self) -> &dyn Any;
 }
 
 pub(crate) struct ClientConnectionSecurityInfo<C> {
     pub(crate) security_protocol: &'static str,
     pub(crate) security_level: SecurityLevel,
     pub(crate) security_context: C,
+    /// Stores extra data derived from the underlying protocol.
+    pub(crate) attributes: Attributes,
 }
 
-/// Represents the security state of an established server-side connection.
-///
-/// Contains authentication information about the connected client (e.g., mTLS identity).
-pub(crate) trait ServerConnectionSecurityContext: Send + Sync + 'static {
-    /// Upcasts the reference to [`Any`] to enable downcasting to the concrete implementation.
-    fn as_any(&self) -> &dyn Any;
-}
-
-pub(crate) struct ServerConnectionSecurityInfo<C> {
+pub(crate) struct ServerConnectionSecurityInfo {
     pub(crate) security_protocol: &'static str,
     pub(crate) security_level: SecurityLevel,
-    pub(crate) security_context: C,
+    /// Stores extra data derived from the underlying protocol.
+    pub(crate) attributes: Attributes,
 }
 
 #[non_exhaustive]
@@ -291,12 +273,12 @@ pub(crate) mod tls {
     use tonic::async_trait;
 
     use crate::{
+        attributes::Attributes,
         byte_str::ByteStr,
         endpoint::{
             private, BoxGrpcEndpoint, ClientChannelCredential, ClientConnectionSecurityContext,
             ClientConnectionSecurityInfo, ClientHandshakeInfo, GrpcEndpoint, GrpcStreamWrapper,
-            ProtocolInfo, SecurityLevel, ServerChannelCredentials, ServerConnectionSecurityContext,
-            ServerConnectionSecurityInfo,
+            ProtocolInfo, SecurityLevel, ServerChannelCredentials, ServerConnectionSecurityInfo,
         },
         rt::Runtime,
     };
@@ -462,10 +444,6 @@ pub(crate) mod tls {
             }
             false
         }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
     }
 
     #[async_trait]
@@ -500,6 +478,7 @@ pub(crate) mod tls {
                 security_context: ClientTlsSecContext {
                     peer_cert_chain: Vec::new(),
                 },
+                attributes: Attributes {},
             };
             let ep = TlsStream { inner: tls_stream };
             Ok((ep, cs_info))
@@ -580,16 +559,6 @@ pub(crate) mod tls {
         /// If such a file cannot be opened, or cannot be written then
         /// this does nothing but logs errors at warning-level.
         pub(crate) use_key_log: bool,
-    }
-
-    pub(crate) struct ServerSecContext {
-        peer_cert_chain: Option<Vec<X509>>,
-    }
-
-    impl ServerConnectionSecurityContext for ServerSecContext {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
     }
 
     impl ServerTlsCredendials {
@@ -767,31 +736,23 @@ pub(crate) mod tls {
 
     #[async_trait]
     impl ServerChannelCredentials for ServerTlsCredendials {
-        type ContextType = ServerSecContext;
         type Output<Input> = TlsStream<Input>;
 
         async fn accept<Input: GrpcEndpoint>(
             &self,
             source: Input,
             _rt: Arc<dyn Runtime>,
-        ) -> Result<
-            (
-                TlsStream<Input>,
-                ServerConnectionSecurityInfo<ServerSecContext>,
-            ),
-            String,
-        > {
+        ) -> Result<(TlsStream<Input>, ServerConnectionSecurityInfo), String> {
             let wrapper = GrpcStreamWrapper::new(source);
             let tls_stream = tokio_boring::accept(&self.acceptor, wrapper)
                 .await
                 .map_err(|e| e.to_string())?;
-            let tls_ctx = ServerSecContext {
-                peer_cert_chain: get_full_peer_chain_server_side(&tls_stream),
-            };
+            let peer_cert_chain = get_full_peer_chain_server_side(&tls_stream);
+            // TODO: Put cert chain in attributes.
             let auth_info = ServerConnectionSecurityInfo {
                 security_protocol: "tls",
                 security_level: SecurityLevel::PrivacyAndIntegrity,
-                security_context: tls_ctx,
+                attributes: Attributes {},
             };
             let ep = TlsStream { inner: tls_stream };
             Ok((ep, auth_info))
