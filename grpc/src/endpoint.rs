@@ -276,7 +276,7 @@ pub(crate) mod tls {
         attributes::Attributes,
         byte_str::ByteStr,
         endpoint::{
-            private, BoxGrpcEndpoint, ClientChannelCredential, ClientConnectionSecurityContext,
+            private, ClientChannelCredential, ClientConnectionSecurityContext,
             ClientConnectionSecurityInfo, ClientHandshakeInfo, GrpcEndpoint, GrpcStreamWrapper,
             ProtocolInfo, SecurityLevel, ServerChannelCredentials, ServerConnectionSecurityInfo,
         },
