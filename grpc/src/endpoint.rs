@@ -840,49 +840,122 @@ pub(crate) mod tls {
     }
 }
 
-// pub(crate) mod call_credentials {
-//     use super::ClientConnectionSecurityInfo;
-//     use crate::{byte_str::ByteStr, endpoint::SecurityLevel};
-//     use tonic::{async_trait, metadata::MetadataMap, Status};
-//
-//     pub(crate) struct CallDetails {
-//         service_url: ByteStr,
-//         /// The fully qualified name of the method being called (e.g., `/package.Service/Method`).
-//         method_name: ByteStr,
-//     }
-//
-//     /// Defines the interface for credentials that need to attach security information
-//     /// to every individual RPC (e.g., OAuth2 tokens, JWTs).
-//     #[async_trait]
-//     pub(crate) trait CallCredentials {
-//         /// Generates the authentication metadata for a specific RPC call.
-//         ///
-//         /// This method is called by the transport layer on each request.
-//         /// Implementations should populate the provided `metadata` map with the
-//         /// necessary authorization headers (e.g., `authorization: Bearer <token>`).
-//         ///
-//         /// If this returns an `Err`, the RPC will fail immediately with a status
-//         /// derived from the error if the status code is in the range defined in
-//         /// gRFC A54. Otherwise, the RPC is failed with an internal status.
-//         async fn get_metadata(
-//             &self,
-//             call_details: &CallDetails,
-//             auth_info: &ClientConnectionSecurityInfo,
-//             metadata: &mut MetadataMap,
-//         ) -> Result<(), Status>;
-//
-//         /// Indicates the minimum transport security level required to send
-//         /// these credentials.
-//         fn minimum_channel_security_level(&self) -> SecurityLevel;
-//     }
-// }
-//
+pub(crate) mod call_credentials {
+    use super::ClientConnectionSecurityInfo;
+    use crate::{attributes::Attributes, byte_str::ByteStr, endpoint::SecurityLevel};
+    use tonic::{async_trait, metadata::MetadataMap, Status};
+
+    /// Details regarding the RPC call.
+    ///
+    /// The fully qualified method name is constructed as:
+    /// `service_url` + "/" + `method_name`
+    pub(crate) struct CallDetails<'a> {
+        pub service_url: &'a str,
+
+        /// The method name suffix (e.g., `Method` or `package.Service/Method`).
+        pub method_name: &'a str,
+    }
+
+    pub(crate) struct ChannelSecurityInfo {
+        pub(crate) security_protocol: &'static str,
+        pub(crate) security_level: SecurityLevel,
+        /// Stores extra data derived from the underlying protocol.
+        pub(crate) attributes: Attributes,
+    }
+
+    /// Defines the interface for credentials that need to attach security information
+    /// to every individual RPC (e.g., OAuth2 tokens, JWTs).
+    #[async_trait]
+    pub(crate) trait CallCredentials {
+        /// Generates the authentication metadata for a specific RPC call.
+        ///
+        /// This method is called by the transport layer on each request.
+        /// Implementations should populate the provided `metadata` map with the
+        /// necessary authorization headers (e.g., `authorization: Bearer <token>`).
+        ///
+        /// If this returns an `Err`, the RPC will fail immediately with a status
+        /// derived from the error if the status code is in the range defined in
+        /// gRFC A54. Otherwise, the RPC is failed with an internal status.
+        async fn get_metadata(
+            &self,
+            call_details: &CallDetails,
+            auth_info: &ChannelSecurityInfo,
+            metadata: &mut MetadataMap,
+        ) -> Result<(), Status>;
+
+        /// Indicates the minimum transport security level required to send
+        /// these credentials.
+        fn minimum_channel_security_level(&self) -> SecurityLevel {
+            SecurityLevel::PrivacyAndIntegrity
+        }
+
+        /// Type of credentials this plugin is implementing.
+        fn get_type(&self) -> &'static str;
+    }
+}
+
+mod gcp {
+    use std::sync::Arc;
+
+    use gcp_auth::TokenProvider;
+    use serde::de::value;
+    use tonic::{async_trait, metadata::MetadataMap, Status};
+
+    use crate::endpoint::call_credentials::{CallCredentials, CallDetails, ChannelSecurityInfo};
+    use crate::endpoint::SecurityLevel;
+
+    pub(crate) struct GcpCallCredentials {
+        token_provider: Arc<dyn TokenProvider>,
+    }
+
+    impl GcpCallCredentials {
+        pub(crate) async fn new() -> Result<GcpCallCredentials, gcp_auth::Error> {
+            Ok(GcpCallCredentials {
+                token_provider: gcp_auth::provider().await?,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl CallCredentials for GcpCallCredentials {
+        async fn get_metadata(
+            &self,
+            call_details: &CallDetails,
+            auth_info: &ChannelSecurityInfo,
+            metadata: &mut MetadataMap,
+        ) -> Result<(), Status> {
+            // let audience = format!("{}/{}", call_details.service_url, call_details.method_name);
+            let token = self
+                .token_provider
+                .token(&["https://www.googleapis.com/auth/cloud-platform"])
+                .await
+                .map_err(|e| Status::unavailable(e.to_string()))?;
+            let value = format!("Bearer {}", token.as_str());
+            metadata.append("authorization", value.parse().unwrap());
+            Ok(())
+        }
+
+        /// Indicates the minimum transport security level required to send
+        /// these credentials.
+        fn minimum_channel_security_level(&self) -> SecurityLevel {
+            SecurityLevel::PrivacyAndIntegrity
+        }
+
+        /// Type of credentials this plugin is implementing.
+        fn get_type(&self) -> &'static str {
+            "gcp"
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
 
     use crate::{
         byte_str::ByteStr,
         endpoint::{
+            call_credentials::{CallCredentials, CallDetails, ChannelSecurityInfo},
+            gcp,
             tls::{
                 Certificates, ClientTlsConfig, ClientTlsCredendials, Identity, ServerTlsConfig,
                 ServerTlsCredendials, TlsClientCertificateRequestType,
@@ -895,6 +968,7 @@ mod test {
     use http::uri::Authority;
     use std::{env, fs, path::PathBuf};
     use tokio::net::{TcpListener, TcpStream};
+    use tonic::metadata::MetadataMap;
 
     #[tokio::test]
     pub async fn test_tls() {
@@ -978,5 +1052,26 @@ mod test {
 
         client.await.unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    pub async fn test_metadata() {
+        let call_creds = gcp::GcpCallCredentials::new().await.unwrap();
+        let mut md = MetadataMap::new();
+        let call_details = CallDetails {
+            service_url: "https://www.googleapis.com",
+            method_name: "auth/devstorage.read_write",
+        };
+        let auth_info = ChannelSecurityInfo {
+            security_protocol: "tls",
+            security_level: crate::endpoint::SecurityLevel::PrivacyAndIntegrity,
+            attributes: crate::attributes::Attributes {},
+        };
+        call_creds
+            .get_metadata(&call_details, &auth_info, &mut md)
+            .await
+            .unwrap();
+        assert!(md.get("authorization").is_some());
+        dbg!(md);
     }
 }
