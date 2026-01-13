@@ -895,9 +895,8 @@ pub(crate) mod call_credentials {
 }
 
 mod gcp {
-    use std::sync::Arc;
-
-    use gcp_auth::TokenProvider;
+    use google_cloud_auth::build_errors::Error;
+    use google_cloud_auth::credentials::{CacheableResource, Credentials};
     use serde::de::value;
     use tonic::{async_trait, metadata::MetadataMap, Status};
 
@@ -905,14 +904,15 @@ mod gcp {
     use crate::endpoint::SecurityLevel;
 
     pub(crate) struct GcpCallCredentials {
-        token_provider: Arc<dyn TokenProvider>,
+        credentials: Credentials,
     }
 
     impl GcpCallCredentials {
-        pub(crate) async fn new() -> Result<GcpCallCredentials, gcp_auth::Error> {
-            Ok(GcpCallCredentials {
-                token_provider: gcp_auth::provider().await?,
-            })
+        pub(crate) async fn new() -> Result<GcpCallCredentials, Error> {
+            let creds = google_cloud_auth::credentials::Builder::default()
+                .with_scopes(["https://www.googleapis.com/auth/cloud-platform"])
+                .build()?;
+            Ok(GcpCallCredentials { credentials: creds })
         }
     }
 
@@ -924,14 +924,30 @@ mod gcp {
             auth_info: &ChannelSecurityInfo,
             metadata: &mut MetadataMap,
         ) -> Result<(), Status> {
+            let extensions = http::Extensions::new();
             // let audience = format!("{}/{}", call_details.service_url, call_details.method_name);
-            let token = self
-                .token_provider
-                .token(&["https://www.googleapis.com/auth/cloud-platform"])
+            let resource = self
+                .credentials
+                .headers(extensions)
                 .await
                 .map_err(|e| Status::unavailable(e.to_string()))?;
-            let value = format!("Bearer {}", token.as_str());
-            metadata.append("authorization", value.parse().unwrap());
+            match resource {
+                CacheableResource::New { data, .. } => {
+                    if let Some(auth_val) = data.get("authorization") {
+                        // 4. Convert http::HeaderValue -> tonic::metadata::MetadataValue
+                        // Tonic's MetadataValue can be created from bytes, which avoids string parsing risks
+                        metadata.append("authorization", auth_val.as_bytes().try_into().unwrap());
+                    } else {
+                        return Err(Status::internal(
+                            "Credentials provider returned no Authorization header",
+                        ));
+                    }
+                }
+                CacheableResource::NotModified => {
+                    // This happens only if you pass an ETag in extensions.
+                    // Since we passed empty extensions, we expect 'New'.
+                }
+            }
             Ok(())
         }
 
