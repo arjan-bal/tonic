@@ -139,7 +139,7 @@ pub(crate) struct ClientHandshakeInfo {
 /// transport security protocols (e.g., TLS, SSL).
 #[async_trait]
 pub(crate) trait ClientChannelCredential: Send + Sync {
-    type ContextType;
+    type ContextType: ClientConnectionSecurityContext;
     type Output<I>;
     /// Performs the client-side authentication handshake on a raw endpoint.
     ///
@@ -153,7 +153,7 @@ pub(crate) trait ClientChannelCredential: Send + Sync {
     ///   (e.g., for SNI) during the handshake.
     /// * `source` - The raw connection handle.
     /// * `info` - Additional context passed from the resolver or load balancer.
-    async fn connect<Input: GrpcEndpoint>(
+    async fn connect<Input: GrpcEndpoint + 'static>(
         &self,
         authority: &http::uri::Authority,
         source: Input,
@@ -171,6 +171,80 @@ pub(crate) trait ClientChannelCredential: Send + Sync {
     fn info(&self) -> &ProtocolInfo;
 }
 
+impl ClientConnectionSecurityContext for Box<dyn ClientConnectionSecurityContext> {}
+impl private::Sealed for Box<dyn GrpcEndpoint> {}
+
+impl GrpcEndpoint for Box<dyn GrpcEndpoint> {
+    fn get_local_address(&self) -> ByteStr {
+        (**self).get_local_address()
+    }
+
+    fn get_peer_address(&self) -> ByteStr {
+        (**self).get_peer_address()
+    }
+}
+
+// This effectively erases the generic types by forcing them into Boxes.
+#[async_trait]
+trait DynClientChannelCredential: Send + Sync {
+    async fn connect_dyn(
+        &self,
+        authority: &http::uri::Authority,
+        source: Box<dyn GrpcEndpoint>,
+        info: ClientHandshakeInfo,
+        runtime: Arc<dyn Runtime>,
+    ) -> Result<
+        (
+            Box<dyn GrpcEndpoint>,
+            ClientConnectionSecurityInfo<Box<dyn ClientConnectionSecurityContext>>,
+        ),
+        String,
+    >;
+
+    fn info_dyn(&self) -> &ProtocolInfo;
+}
+
+#[async_trait]
+impl<T> DynClientChannelCredential for T
+where
+    T: ClientChannelCredential,
+    // We require that the specific Output T produces can be boxed into the dyn trait
+    // and the Context can be boxed.
+    T::Output<Box<dyn GrpcEndpoint>>: GrpcEndpoint + 'static,
+{
+    async fn connect_dyn(
+        &self,
+        authority: &http::uri::Authority,
+        source: Box<dyn GrpcEndpoint>,
+        info: ClientHandshakeInfo,
+        runtime: Arc<dyn Runtime>,
+    ) -> Result<
+        (
+            Box<dyn GrpcEndpoint>,
+            ClientConnectionSecurityInfo<Box<dyn ClientConnectionSecurityContext>>,
+        ),
+        String,
+    > {
+        let (stream, sec_info) = self.connect(authority, source, info, runtime).await?;
+
+        let boxed_stream: Box<dyn GrpcEndpoint> = Box::new(stream);
+
+        let boxed_sec_info = ClientConnectionSecurityInfo {
+            security_protocol: sec_info.security_protocol,
+            security_level: sec_info.security_level,
+            security_context: Box::new(sec_info.security_context)
+                as Box<dyn ClientConnectionSecurityContext>,
+            attributes: sec_info.attributes,
+        };
+
+        Ok((boxed_stream, boxed_sec_info))
+    }
+
+    fn info_dyn(&self) -> &ProtocolInfo {
+        self.info()
+    }
+}
+
 #[async_trait]
 pub(crate) trait ServerChannelCredentials: Send + Sync {
     type Output<I>;
@@ -183,8 +257,7 @@ pub(crate) trait ServerChannelCredentials: Send + Sync {
     ///
     /// A tuple containing:
     /// 1. The authenticated endpoint (ready for reading/writing frames).
-    /// 2. The security context describing the connection (e.g., peer certificates).
-    async fn accept<Input: GrpcEndpoint>(
+    async fn accept<Input: GrpcEndpoint + 'static>(
         &self,
         source: Input,
         runtime: Arc<dyn Runtime>,
@@ -192,6 +265,40 @@ pub(crate) trait ServerChannelCredentials: Send + Sync {
 
     //// Provides the ProtocolInfo of this ServerChannelCredentials.
     fn info(&self) -> &ProtocolInfo;
+}
+
+// Bridge trait for type erasure
+#[async_trait]
+trait DynServerChannelCredentials: Send + Sync {
+    async fn accept_dyn(
+        &self,
+        source: Box<dyn GrpcEndpoint>,
+        runtime: Arc<dyn Runtime>,
+    ) -> Result<(Box<dyn GrpcEndpoint>, ServerConnectionSecurityInfo), String>;
+
+    fn info_dyn(&self) -> &ProtocolInfo;
+}
+
+// Blanket implementation to bridge generic to dynamic
+#[async_trait]
+impl<T> DynServerChannelCredentials for T
+where
+    T: ServerChannelCredentials,
+    T::Output<Box<dyn GrpcEndpoint>>: GrpcEndpoint + 'static,
+{
+    async fn accept_dyn(
+        &self,
+        source: Box<dyn GrpcEndpoint>,
+        runtime: Arc<dyn Runtime>,
+    ) -> Result<(Box<dyn GrpcEndpoint>, ServerConnectionSecurityInfo), String> {
+        let (stream, sec_info) = self.accept(source, runtime).await?;
+        let boxed_stream: Box<dyn GrpcEndpoint> = Box::new(stream);
+        Ok((boxed_stream, sec_info))
+    }
+
+    fn info_dyn(&self) -> &ProtocolInfo {
+        self.info()
+    }
 }
 
 /// Defines the level of protection provided by an established connection.
@@ -450,7 +557,7 @@ pub(crate) mod tls {
     impl ClientChannelCredential for ClientTlsCredendials {
         type ContextType = ClientTlsSecContext;
         type Output<I> = TlsStream<I>;
-        async fn connect<Input: GrpcEndpoint>(
+        async fn connect<Input: GrpcEndpoint + 'static>(
             &self,
             authority: &http::uri::Authority,
             source: Input,
@@ -738,7 +845,7 @@ pub(crate) mod tls {
     impl ServerChannelCredentials for ServerTlsCredendials {
         type Output<Input> = TlsStream<Input>;
 
-        async fn accept<Input: GrpcEndpoint>(
+        async fn accept<Input: GrpcEndpoint + 'static>(
             &self,
             source: Input,
             _rt: Arc<dyn Runtime>,
@@ -976,8 +1083,8 @@ mod test {
                 Certificates, ClientTlsConfig, ClientTlsCredendials, Identity, ServerTlsConfig,
                 ServerTlsCredendials, TlsClientCertificateRequestType,
             },
-            BoxGrpcEndpoint, ClientChannelCredential, ClientHandshakeInfo,
-            ServerChannelCredentials,
+            ClientChannelCredential, ClientHandshakeInfo, DynClientChannelCredential,
+            DynServerChannelCredentials, ServerChannelCredentials,
         },
         rt,
     };
@@ -1034,7 +1141,11 @@ mod test {
                     },
             };
             let creds = ServerTlsCredendials::new(&config).unwrap();
-            let stream = creds.accept(stream, rt::default_runtime()).await.unwrap();
+            let any_creds: Box<dyn DynServerChannelCredentials> = Box::new(creds);
+            let stream = any_creds
+                .accept_dyn(Box::new(stream), rt::default_runtime())
+                .await
+                .unwrap();
         });
 
         let client = tokio::spawn(async move {
@@ -1055,10 +1166,11 @@ mod test {
                 use_key_log: false,
             };
             let creds = ClientTlsCredendials::new(&config).unwrap();
-            let stream = creds
-                .connect(
+            let any_creds: Box<dyn DynClientChannelCredential> = Box::new(creds);
+            let stream = any_creds
+                .connect_dyn(
                     &"abc.test.example.com".parse().unwrap(),
-                    socket,
+                    Box::new(socket),
                     ClientHandshakeInfo::default(),
                     rt::default_runtime(),
                 )
