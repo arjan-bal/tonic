@@ -398,18 +398,11 @@ pub(crate) mod tls {
 
     /// Represents a X509 certificate chain.
     #[derive(Debug, Clone)]
-    pub struct Certificates {
+    pub struct Roots {
         pem: Vec<u8>,
     }
 
-    /// Represents a private key and X509 certificate chain.
-    #[derive(Debug, Clone)]
-    pub struct Identity {
-        cert: Certificates,
-        key: Vec<u8>,
-    }
-
-    impl Certificates {
+    impl Roots {
         /// Parse a PEM encoded X509 Certificate.
         ///
         /// The provided PEM should include at least one PEM encoded certificate.
@@ -419,31 +412,38 @@ pub(crate) mod tls {
         }
 
         /// Get a immutable reference to underlying certificate
-        pub fn get_ref(&self) -> &[u8] {
+        fn get_ref(&self) -> &[u8] {
             self.pem.as_slice()
         }
 
         /// Get a mutable reference to underlying certificate
-        pub fn get_mut(&mut self) -> &mut [u8] {
+        fn get_mut(&mut self) -> &mut [u8] {
             self.pem.as_mut()
         }
 
         /// Consumes `self`, returning the underlying certificate
-        pub fn into_inner(self) -> Vec<u8> {
+        fn into_inner(self) -> Vec<u8> {
             self.pem
         }
     }
 
-    impl AsRef<[u8]> for Certificates {
+    impl AsRef<[u8]> for Roots {
         fn as_ref(&self) -> &[u8] {
             self.pem.as_ref()
         }
     }
 
-    impl AsMut<[u8]> for Certificates {
+    impl AsMut<[u8]> for Roots {
         fn as_mut(&mut self) -> &mut [u8] {
             self.pem.as_mut()
         }
+    }
+
+    /// Represents a private key and X509 certificate chain.
+    #[derive(Debug, Clone)]
+    pub struct Identity {
+        cert: Vec<u8>,
+        key: Vec<u8>,
     }
 
     impl Identity {
@@ -451,7 +451,7 @@ pub(crate) mod tls {
         ///
         /// The provided cert must contain at least one PEM encoded certificate.
         pub fn from_pem(cert: impl AsRef<[u8]>, key: impl AsRef<[u8]>) -> Self {
-            let cert = Certificates::from_pem(cert);
+            let cert = cert.as_ref().into();
             let key = key.as_ref().into();
             Self { cert, key }
         }
@@ -459,7 +459,7 @@ pub(crate) mod tls {
 
     /// Configuration for client-side TLS settings.
     pub(crate) struct ClientTlsConfig {
-        pem_roots_provider: Option<Receiver<Certificates>>,
+        pem_roots_provider: Option<Receiver<Roots>>,
         identity_provider: Option<Receiver<Identity>>,
         key_log_path: Option<PathBuf>,
     }
@@ -467,18 +467,45 @@ pub(crate) mod tls {
     mod provider {
         use tokio::sync::watch::Receiver;
 
+        /// A sealed trait to prevent downstream implementations of `Provider`.
+        ///
+        /// This trait exposes the internal mechanism (Tokio watch channel) used to
+        /// receive updates. It is kept private/restricted to ensure that `Provider`
+        /// can only be implemented by types defined within this crate.
         pub trait Sealed<T> {
+            /// Returns a clone of the underlying watch receiver.
+            ///
+            /// This allows the consumer to observe the current value and await
+            /// future updates.
             fn get_receiver(self) -> Receiver<T>;
         }
     }
 
-    pub(crate) trait Provider<T>: provider::Sealed<T> {}
+    /// A source of configuration or state of type `T` that allows for dynamic
+    /// updates.
+    ///
+    /// This trait abstracts over the source of the data (e.g., static memory,
+    /// file system, network) and provides a uniform interface for consumers to
+    /// access the current value and subscribe to changes.
+    ///
+    /// # Underlying Mechanism
+    ///
+    /// Implementations use a [`tokio::sync::watch::Receiver`] internally. This supports:
+    /// * **Instant Access:** The current value is always available via `borrow()`.
+    /// * **Change Notification:** Consumers can `await` changes using `changed()`.
+    ///
+    /// # Sealed Trait
+    ///
+    /// This trait is **sealed**. It cannot be implemented by downstream crates.
+    /// Users should rely on the provided implementations (e.g.,
+    /// `StaticIdentityProvider`, `StaticRootsProvider`).
+    pub trait Provider<T>: provider::Sealed<T> {}
 
-    pub(crate) type StaticRootsProvider = StaticProvider<Certificates>;
-    pub(crate) type StaticIdentityProvider = StaticProvider<Identity>;
+    pub type StaticRootsProvider = StaticProvider<Roots>;
+    pub type StaticIdentityProvider = StaticProvider<Identity>;
 
     impl ClientTlsConfig {
-        pub(crate) fn new() -> Self {
+        pub fn new() -> Self {
             ClientTlsConfig {
                 pem_roots_provider: None,
                 identity_provider: None,
@@ -491,9 +518,9 @@ pub(crate) mod tls {
         /// These certificates are used to validate the server's certificate chain.
         /// If this is not called, the client generally defaults to using the
         /// system's native certificate store.
-        pub(crate) fn with_roots_provider<R>(mut self, provider: R) -> Self
+        pub fn with_roots_provider<R>(mut self, provider: R) -> Self
         where
-            R: Provider<Certificates>,
+            R: Provider<Roots>,
         {
             self.pem_roots_provider = Some(provider.get_receiver());
             self
@@ -504,7 +531,7 @@ pub(crate) mod tls {
         /// This provides the client's certificate chain and private key.
         /// If this is not called, the client will not present a certificate
         /// to the server (standard one-way TLS).
-        pub(crate) fn with_identity_provider<I>(mut self, provider: I) -> Self
+        pub fn with_identity_provider<I>(mut self, provider: I) -> Self
         where
             I: Provider<Identity>,
         {
@@ -518,14 +545,14 @@ pub(crate) mod tls {
         ///
         /// This should be used **only for debugging purposes**. It should never be
         /// used in a production environment due to security concerns.
-        pub(crate) fn with_key_log_path(mut self, path: impl Into<PathBuf>) -> Self {
+        pub fn with_key_log_path(mut self, path: impl Into<PathBuf>) -> Self {
             self.key_log_path = Some(path.into());
             self
         }
     }
 
     #[derive(Clone)]
-    pub(crate) struct ClientTlsCredendials {
+    pub struct ClientTlsCredendials {
         connector: SslConnector,
     }
 
@@ -536,7 +563,9 @@ pub(crate) mod tls {
     const ALPN_H2: &[u8] = b"\x02h2";
 
     impl ClientTlsCredendials {
-        pub(crate) fn new(mut config: ClientTlsConfig) -> Result<ClientTlsCredendials, String> {
+        /// Constructs a new `ClientTlsCredendials` instance from the provided
+        /// configuration.
+        pub fn new(mut config: ClientTlsConfig) -> Result<ClientTlsCredendials, String> {
             let mut builder =
                 SslConnector::builder(SslMethod::tls_client()).map_err(|e| e.to_string())?;
             builder.set_verify(SslVerifyMode::PEER);
@@ -563,7 +592,7 @@ pub(crate) mod tls {
             if let Some(mut identity_provider) = config.identity_provider.take() {
                 let identity = identity_provider.borrow_and_update();
                 let mut chain =
-                    X509::stack_from_pem(identity.cert.get_ref()).map_err(|e| e.to_string())?;
+                    X509::stack_from_pem(identity.cert.as_ref()).map_err(|e| e.to_string())?;
                 if chain.is_empty() {
                     return Err("empty client cert chain".to_string());
                 }
@@ -645,7 +674,7 @@ pub(crate) mod tls {
     }
 
     #[non_exhaustive]
-    pub(crate) enum TlsClientCertificateRequestType<R = StaticRootsProvider> {
+    pub enum TlsClientCertificateRequestType<R = StaticRootsProvider> {
         /// Server does not request client certificate.
         ///
         /// The certificate presented by the client is not checked by the server at
@@ -679,12 +708,8 @@ pub(crate) mod tls {
 
     enum InnerClientCertificateRequestType {
         DontRequestClientCertificate,
-        RequestClientCertificateAndVerify {
-            roots_provider: Receiver<Certificates>,
-        },
-        RequestAndRequireClientCertificateAndVerify {
-            roots_provider: Receiver<Certificates>,
-        },
+        RequestClientCertificateAndVerify { roots_provider: Receiver<Roots> },
+        RequestAndRequireClientCertificateAndVerify { roots_provider: Receiver<Roots> },
     }
 
     impl From<TlsClientCertificateRequestType> for InnerClientCertificateRequestType {
@@ -714,11 +739,17 @@ pub(crate) mod tls {
         acceptor: SslAcceptor,
     }
 
-    pub(crate) struct StaticProvider<T> {
+    /// A provider that supplies a constant, immutable value.
+    ///
+    /// This implementation is useful when dynamic updates are not required,
+    /// such  simple configurations where certificates or identities are loaded
+    /// once at startup and never change.
+    pub struct StaticProvider<T> {
         inner: T,
     }
 
     impl<T> StaticProvider<T> {
+        /// Creates a new `StaticProvider` with the given fixed value.
         pub(crate) fn new(value: T) -> Self {
             Self { inner: value }
         }
@@ -726,6 +757,9 @@ pub(crate) mod tls {
 
     impl<T> provider::Sealed<T> for StaticProvider<T> {
         fn get_receiver(self) -> Receiver<T> {
+            // We drop the sender (_) immediately.
+            // This ensures the receiver sees the initial value but knows
+            // no future updates will arrive.
             let (_, rx) = watch::channel(self.inner);
             rx
         }
@@ -733,21 +767,18 @@ pub(crate) mod tls {
 
     impl<T> Provider<T> for StaticProvider<T> {}
 
-    pub(crate) type StaticIdentityListProvider = StaticProvider<IdentityList>;
+    pub type IdentityList = Vec<Identity>;
+    pub type StaticIdentityListProvider = StaticProvider<IdentityList>;
 
-    pub(crate) struct ServerTlsConfig {
+    /// Configuration for server-side TLS settings.
+    pub struct ServerTlsConfig {
         identities_provider: Receiver<IdentityList>,
         request_type: InnerClientCertificateRequestType,
         key_log_path: Option<PathBuf>,
     }
 
-    pub(crate) type IdentityList = Vec<Identity>;
-
     impl ServerTlsConfig {
-        pub(crate) fn new<I>(
-            identities_provider: I,
-            request_type: TlsClientCertificateRequestType,
-        ) -> Self
+        pub fn new<I>(identities_provider: I, request_type: TlsClientCertificateRequestType) -> Self
         where
             I: Provider<IdentityList>,
         {
@@ -771,7 +802,7 @@ pub(crate) mod tls {
     }
 
     impl ServerTlsCredendials {
-        pub(crate) fn new(mut config: ServerTlsConfig) -> Result<ServerTlsCredendials, String> {
+        pub fn new(mut config: ServerTlsConfig) -> Result<ServerTlsCredendials, String> {
             let id_list = config.identities_provider.borrow_and_update().clone();
             if id_list.is_empty() {
                 return Err("need at least one server identity.".to_string());
@@ -1149,7 +1180,7 @@ mod test {
             call_credentials::{CallCredentials, CallDetails, ChannelSecurityInfo},
             gcp,
             tls::{
-                Certificates, ClientTlsConfig, ClientTlsCredendials, Identity, ServerTlsConfig,
+                ClientTlsConfig, ClientTlsCredendials, Identity, Roots, ServerTlsConfig,
                 ServerTlsCredendials, StaticIdentityListProvider, StaticIdentityProvider,
                 StaticRootsProvider, TlsClientCertificateRequestType,
             },
@@ -1202,7 +1233,7 @@ mod test {
             let config = ServerTlsConfig::new(
                 StaticIdentityListProvider::new(vec![Identity::from_pem(cert, key)]),
                 TlsClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
-                    roots_provider: StaticRootsProvider::new(Certificates::from_pem(ca)),
+                    roots_provider: StaticRootsProvider::new(Roots::from_pem(ca)),
                 },
             );
             let creds = ServerTlsCredendials::new(config).unwrap();
@@ -1223,7 +1254,7 @@ mod test {
             let key = fs::read(base_copy.join("client1_key.pem")).unwrap();
 
             let config = ClientTlsConfig::new()
-                .with_roots_provider(StaticRootsProvider::new(Certificates::from_pem(ca)))
+                .with_roots_provider(StaticRootsProvider::new(Roots::from_pem(ca)))
                 .with_identity_provider(StaticIdentityProvider::new(Identity::from_pem(cert, key)));
             let creds = ClientTlsCredendials::new(config).unwrap();
             let any_creds: Box<dyn DynClientChannelCredential> = Box::new(creds);
