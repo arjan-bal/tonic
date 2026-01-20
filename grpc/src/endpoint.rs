@@ -363,6 +363,7 @@ pub(crate) mod tls {
         env,
         io::IoSlice,
         net::IpAddr,
+        path::PathBuf,
         pin::Pin,
         sync::Arc,
         task::{Context, Poll},
@@ -375,7 +376,11 @@ pub(crate) mod tls {
         },
         x509::X509,
     };
-    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use google_cloud_auth::credentials::api_key_credentials;
+    use tokio::{
+        io::{AsyncRead, AsyncWrite, ReadBuf},
+        sync::watch::{self, Receiver},
+    };
     use tokio_boring::SslStream;
     use tonic::async_trait;
 
@@ -383,9 +388,10 @@ pub(crate) mod tls {
         attributes::Attributes,
         byte_str::ByteStr,
         endpoint::{
-            private, ClientChannelCredential, ClientConnectionSecurityContext,
-            ClientConnectionSecurityInfo, ClientHandshakeInfo, GrpcEndpoint, GrpcStreamWrapper,
-            ProtocolInfo, SecurityLevel, ServerChannelCredentials, ServerConnectionSecurityInfo,
+            private, tls::provider::Sealed as _, ClientChannelCredential,
+            ClientConnectionSecurityContext, ClientConnectionSecurityInfo, ClientHandshakeInfo,
+            GrpcEndpoint, GrpcStreamWrapper, ProtocolInfo, SecurityLevel, ServerChannelCredentials,
+            ServerConnectionSecurityInfo,
         },
         rt::Runtime,
     };
@@ -393,14 +399,14 @@ pub(crate) mod tls {
     /// Represents a X509 certificate chain.
     #[derive(Debug, Clone)]
     pub struct Certificates {
-        pub(crate) pem: Vec<u8>,
+        pem: Vec<u8>,
     }
 
     /// Represents a private key and X509 certificate chain.
     #[derive(Debug, Clone)]
     pub struct Identity {
-        pub(crate) cert: Certificates,
-        pub(crate) key: Vec<u8>,
+        cert: Certificates,
+        key: Vec<u8>,
     }
 
     impl Certificates {
@@ -452,30 +458,70 @@ pub(crate) mod tls {
     }
 
     /// Configuration for client-side TLS settings.
-    #[derive(Default)]
     pub(crate) struct ClientTlsConfig {
-        /// The set of PEM-encoded root certificates (CA) to trust.
-        ///
-        /// If `Some`, these certificates are used to validate the server's
-        /// certificate chain. If `None`, the client generally defaults to using
-        /// the system's native certificate store.
-        pub(crate) pem_root_certs: Option<Certificates>,
+        pem_roots_provider: Option<Receiver<Certificates>>,
+        identity_provider: Option<Receiver<Identity>>,
+        key_log_path: Option<PathBuf>,
+    }
 
-        /// The client's identity for Mutual TLS (mTLS).
-        ///
-        /// Contains the client's certificate chain and private key. If `None`,
-        /// the client will not present a certificate to the server
-        /// (standard one-way TLS).
-        pub(crate) identity: Option<Identity>,
+    mod provider {
+        use tokio::sync::watch::Receiver;
 
-        /// Enables the key logging that writes to a file whose name is
-        /// given by the `SSLKEYLOGFILE` environment variable.
+        pub trait Sealed<T> {
+            fn get_receiver(self) -> Receiver<T>;
+        }
+    }
+
+    pub(crate) trait Provider<T>: provider::Sealed<T> {}
+
+    pub(crate) type StaticRootsProvider = StaticProvider<Certificates>;
+    pub(crate) type StaticIdentityProvider = StaticProvider<Identity>;
+
+    impl ClientTlsConfig {
+        pub(crate) fn new() -> Self {
+            ClientTlsConfig {
+                pem_roots_provider: None,
+                identity_provider: None,
+                key_log_path: None,
+            }
+        }
+
+        /// Configures the set of PEM-encoded root certificates (CA) to trust.
         ///
-        /// If `SSLKEYLOGFILE` is not set, this does nothing.
+        /// These certificates are used to validate the server's certificate chain.
+        /// If this is not called, the client generally defaults to using the
+        /// system's native certificate store.
+        pub(crate) fn with_roots_provider<R>(mut self, provider: R) -> Self
+        where
+            R: Provider<Certificates>,
+        {
+            self.pem_roots_provider = Some(provider.get_receiver());
+            self
+        }
+
+        /// Configures the client's identity for Mutual TLS (mTLS).
         ///
-        /// If such a file cannot be opened, or cannot be written then
-        /// this does nothing but logs errors at warning-level.
-        pub(crate) use_key_log: bool,
+        /// This provides the client's certificate chain and private key.
+        /// If this is not called, the client will not present a certificate
+        /// to the server (standard one-way TLS).
+        pub(crate) fn with_identity_provider<I>(mut self, provider: I) -> Self
+        where
+            I: Provider<Identity>,
+        {
+            self.identity_provider = Some(provider.get_receiver());
+            self
+        }
+
+        /// Sets the path where TLS session keys will be logged.
+        ///
+        /// # Security
+        ///
+        /// This should be used **only for debugging purposes**. It should never be
+        /// used in a production environment due to security concerns.
+        pub(crate) fn with_key_log_path(mut self, path: impl Into<PathBuf>) -> Self {
+            self.key_log_path = Some(path.into());
+            self
+        }
     }
 
     #[derive(Clone)]
@@ -490,7 +536,7 @@ pub(crate) mod tls {
     const ALPN_H2: &[u8] = b"\x02h2";
 
     impl ClientTlsCredendials {
-        pub(crate) fn new(config: &ClientTlsConfig) -> Result<ClientTlsCredendials, String> {
+        pub(crate) fn new(mut config: ClientTlsConfig) -> Result<ClientTlsCredendials, String> {
             let mut builder =
                 SslConnector::builder(SslMethod::tls_client()).map_err(|e| e.to_string())?;
             builder.set_verify(SslVerifyMode::PEER);
@@ -499,7 +545,8 @@ pub(crate) mod tls {
                 .map_err(|e| e.to_string())?;
 
             // Set trust store.
-            if let Some(ca_pem) = &config.pem_root_certs {
+            if let Some(mut roots_provider) = config.pem_roots_provider.take() {
+                let ca_pem = roots_provider.borrow_and_update();
                 let ca_certs = X509::stack_from_pem(ca_pem.as_ref()).map_err(|e| e.to_string())?;
                 let cert_store = builder.cert_store_mut();
                 for cert in ca_certs {
@@ -513,7 +560,8 @@ pub(crate) mod tls {
                     .map_err(|e| e.to_string())?;
             }
 
-            if let Some(identity) = &config.identity {
+            if let Some(mut identity_provider) = config.identity_provider.take() {
+                let identity = identity_provider.borrow_and_update();
                 let mut chain =
                     X509::stack_from_pem(identity.cert.get_ref()).map_err(|e| e.to_string())?;
                 if chain.is_empty() {
@@ -596,24 +644,14 @@ pub(crate) mod tls {
         }
     }
 
-    pub(crate) enum TlsClientCertificateRequestType {
+    #[non_exhaustive]
+    pub(crate) enum TlsClientCertificateRequestType<R = StaticRootsProvider> {
         /// Server does not request client certificate.
         ///
         /// The certificate presented by the client is not checked by the server at
         /// all. (A client may present a self-signed or signed certificate or not
         /// present a certificate at all and any of those option would be accepted).
         DontRequestClientCertificate,
-
-        /// Server requests client certificate but does not enforce that the client
-        /// presents a certificate.
-        ///
-        /// If the client presents a certificate, the client authentication is left to
-        /// the application (the necessary metadata will be available to the
-        /// application via authentication context properties).
-        ///
-        /// The client's key certificate pair must be valid for the SSL connection to
-        /// be established.
-        RequestClientCertificateButDontVerify,
 
         /// Server requests client certificate but does not enforce that the client
         /// presents a certificate.
@@ -625,18 +663,7 @@ pub(crate) mod tls {
         ///
         /// The client's key certificate pair must be valid for the SSL connection to
         /// be established.
-        RequestClientCertificateAndVerify { pem_root_certs: Certificates },
-
-        /// Server requests client certificate and enforces that the client presents a
-        /// certificate.
-        ///
-        /// If the client presents a certificate, the client authentication is left to
-        /// the application (the necessary metadata will be available to the
-        /// application via authentication context properties).
-        ///
-        /// The client's key certificate pair must be valid for the SSL connection to
-        /// be established.
-        RequestAndRequireClientCertificateButDontVerify,
+        RequestClientCertificateAndVerify { roots_provider: R },
 
         /// Server requests client certificate and enforces that the client presents a
         /// certificate.
@@ -647,7 +674,39 @@ pub(crate) mod tls {
         ///
         /// The client's key certificate pair must be valid for the SSL connection to
         /// be established.
-        RequestAndRequireClientCertificateAndVerify { pem_root_certs: Certificates },
+        RequestAndRequireClientCertificateAndVerify { roots_provider: R },
+    }
+
+    enum InnerClientCertificateRequestType {
+        DontRequestClientCertificate,
+        RequestClientCertificateAndVerify {
+            roots_provider: Receiver<Certificates>,
+        },
+        RequestAndRequireClientCertificateAndVerify {
+            roots_provider: Receiver<Certificates>,
+        },
+    }
+
+    impl From<TlsClientCertificateRequestType> for InnerClientCertificateRequestType {
+        fn from(value: TlsClientCertificateRequestType) -> Self {
+            match value {
+                TlsClientCertificateRequestType::DontRequestClientCertificate => {
+                    InnerClientCertificateRequestType::DontRequestClientCertificate
+                }
+                TlsClientCertificateRequestType::RequestClientCertificateAndVerify {
+                    roots_provider,
+                } => InnerClientCertificateRequestType::RequestClientCertificateAndVerify {
+                    roots_provider: roots_provider.get_receiver(),
+                },
+                TlsClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
+                    roots_provider,
+                } => {
+                    InnerClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
+                        roots_provider: roots_provider.get_receiver(),
+                    }
+                }
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -655,29 +714,90 @@ pub(crate) mod tls {
         acceptor: SslAcceptor,
     }
 
+    pub(crate) struct StaticProvider<T> {
+        inner: T,
+    }
+
+    impl<T> StaticProvider<T> {
+        pub(crate) fn new(value: T) -> Self {
+            Self { inner: value }
+        }
+    }
+
+    impl<T> provider::Sealed<T> for StaticProvider<T> {
+        fn get_receiver(self) -> Receiver<T> {
+            let (_, rx) = watch::channel(self.inner);
+            rx
+        }
+    }
+
+    impl<T> Provider<T> for StaticProvider<T> {}
+
+    pub(crate) type StaticIdentityListProvider = StaticProvider<IdentityList>;
+
     pub(crate) struct ServerTlsConfig {
-        pub(crate) identities: Vec<Identity>,
-        pub(crate) request_type: TlsClientCertificateRequestType,
-        /// Enables the key logging that writes to a file whose name is
-        /// given by the `SSLKEYLOGFILE` environment variable.
+        identities_provider: Receiver<IdentityList>,
+        request_type: InnerClientCertificateRequestType,
+        key_log_path: Option<PathBuf>,
+    }
+
+    pub(crate) type IdentityList = Vec<Identity>;
+
+    impl ServerTlsConfig {
+        pub(crate) fn new<I>(
+            identities_provider: I,
+            request_type: TlsClientCertificateRequestType,
+        ) -> Self
+        where
+            I: Provider<IdentityList>,
+        {
+            ServerTlsConfig {
+                identities_provider: identities_provider.get_receiver(),
+                request_type: request_type.into(),
+                key_log_path: None,
+            }
+        }
+
+        /// Sets the path where TLS session keys will be logged.
         ///
-        /// If `SSLKEYLOGFILE` is not set, this does nothing.
+        /// # Security
         ///
-        /// If such a file cannot be opened, or cannot be written then
-        /// this does nothing but logs errors at warning-level.
-        pub(crate) use_key_log: bool,
+        /// This should be used **only for debugging purposes**. It should never be
+        /// used in a production environment due to security concerns.
+        pub(crate) fn with_key_log_path(mut self, path: impl Into<PathBuf>) -> Self {
+            self.key_log_path = Some(path.into());
+            self
+        }
     }
 
     impl ServerTlsCredendials {
-        pub(crate) fn new(config: &ServerTlsConfig) -> Result<ServerTlsCredendials, String> {
-            if config.identities.is_empty() {
+        pub(crate) fn new(mut config: ServerTlsConfig) -> Result<ServerTlsCredendials, String> {
+            let id_list = config.identities_provider.borrow_and_update().clone();
+            if id_list.is_empty() {
                 return Err("need at least one server identity.".to_string());
             }
             let mut contexts = Vec::new();
-            let mut verify_mode = SslVerifyMode::NONE;
-            let mut bypass_cert_verification = false;
+            let verify_mode;
+            let roots_pem = match config.request_type {
+                InnerClientCertificateRequestType::RequestClientCertificateAndVerify {
+               mut     roots_provider,
+                } => {
+                    verify_mode = SslVerifyMode::PEER;
+                    Some(roots_provider.borrow_and_update().pem.clone())
+                }
+                InnerClientCertificateRequestType::DontRequestClientCertificate => {
+                    verify_mode = SslVerifyMode::NONE;
+                    None
+                }
+                InnerClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
+                    mut roots_provider,
+                } => {
+                    verify_mode = SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT;
+                    Some(roots_provider.borrow_and_update().pem.clone())
+                }
+            };
 
-            for identity in &config.identities {
+            for identity in id_list {
                 let mut context =
                     SslContext::builder(SslMethod::tls_server()).map_err(|e| e.to_string())?;
                 context.set_alpn_select_callback(|_ssl_ref, a| Ok(b"h2"));
@@ -700,58 +820,15 @@ pub(crate) mod tls {
 
                 let pkey = PKey::private_key_from_pem(&identity.key).map_err(|e| e.to_string())?;
                 context.set_private_key(&pkey).map_err(|e| e.to_string())?;
-
-                match &config.request_type {
-            TlsClientCertificateRequestType::DontRequestClientCertificate => {
-                verify_mode = SslVerifyMode::NONE;
-                context.set_verify(verify_mode)
-            }
-            TlsClientCertificateRequestType::RequestClientCertificateButDontVerify => {
-                verify_mode = SslVerifyMode::PEER;
-                bypass_cert_verification = true;
-                // Disable cryptographic verification.
-                // By default, OpenSSL attempts to verify the chain against trusted roots
-                // if a cert is presented. We override this to always say "valid".
-                context.set_custom_verify_callback(verify_mode, |_ssl_ref| {
-                    // Return Ok(()) unconditionally to accept ANY certificate (expired, self-signed, etc.)
-                    Ok(())
-                });
-            }
-            TlsClientCertificateRequestType::RequestClientCertificateAndVerify {
-                pem_root_certs,
-            } => {
-                verify_mode = SslVerifyMode::PEER;
                 context.set_verify(verify_mode);
-                let certs =
-                    X509::stack_from_pem(&pem_root_certs.pem).map_err(|e| e.to_string())?;
-                let store = context.cert_store_mut();
-                for cert in certs {
-                    store.add_cert(cert).map_err(|e| e.to_string())?;
+
+                if let Some(pem) = roots_pem.as_ref() {
+                    let certs = X509::stack_from_pem(pem).map_err(|e| e.to_string())?;
+                    let store = context.cert_store_mut();
+                    for cert in certs {
+                        store.add_cert(cert).map_err(|e| e.to_string())?;
+                    }
                 }
-            }
-            TlsClientCertificateRequestType::RequestAndRequireClientCertificateButDontVerify => {
-                // Disable cryptographic verification.
-                // By default, OpenSSL attempts to verify the chain against trusted roots
-                // if a cert is presented. We override this to always say "valid".
-                verify_mode = SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT;
-                bypass_cert_verification = true;
-                context.set_custom_verify_callback(verify_mode, |_ssl_ref| {
-                    // Return Ok(()) unconditionally to accept ANY certificate (expired, self-signed, etc.)
-                    Ok(())
-                });
-            }
-            TlsClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
-                pem_root_certs,
-            } => {
-                context.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
-                let certs =
-                    X509::stack_from_pem(&pem_root_certs.pem).map_err(|e| e.to_string())?;
-                let store = context.cert_store_mut();
-                for cert in certs {
-                    store.add_cert(cert).map_err(|e| e.to_string())?;
-                }
-            }
-        };
                 contexts.push(context.build());
             }
 
@@ -794,15 +871,7 @@ pub(crate) mod tls {
                     ssl.set_ssl_context(ctx)
                         .map_err(|_| SniError::ALERT_FATAL)?;
                     ssl.set_verify(ctx.verify_mode());
-                    if bypass_cert_verification {
-                        ssl.set_custom_verify_callback(verify_mode, |_ssl_ref| {
-                            // Return Ok(()) unconditionally to accept ANY certificate (expired, self-signed, etc.)
-                            println!("Verification skipped");
-                            Ok(())
-                        });
-                    } else {
-                        ssl.set_verify(verify_mode);
-                    }
+                    ssl.set_verify(verify_mode);
                     return Ok(());
                 }
                 // No match found in any context.
@@ -1081,7 +1150,8 @@ mod test {
             gcp,
             tls::{
                 Certificates, ClientTlsConfig, ClientTlsCredendials, Identity, ServerTlsConfig,
-                ServerTlsCredendials, TlsClientCertificateRequestType,
+                ServerTlsCredendials, StaticIdentityListProvider, StaticIdentityProvider,
+                StaticRootsProvider, TlsClientCertificateRequestType,
             },
             ClientChannelCredential, ClientHandshakeInfo, DynClientChannelCredential,
             DynServerChannelCredentials, ServerChannelCredentials,
@@ -1100,7 +1170,7 @@ mod test {
             .await
             .unwrap();
         let ge = stream;
-        let creds = ClientTlsCredendials::new(&ClientTlsConfig::default()).unwrap();
+        let creds = ClientTlsCredendials::new(ClientTlsConfig::new()).unwrap();
         let authority: Authority = "google.com".parse().unwrap();
         let authenticated = creds
             .connect(
@@ -1129,18 +1199,13 @@ mod test {
             let cert = fs::read(base.join("server1_cert.pem")).unwrap();
             let key = fs::read(base.join("server1_key.pem")).unwrap();
 
-            let config = ServerTlsConfig {
-                use_key_log: false,
-                identities: vec![Identity {
-                    key: key,
-                    cert: crate::endpoint::tls::Certificates { pem: cert },
-                }],
-                request_type:
-                    TlsClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
-                        pem_root_certs: Certificates::from_pem(ca),
-                    },
-            };
-            let creds = ServerTlsCredendials::new(&config).unwrap();
+            let config = ServerTlsConfig::new(
+                StaticIdentityListProvider::new(vec![Identity::from_pem(cert, key)]),
+                TlsClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
+                    roots_provider: StaticRootsProvider::new(Certificates::from_pem(ca)),
+                },
+            );
+            let creds = ServerTlsCredendials::new(config).unwrap();
             let any_creds: Box<dyn DynServerChannelCredentials> = Box::new(creds);
             let stream = any_creds
                 .accept_dyn(Box::new(stream), rt::default_runtime())
@@ -1157,15 +1222,10 @@ mod test {
             let cert = fs::read(base_copy.join("client1_cert.pem")).unwrap();
             let key = fs::read(base_copy.join("client1_key.pem")).unwrap();
 
-            let config = ClientTlsConfig {
-                pem_root_certs: Some(Certificates { pem: ca }),
-                identity: Some(Identity {
-                    key: key,
-                    cert: crate::endpoint::tls::Certificates { pem: cert },
-                }),
-                use_key_log: false,
-            };
-            let creds = ClientTlsCredendials::new(&config).unwrap();
+            let config = ClientTlsConfig::new()
+                .with_roots_provider(StaticRootsProvider::new(Certificates::from_pem(ca)))
+                .with_identity_provider(StaticIdentityProvider::new(Identity::from_pem(cert, key)));
+            let creds = ClientTlsCredendials::new(config).unwrap();
             let any_creds: Box<dyn DynClientChannelCredential> = Box::new(creds);
             let stream = any_creds
                 .connect_dyn(
