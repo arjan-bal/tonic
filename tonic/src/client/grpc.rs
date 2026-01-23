@@ -418,7 +418,7 @@ impl GrpcConfig {
         {
             request.headers_mut().insert(
                 crate::codec::compression::ACCEPT_ENCODING_HEADER,
-                header_value,
+                HeaderValue::from_maybe_shared(header_value).unwrap(),
             );
         }
 

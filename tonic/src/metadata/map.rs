@@ -1,4 +1,7 @@
-use http::HeaderName;
+use http::{HeaderName, HeaderValue};
+
+use crate::metadata::encoding::is_valid_key;
+use crate::metadata::value::PrivateHeaderValue;
 
 pub(crate) use self::as_encoding_agnostic_metadata_key::AsEncodingAgnosticMetadataKey;
 pub(crate) use self::as_metadata_key::AsMetadataKey;
@@ -35,19 +38,7 @@ use std::marker::PhantomData;
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct MetadataMap {
-    headers: http::HeaderMap,
-}
-
-impl AsRef<http::HeaderMap> for MetadataMap {
-    fn as_ref(&self) -> &http::HeaderMap {
-        &self.headers
-    }
-}
-
-impl AsMut<http::HeaderMap> for MetadataMap {
-    fn as_mut(&mut self) -> &mut http::HeaderMap {
-        &mut self.headers
-    }
+    headers: http::HeaderMap<PrivateHeaderValue>,
 }
 
 /// `MetadataMap` entry iterator.
@@ -56,7 +47,7 @@ impl AsMut<http::HeaderMap> for MetadataMap {
 /// more than once if it has more than one associated value.
 #[derive(Debug)]
 pub struct Iter<'a> {
-    inner: http::header::Iter<'a, http::header::HeaderValue>,
+    inner: http::header::Iter<'a, PrivateHeaderValue>,
 }
 
 /// Reference to a key and an associated value in a `MetadataMap`. It can point
@@ -85,13 +76,13 @@ pub enum KeyAndMutValueRef<'a> {
 /// more than once if it has more than one associated value.
 #[derive(Debug)]
 pub struct IterMut<'a> {
-    inner: http::header::IterMut<'a, http::header::HeaderValue>,
+    inner: http::header::IterMut<'a, PrivateHeaderValue>,
 }
 
 /// A drain iterator of all values associated with a single metadata key.
 #[derive(Debug)]
 pub struct ValueDrain<'a, VE: ValueEncoding> {
-    inner: http::header::ValueDrain<'a, http::header::HeaderValue>,
+    inner: http::header::ValueDrain<'a, PrivateHeaderValue>,
     phantom: PhantomData<VE>,
 }
 
@@ -101,7 +92,7 @@ pub struct ValueDrain<'a, VE: ValueEncoding> {
 /// has more than one associated value.
 #[derive(Debug)]
 pub struct Keys<'a> {
-    inner: http::header::Keys<'a, http::header::HeaderValue>,
+    inner: http::header::Keys<'a, PrivateHeaderValue>,
 }
 
 /// Reference to a key in a `MetadataMap`. It can point
@@ -122,7 +113,7 @@ pub enum KeyRef<'a> {
 pub struct Values<'a> {
     // Need to use http::header::Iter and not http::header::Values to be able
     // to know if a value is binary or not.
-    inner: http::header::Iter<'a, http::header::HeaderValue>,
+    inner: http::header::Iter<'a, PrivateHeaderValue>,
 }
 
 /// Reference to a value in a `MetadataMap`. It can point
@@ -142,7 +133,7 @@ pub enum ValueRef<'a> {
 pub struct ValuesMut<'a> {
     // Need to use http::header::IterMut and not http::header::ValuesMut to be
     // able to know if a value is binary or not.
-    inner: http::header::IterMut<'a, http::header::HeaderValue>,
+    inner: http::header::IterMut<'a, PrivateHeaderValue>,
 }
 
 /// Reference to a value in a `MetadataMap`. It can point
@@ -158,14 +149,14 @@ pub enum ValueRefMut<'a> {
 /// An iterator of all values associated with a single metadata key.
 #[derive(Debug)]
 pub struct ValueIter<'a, VE: ValueEncoding> {
-    inner: Option<http::header::ValueIter<'a, http::header::HeaderValue>>,
+    inner: Option<http::header::ValueIter<'a, PrivateHeaderValue>>,
     phantom: PhantomData<VE>,
 }
 
 /// An iterator of all values associated with a single metadata key.
 #[derive(Debug)]
 pub struct ValueIterMut<'a, VE: ValueEncoding> {
-    inner: http::header::ValueIterMut<'a, http::header::HeaderValue>,
+    inner: http::header::ValueIterMut<'a, PrivateHeaderValue>,
     phantom: PhantomData<VE>,
 }
 
@@ -175,7 +166,7 @@ pub struct ValueIterMut<'a, VE: ValueEncoding> {
 /// `MetadataMap::get_all_bin`.
 #[derive(Debug)]
 pub struct GetAll<'a, VE: ValueEncoding> {
-    inner: Option<http::header::GetAll<'a, http::header::HeaderValue>>,
+    inner: Option<http::header::GetAll<'a, PrivateHeaderValue>>,
     phantom: PhantomData<VE>,
 }
 
@@ -195,7 +186,7 @@ pub enum Entry<'a, VE: ValueEncoding> {
 /// This struct is returned as part of the `Entry` enum.
 #[derive(Debug)]
 pub struct VacantEntry<'a, VE: ValueEncoding> {
-    inner: http::header::VacantEntry<'a, http::header::HeaderValue>,
+    inner: http::header::VacantEntry<'a, PrivateHeaderValue>,
     phantom: PhantomData<VE>,
 }
 
@@ -204,7 +195,7 @@ pub struct VacantEntry<'a, VE: ValueEncoding> {
 /// This struct is returned as part of the `Entry` enum.
 #[derive(Debug)]
 pub struct OccupiedEntry<'a, VE: ValueEncoding> {
-    inner: http::header::OccupiedEntry<'a, http::header::HeaderValue>,
+    inner: http::header::OccupiedEntry<'a, PrivateHeaderValue>,
     phantom: PhantomData<VE>,
 }
 
@@ -242,7 +233,30 @@ impl MetadataMap {
 
     /// Convert an HTTP HeaderMap to a MetadataMap
     pub fn from_headers(headers: http::HeaderMap) -> Self {
-        MetadataMap { headers }
+        let mut ret = http::HeaderMap::<PrivateHeaderValue>::with_capacity(headers.capacity());
+        let mut current_key: Option<HeaderName> = None;
+        for (key, value) in headers {
+            if let Some(k) = key {
+                if is_valid_key(&k) {
+                    current_key = Some(k);
+                }
+            }
+            // Drop invalid header keys.
+            if let Some(k) = current_key.as_ref() {
+                if Ascii::is_valid_key(k.as_str()) {
+                    if let Ok(mut mv) = MetadataValue::<Ascii>::try_from(value.as_bytes()) {
+                        mv.set_sensitive(value.is_sensitive());
+                        ret.append(k, mv.inner);
+                    }
+                } else if Binary::is_valid_key(k.as_str()) {
+                    if let Ok(mut mv) = MetadataValue::<Binary>::try_from(value.as_bytes()) {
+                        mv.set_sensitive(value.is_sensitive());
+                        ret.append(k, mv.inner);
+                    }
+                }
+            }
+        }
+        MetadataMap { headers: ret }
     }
 
     /// Convert a MetadataMap into a HTTP HeaderMap
@@ -259,14 +273,34 @@ impl MetadataMap {
     /// assert_eq!(http_map.get("x-host").unwrap(), "example.com");
     /// ```
     pub fn into_headers(self) -> http::HeaderMap {
-        self.headers
+        let mut ret = http::HeaderMap::with_capacity(self.capacity());
+        let mut current_key: Option<HeaderName> = None;
+        for (key, value) in self.headers {
+            if let Some(k) = key {
+                current_key = Some(k);
+            }
+            if let Some(k) = current_key.as_ref() {
+                let bytes;
+                if Ascii::is_valid_key(k.as_str()) {
+                    bytes = MetadataValue::<Ascii>::encode(value.data);
+                } else {
+                    bytes = MetadataValue::<Binary>::encode(value.data);
+                }
+                // gRPC's validation is stricter than HTTP/2.
+                unsafe {
+                    ret.append(k, HeaderValue::from_maybe_shared_unchecked(bytes));
+                }
+            }
+        }
+        ret
     }
 
-    pub(crate) fn into_sanitized_headers(mut self) -> http::HeaderMap {
+    pub(crate) fn into_sanitized_headers(self) -> http::HeaderMap {
+        let mut headers = self.into_headers();
         for r in &Self::GRPC_RESERVED_HEADERS {
-            self.headers.remove(r);
+            headers.remove(r);
         }
-        self.headers
+        headers
     }
 
     /// Create an empty `MetadataMap` with the specified capacity.
@@ -2113,8 +2147,11 @@ mod into_metadata_key {
 
 mod as_metadata_key {
     use super::{MetadataMap, MetadataValue, ValueEncoding};
-    use crate::metadata::key::{InvalidMetadataKey, MetadataKey};
-    use http::header::{Entry, GetAll, HeaderValue};
+    use crate::metadata::{
+        key::{InvalidMetadataKey, MetadataKey},
+        value::PrivateHeaderValue,
+    };
+    use http::header::{Entry, GetAll};
 
     /// A marker trait used to identify values that can be used as search keys
     /// to a `MetadataMap`.
@@ -2136,11 +2173,13 @@ mod as_metadata_key {
         fn get_mut(self, map: &mut MetadataMap) -> Option<&mut MetadataValue<VE>>;
 
         #[doc(hidden)]
-        fn get_all(self, map: &MetadataMap) -> Option<GetAll<'_, HeaderValue>>;
+        fn get_all(self, map: &MetadataMap) -> Option<GetAll<'_, PrivateHeaderValue>>;
 
         #[doc(hidden)]
-        fn entry(self, map: &mut MetadataMap)
-            -> Result<Entry<'_, HeaderValue>, InvalidMetadataKey>;
+        fn entry(
+            self,
+            map: &mut MetadataMap,
+        ) -> Result<Entry<'_, PrivateHeaderValue>, InvalidMetadataKey>;
 
         #[doc(hidden)]
         fn remove(self, map: &mut MetadataMap) -> Option<MetadataValue<VE>>;
@@ -2167,7 +2206,7 @@ mod as_metadata_key {
 
         #[doc(hidden)]
         #[inline]
-        fn get_all(self, map: &MetadataMap) -> Option<GetAll<'_, HeaderValue>> {
+        fn get_all(self, map: &MetadataMap) -> Option<GetAll<'_, PrivateHeaderValue>> {
             Some(map.headers.get_all(self.inner))
         }
 
@@ -2176,7 +2215,7 @@ mod as_metadata_key {
         fn entry(
             self,
             map: &mut MetadataMap,
-        ) -> Result<Entry<'_, HeaderValue>, InvalidMetadataKey> {
+        ) -> Result<Entry<'_, PrivateHeaderValue>, InvalidMetadataKey> {
             Ok(map.headers.entry(self.inner))
         }
 
@@ -2210,7 +2249,7 @@ mod as_metadata_key {
 
         #[doc(hidden)]
         #[inline]
-        fn get_all(self, map: &MetadataMap) -> Option<GetAll<'_, HeaderValue>> {
+        fn get_all(self, map: &MetadataMap) -> Option<GetAll<'_, PrivateHeaderValue>> {
             Some(map.headers.get_all(&self.inner))
         }
 
@@ -2219,7 +2258,7 @@ mod as_metadata_key {
         fn entry(
             self,
             map: &mut MetadataMap,
-        ) -> Result<Entry<'_, HeaderValue>, InvalidMetadataKey> {
+        ) -> Result<Entry<'_, PrivateHeaderValue>, InvalidMetadataKey> {
             Ok(map.headers.entry(&self.inner))
         }
 
@@ -2259,7 +2298,7 @@ mod as_metadata_key {
 
         #[doc(hidden)]
         #[inline]
-        fn get_all(self, map: &MetadataMap) -> Option<GetAll<'_, HeaderValue>> {
+        fn get_all(self, map: &MetadataMap) -> Option<GetAll<'_, PrivateHeaderValue>> {
             if !VE::is_valid_key(self) {
                 return None;
             }
@@ -2271,7 +2310,7 @@ mod as_metadata_key {
         fn entry(
             self,
             map: &mut MetadataMap,
-        ) -> Result<Entry<'_, HeaderValue>, InvalidMetadataKey> {
+        ) -> Result<Entry<'_, PrivateHeaderValue>, InvalidMetadataKey> {
             if !VE::is_valid_key(self) {
                 return Err(InvalidMetadataKey::new());
             }
@@ -2321,7 +2360,7 @@ mod as_metadata_key {
 
         #[doc(hidden)]
         #[inline]
-        fn get_all(self, map: &MetadataMap) -> Option<GetAll<'_, HeaderValue>> {
+        fn get_all(self, map: &MetadataMap) -> Option<GetAll<'_, PrivateHeaderValue>> {
             if !VE::is_valid_key(self.as_str()) {
                 return None;
             }
@@ -2333,7 +2372,7 @@ mod as_metadata_key {
         fn entry(
             self,
             map: &mut MetadataMap,
-        ) -> Result<Entry<'_, HeaderValue>, InvalidMetadataKey> {
+        ) -> Result<Entry<'_, PrivateHeaderValue>, InvalidMetadataKey> {
             if !VE::is_valid_key(self.as_str()) {
                 return Err(InvalidMetadataKey::new());
             }
@@ -2382,7 +2421,7 @@ mod as_metadata_key {
 
         #[doc(hidden)]
         #[inline]
-        fn get_all(self, map: &MetadataMap) -> Option<GetAll<'_, HeaderValue>> {
+        fn get_all(self, map: &MetadataMap) -> Option<GetAll<'_, PrivateHeaderValue>> {
             if !VE::is_valid_key(self) {
                 return None;
             }
@@ -2394,7 +2433,7 @@ mod as_metadata_key {
         fn entry(
             self,
             map: &mut MetadataMap,
-        ) -> Result<Entry<'_, HeaderValue>, InvalidMetadataKey> {
+        ) -> Result<Entry<'_, PrivateHeaderValue>, InvalidMetadataKey> {
             if !VE::is_valid_key(self) {
                 return Err(InvalidMetadataKey::new());
             }

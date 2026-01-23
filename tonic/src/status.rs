@@ -754,9 +754,10 @@ impl fmt::Display for Status {
             write!(f, ", message: {:?}", self.message())?;
         }
         // We intentionally omit `self.details` since it's binary data, not fit for human eyes.
-        if !self.metadata().is_empty() {
-            write!(f, ", metadata: {:?}", self.metadata().as_ref())?;
-        }
+        // TODO
+        // if !self.metadata().is_empty() {
+        //     write!(f, ", metadata: {:?}", self.metadata().as_ref())?;
+        // }
         if let Some(source) = self.source() {
             write!(f, ", source: {source:?}")?;
         }

@@ -1,9 +1,10 @@
 use base64::Engine as _;
 use bytes::Bytes;
-use http::header::HeaderValue;
 use std::error::Error;
 use std::fmt;
 use std::hash::Hash;
+
+use crate::metadata::value::PrivateHeaderValue;
 
 /// A possible error when converting a `MetadataValue` from a string or byte
 /// slice.
@@ -13,9 +14,10 @@ pub struct InvalidMetadataValue {
 }
 
 mod value_encoding {
+    use crate::metadata::value::PrivateHeaderValue;
+
     use super::InvalidMetadataValueBytes;
     use bytes::Bytes;
-    use http::header::HeaderValue;
     use std::fmt;
 
     pub trait Sealed {
@@ -23,25 +25,28 @@ mod value_encoding {
         fn is_empty(value: &[u8]) -> bool;
 
         #[doc(hidden)]
-        fn from_bytes(value: &[u8]) -> Result<HeaderValue, InvalidMetadataValueBytes>;
+        fn from_bytes(value: &[u8]) -> Result<PrivateHeaderValue, InvalidMetadataValueBytes>;
 
         #[doc(hidden)]
-        fn from_shared(value: Bytes) -> Result<HeaderValue, InvalidMetadataValueBytes>;
+        fn from_shared(value: Bytes) -> Result<PrivateHeaderValue, InvalidMetadataValueBytes>;
 
         #[doc(hidden)]
-        fn from_static(value: &'static str) -> HeaderValue;
+        fn from_static(value: &'static str) -> PrivateHeaderValue;
 
         #[doc(hidden)]
         fn decode(value: &[u8]) -> Result<Bytes, InvalidMetadataValueBytes>;
 
         #[doc(hidden)]
-        fn equals(a: &HeaderValue, b: &[u8]) -> bool;
+        fn encode(value: Bytes) -> Bytes;
 
         #[doc(hidden)]
-        fn values_equal(a: &HeaderValue, b: &HeaderValue) -> bool;
+        fn equals(a: &PrivateHeaderValue, b: &[u8]) -> bool;
 
         #[doc(hidden)]
-        fn fmt(value: &HeaderValue, f: &mut fmt::Formatter<'_>) -> fmt::Result;
+        fn values_equal(a: &PrivateHeaderValue, b: &PrivateHeaderValue) -> bool;
+
+        #[doc(hidden)]
+        fn fmt(value: &PrivateHeaderValue, f: &mut fmt::Formatter<'_>) -> fmt::Result;
     }
 }
 
@@ -64,6 +69,30 @@ pub trait ValueEncoding: Clone + Eq + PartialEq + Hash + self::value_encoding::S
 #[non_exhaustive]
 pub enum Ascii {}
 
+impl Ascii {
+    pub(crate) fn is_valid_value(key: impl AsRef<[u8]>) -> bool {
+        // This array maps every byte (0-255) to a boolean (valid/invalid).
+        static VALID_HEADER_VALUE_CHARS: [bool; 256] = {
+            let mut table = [false; 256];
+
+            let mut i = 0x20;
+            while i <= 0x7E {
+                table[i as usize] = true;
+                i += 1;
+            }
+            table
+        };
+        let bytes = key.as_ref();
+
+        for &b in bytes {
+            if !VALID_HEADER_VALUE_CHARS[b as usize] {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// gRPC metadata values can be either ASCII strings or binary.
 /// This type should never be instantiated -- in fact, it's impossible
 /// to, because there's no variants to instantiate. Instead, it's just used as
@@ -82,38 +111,123 @@ impl self::value_encoding::Sealed for Ascii {
         value.is_empty()
     }
 
-    fn from_bytes(value: &[u8]) -> Result<HeaderValue, InvalidMetadataValueBytes> {
-        HeaderValue::from_bytes(value).map_err(|_| InvalidMetadataValueBytes::new())
+    fn from_bytes(value: &[u8]) -> Result<PrivateHeaderValue, InvalidMetadataValueBytes> {
+        let start = value
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .map(|p| p + 1)
+            .unwrap_or(start);
+        let value = &value[start..end];
+
+        if !Ascii::is_valid_value(value) {
+            return Err(InvalidMetadataValueBytes::new());
+        }
+        Ok(PrivateHeaderValue::from_bytes(Bytes::copy_from_slice(
+            value,
+        )))
     }
 
-    fn from_shared(value: Bytes) -> Result<HeaderValue, InvalidMetadataValueBytes> {
-        HeaderValue::from_maybe_shared(value).map_err(|_| InvalidMetadataValueBytes::new())
+    fn from_shared(value: Bytes) -> Result<PrivateHeaderValue, InvalidMetadataValueBytes> {
+        let start = value
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .map(|p| p + 1)
+            .unwrap_or(start);
+        let value = if end - start + 1 != value.len() {
+            value.slice(start..end)
+        } else {
+            value
+        };
+
+        if !Ascii::is_valid_value(value.as_ref()) {
+            return Err(InvalidMetadataValueBytes::new());
+        }
+        Ok(PrivateHeaderValue::from_bytes(value))
     }
 
-    fn from_static(value: &'static str) -> HeaderValue {
-        HeaderValue::from_static(value)
+    fn from_static(value: &'static str) -> PrivateHeaderValue {
+        let value = value.trim();
+        if !Ascii::is_valid_value(value) {
+            panic!("Invalid ASCII header value: {}", value)
+        }
+        PrivateHeaderValue::from_bytes(Bytes::from_static(value.as_bytes()))
     }
 
     fn decode(value: &[u8]) -> Result<Bytes, InvalidMetadataValueBytes> {
+        if !Ascii::is_valid_value(value.as_ref()) {
+            return Err(InvalidMetadataValueBytes::new());
+        }
         Ok(Bytes::copy_from_slice(value))
     }
 
-    fn equals(a: &HeaderValue, b: &[u8]) -> bool {
-        a.as_bytes() == b
+    fn equals(a: &PrivateHeaderValue, b: &[u8]) -> bool {
+        a.data.as_ref() == b
     }
 
-    fn values_equal(a: &HeaderValue, b: &HeaderValue) -> bool {
+    fn values_equal(a: &PrivateHeaderValue, b: &PrivateHeaderValue) -> bool {
         a == b
     }
 
-    fn fmt(value: &HeaderValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(value: &PrivateHeaderValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(value, f)
     }
+
+    fn encode(value: Bytes) -> Bytes {
+        value
+    }
+}
+
+// This array maps every byte (0-255) to a boolean (valid/invalid).
+static VALID_HEADER_KEY_CHARS: [bool; 256] = {
+    let mut table = [false; 256];
+
+    // Valid: 0-9
+    let mut i = b'0';
+    while i <= b'9' {
+        table[i as usize] = true;
+        i += 1;
+    }
+
+    // Valid: a-z
+    let mut i = b'a';
+    while i <= b'z' {
+        table[i as usize] = true;
+        i += 1;
+    }
+
+    // Valid: special chars
+    table[b'_' as usize] = true;
+    table[b'-' as usize] = true;
+    table[b'.' as usize] = true;
+
+    table
+};
+
+pub(crate) fn is_valid_key(key: impl AsRef<[u8]>) -> bool {
+    let bytes = key.as_ref();
+    if bytes.is_empty() {
+        return false;
+    }
+
+    for &b in bytes {
+        if !VALID_HEADER_KEY_CHARS[b as usize] {
+            return false;
+        }
+    }
+    true
 }
 
 impl ValueEncoding for Ascii {
     fn is_valid_key(key: &str) -> bool {
-        !Binary::is_valid_key(key)
+        is_valid_key(key) && !Binary::is_valid_key(key)
     }
 }
 
@@ -127,25 +241,19 @@ impl self::value_encoding::Sealed for Binary {
         true
     }
 
-    fn from_bytes(value: &[u8]) -> Result<HeaderValue, InvalidMetadataValueBytes> {
-        let encoded_value: String = crate::util::base64::STANDARD_NO_PAD.encode(value);
-        HeaderValue::from_maybe_shared(Bytes::from(encoded_value))
-            .map_err(|_| InvalidMetadataValueBytes::new())
+    fn from_bytes(value: &[u8]) -> Result<PrivateHeaderValue, InvalidMetadataValueBytes> {
+        Ok(PrivateHeaderValue::from_bytes(Bytes::copy_from_slice(
+            value,
+        )))
     }
 
-    fn from_shared(value: Bytes) -> Result<HeaderValue, InvalidMetadataValueBytes> {
-        Self::from_bytes(value.as_ref())
+    fn from_shared(value: Bytes) -> Result<PrivateHeaderValue, InvalidMetadataValueBytes> {
+        Ok(PrivateHeaderValue::from_bytes(value))
     }
 
-    fn from_static(value: &'static str) -> HeaderValue {
-        if crate::util::base64::STANDARD.decode(value).is_err() {
-            panic!("Invalid base64 passed to from_static: {value}");
-        }
-        unsafe {
-            // Because this is valid base64 this must be a valid HTTP header value,
-            // no need to check again by calling from_shared.
-            HeaderValue::from_maybe_shared_unchecked(Bytes::from_static(value.as_ref()))
-        }
+    fn from_static(value: &'static str) -> PrivateHeaderValue {
+        let decoded = crate::util::base64::STANDARD.decode(value).unwrap();
+        PrivateHeaderValue::from_bytes(Bytes::from(decoded))
     }
 
     fn decode(value: &[u8]) -> Result<Bytes, InvalidMetadataValueBytes> {
@@ -155,34 +263,27 @@ impl self::value_encoding::Sealed for Binary {
             .map_err(|_| InvalidMetadataValueBytes::new())
     }
 
-    fn equals(a: &HeaderValue, b: &[u8]) -> bool {
-        if let Ok(decoded) = crate::util::base64::STANDARD.decode(a.as_bytes()) {
-            decoded == b
-        } else {
-            a.as_bytes() == b
-        }
+    fn equals(a: &PrivateHeaderValue, b: &[u8]) -> bool {
+        a.data.as_ref() == b
     }
 
-    fn values_equal(a: &HeaderValue, b: &HeaderValue) -> bool {
-        match (Self::decode(a.as_bytes()), Self::decode(b.as_bytes())) {
-            (Ok(a), Ok(b)) => a == b,
-            (Err(_), Err(_)) => true,
-            _ => false,
-        }
+    fn values_equal(a: &PrivateHeaderValue, b: &PrivateHeaderValue) -> bool {
+        a.data == b.data
     }
 
-    fn fmt(value: &HeaderValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Ok(decoded) = Self::decode(value.as_bytes()) {
-            write!(f, "{decoded:?}")
-        } else {
-            write!(f, "b[invalid]{value:?}")
-        }
+    fn fmt(value: &PrivateHeaderValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", value.data)
+    }
+
+    fn encode(value: Bytes) -> Bytes {
+        let encoded_value: String = crate::util::base64::STANDARD_NO_PAD.encode(value);
+        Bytes::from(encoded_value)
     }
 }
 
 impl ValueEncoding for Binary {
     fn is_valid_key(key: &str) -> bool {
-        key.ends_with("-bin")
+        key.ends_with("-bin") && is_valid_key(key)
     }
 }
 

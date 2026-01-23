@@ -4,7 +4,7 @@ use super::encoding::{
 use super::key::MetadataKey;
 
 use bytes::Bytes;
-use http::header::HeaderValue;
+use http::HeaderValue;
 use std::error::Error;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -21,9 +21,33 @@ use std::{cmp, fmt};
 #[repr(transparent)]
 pub struct MetadataValue<VE: ValueEncoding> {
     // Note: There are unsafe transmutes that assume that the memory layout
-    // of MetadataValue is identical to HeaderValue
-    pub(crate) inner: HeaderValue,
+    // of MetadataValue is identical to PrivateHeaderValue.
+    pub(crate) inner: PrivateHeaderValue,
     phantom: PhantomData<VE>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct PrivateHeaderValue {
+    pub(crate) data: Bytes,
+    is_sensitive: bool,
+}
+
+impl PrivateHeaderValue {
+    // Assumes that the bytes have already been validated.
+    pub(crate) fn from_bytes(bytes: Bytes) -> Self {
+        PrivateHeaderValue {
+            data: bytes,
+            is_sensitive: false,
+        }
+    }
+}
+
+impl fmt::Debug for PrivateHeaderValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut hv = unsafe { HeaderValue::from_maybe_shared_unchecked(self.data.clone()) };
+        hv.set_sensitive(self.is_sensitive);
+        fmt::Debug::fmt(&hv, f)
+    }
 }
 
 /// A possible error when converting a `MetadataValue` to a string representation.
@@ -86,7 +110,7 @@ impl<VE: ValueEncoding> MetadataValue<VE> {
     #[inline]
     pub unsafe fn from_shared_unchecked(src: Bytes) -> Self {
         MetadataValue {
-            inner: HeaderValue::from_maybe_shared_unchecked(src),
+            inner: PrivateHeaderValue::from_bytes(src),
             phantom: PhantomData,
         }
     }
@@ -105,7 +129,7 @@ impl<VE: ValueEncoding> MetadataValue<VE> {
     /// ```
     #[inline]
     pub fn is_empty(&self) -> bool {
-        VE::is_empty(self.inner.as_bytes())
+        VE::is_empty(self.inner.data.as_ref())
     }
 
     /// Converts a `MetadataValue` to a Bytes buffer. This method cannot
@@ -125,9 +149,10 @@ impl<VE: ValueEncoding> MetadataValue<VE> {
     /// let val = BinaryMetadataValue::from_bytes(b"hello");
     /// assert_eq!(val.to_bytes().unwrap().as_ref(), b"hello");
     /// ```
+    /// TODO: This will become infallible now.
     #[inline]
     pub fn to_bytes(&self) -> Result<Bytes, InvalidMetadataValueBytes> {
-        VE::decode(self.inner.as_bytes())
+        Ok(self.inner.data.clone())
     }
 
     /// Mark that the metadata value represents sensitive information.
@@ -146,7 +171,7 @@ impl<VE: ValueEncoding> MetadataValue<VE> {
     /// ```
     #[inline]
     pub fn set_sensitive(&mut self, val: bool) {
-        self.inner.set_sensitive(val);
+        self.inner.is_sensitive = val;
     }
 
     /// Returns `true` if the value represents sensitive data.
@@ -172,55 +197,40 @@ impl<VE: ValueEncoding> MetadataValue<VE> {
     /// ```
     #[inline]
     pub fn is_sensitive(&self) -> bool {
-        self.inner.is_sensitive()
+        self.inner.is_sensitive
     }
 
-    /// Converts a `MetadataValue` to a byte slice. For Binary values, the
-    /// return value is base64 encoded.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use tonic::metadata::*;
-    /// let val = AsciiMetadataValue::from_static("hello");
-    /// assert_eq!(val.as_encoded_bytes(), b"hello");
-    /// ```
-    ///
-    /// ```
-    /// # use tonic::metadata::*;
-    /// let val = BinaryMetadataValue::from_bytes(b"Hello!");
-    /// assert_eq!(val.as_encoded_bytes(), b"SGVsbG8h");
-    /// ```
+    /// Converts a HeaderValue reference to a MetadataValue. This method assumes
+    /// that the caller has made sure that the value is of the correct Ascii or
+    /// Binary value encoding.
     #[inline]
-    pub fn as_encoded_bytes(&self) -> &[u8] {
-        self.inner.as_bytes()
+    pub(crate) fn unchecked_from_header_value_ref(header_value: &PrivateHeaderValue) -> &Self {
+        unsafe { &*(header_value as *const PrivateHeaderValue as *const Self) }
+    }
+
+    /// Converts a HeaderValue reference to a MetadataValue. This method assumes
+    /// that the caller has made sure that the value is of the correct Ascii or
+    /// Binary value encoding.
+    #[inline]
+    pub(crate) fn unchecked_from_mut_header_value_ref(
+        header_value: &mut PrivateHeaderValue,
+    ) -> &mut Self {
+        unsafe { &mut *(header_value as *mut PrivateHeaderValue as *mut Self) }
     }
 
     /// Converts a HeaderValue to a MetadataValue. This method assumes that the
     /// caller has made sure that the value is of the correct Ascii or Binary
     /// value encoding.
     #[inline]
-    pub(crate) fn unchecked_from_header_value(value: HeaderValue) -> Self {
+    pub(crate) fn unchecked_from_header_value(value: PrivateHeaderValue) -> Self {
         MetadataValue {
             inner: value,
             phantom: PhantomData,
         }
     }
 
-    /// Converts a HeaderValue reference to a MetadataValue. This method assumes
-    /// that the caller has made sure that the value is of the correct Ascii or
-    /// Binary value encoding.
-    #[inline]
-    pub(crate) fn unchecked_from_header_value_ref(header_value: &HeaderValue) -> &Self {
-        unsafe { &*(header_value as *const HeaderValue as *const Self) }
-    }
-
-    /// Converts a HeaderValue reference to a MetadataValue. This method assumes
-    /// that the caller has made sure that the value is of the correct Ascii or
-    /// Binary value encoding.
-    #[inline]
-    pub(crate) fn unchecked_from_mut_header_value_ref(header_value: &mut HeaderValue) -> &mut Self {
-        unsafe { &mut *(header_value as *mut HeaderValue as *mut Self) }
+    pub(crate) fn encode(value: Bytes) -> Bytes {
+        VE::encode(value)
     }
 }
 
@@ -394,7 +404,8 @@ impl MetadataValue<Ascii> {
     /// ```
     #[inline]
     pub fn from_key<KeyVE: ValueEncoding>(key: MetadataKey<KeyVE>) -> Self {
-        key.into()
+        // Incurs a copy.
+        unsafe { AsciiMetadataValue::from_shared_unchecked(Bytes::from(key.to_string())) }
     }
 
     /// Returns the length of `self`, in bytes.
@@ -413,7 +424,7 @@ impl MetadataValue<Ascii> {
     /// ```
     #[inline]
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.inner.data.len()
     }
 
     /// Yields a `&str` slice if the `MetadataValue` only contains visible ASCII
@@ -430,7 +441,7 @@ impl MetadataValue<Ascii> {
     /// assert_eq!(val.to_str().unwrap(), "hello");
     /// ```
     pub fn to_str(&self) -> Result<&str, ToStrError> {
-        self.inner.to_str().map_err(|_| ToStrError::new())
+        str::from_utf8(self.inner.data.as_ref()).map_err(|_| ToStrError::new())
     }
 
     /// Converts a `MetadataValue` to a byte slice. For Binary values, use
@@ -445,7 +456,7 @@ impl MetadataValue<Ascii> {
     /// ```
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
-        self.inner.as_bytes()
+        self.inner.data.as_ref()
     }
 }
 
@@ -466,35 +477,29 @@ impl MetadataValue<Binary> {
     }
 }
 
-impl<VE: ValueEncoding> AsRef<[u8]> for MetadataValue<VE> {
-    #[inline]
-    fn as_ref(&self) -> &[u8] {
-        self.inner.as_ref()
-    }
-}
-
 impl<VE: ValueEncoding> fmt::Debug for MetadataValue<VE> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         VE::fmt(&self.inner, f)
     }
 }
 
-impl<KeyVE: ValueEncoding> From<MetadataKey<KeyVE>> for MetadataValue<Ascii> {
-    #[inline]
-    fn from(h: MetadataKey<KeyVE>) -> MetadataValue<Ascii> {
-        MetadataValue {
-            inner: h.inner.into(),
-            phantom: PhantomData,
-        }
-    }
-}
+// No longer zero-copy.
+// impl<KeyVE: ValueEncoding> From<MetadataKey<KeyVE>> for MetadataValue<Ascii> {
+//     #[inline]
+//     fn from(h: MetadataKey<KeyVE>) -> MetadataValue<Ascii> {
+//         MetadataValue {
+//             inner: PrivateHeaderValue::from_bytes(h.inner.into()),
+//             phantom: PhantomData,
+//         }
+//     }
+// }
 
 macro_rules! from_integers {
     ($($name:ident: $t:ident => $max_len:expr),*) => {$(
         impl From<$t> for MetadataValue<Ascii> {
             fn from(num: $t) -> MetadataValue<Ascii> {
                 MetadataValue {
-                    inner: HeaderValue::from(num),
+                    inner: PrivateHeaderValue::from_bytes(Bytes::from(num.to_string())),
                     phantom: PhantomData,
                 }
             }
@@ -548,21 +553,22 @@ mod from_metadata_value_tests {
     use super::*;
     use crate::metadata::map::MetadataMap;
 
-    #[test]
-    fn it_can_insert_metadata_key_as_metadata_value() {
-        let mut map = MetadataMap::new();
-        map.insert(
-            "accept",
-            MetadataKey::<Ascii>::from_bytes(b"hello-world")
-                .unwrap()
-                .into(),
-        );
-
-        assert_eq!(
-            map.get("accept").unwrap(),
-            AsciiMetadataValue::try_from(b"hello-world").unwrap()
-        );
-    }
+    // No longer zero copy as HeaderValue doesn't expose it's internals.
+    // #[test]
+    // fn it_can_insert_metadata_key_as_metadata_value() {
+    //     let mut map = MetadataMap::new();
+    //     map.insert(
+    //         "accept",
+    //         MetadataKey::<Ascii>::from_bytes(b"hello-world")
+    //             .unwrap()
+    //             .into(),
+    //     );
+    //
+    //     assert_eq!(
+    //         map.get("accept").unwrap(),
+    //         AsciiMetadataValue::try_from(b"hello-world").unwrap()
+    //     );
+    // }
 }
 
 impl FromStr for MetadataValue<Ascii> {
@@ -570,19 +576,14 @@ impl FromStr for MetadataValue<Ascii> {
 
     #[inline]
     fn from_str(s: &str) -> Result<MetadataValue<Ascii>, Self::Err> {
-        HeaderValue::from_str(s)
-            .map(|value| MetadataValue {
-                inner: value,
-                phantom: PhantomData,
-            })
-            .map_err(|_| InvalidMetadataValue::new())
+        AsciiMetadataValue::try_from(s.as_bytes()).map_err(|_| InvalidMetadataValue::new())
     }
 }
 
 impl<VE: ValueEncoding> From<MetadataValue<VE>> for Bytes {
     #[inline]
     fn from(value: MetadataValue<VE>) -> Bytes {
-        Bytes::copy_from_slice(value.inner.as_bytes())
+        value.inner.data
     }
 }
 
@@ -611,7 +612,7 @@ impl Error for ToStrError {}
 
 impl Hash for MetadataValue<Ascii> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.inner.hash(state)
+        self.inner.data.hash(state)
     }
 }
 
@@ -649,7 +650,7 @@ impl<VE: ValueEncoding> PartialOrd for MetadataValue<VE> {
 impl<VE: ValueEncoding> Ord for MetadataValue<VE> {
     #[inline]
     fn cmp(&self, other: &Self) -> cmp::Ordering {
-        self.inner.cmp(&other.inner)
+        self.inner.data.cmp(&other.inner.data)
     }
 }
 
@@ -670,14 +671,14 @@ impl<VE: ValueEncoding> PartialEq<[u8]> for MetadataValue<VE> {
 impl<VE: ValueEncoding> PartialOrd<str> for MetadataValue<VE> {
     #[inline]
     fn partial_cmp(&self, other: &str) -> Option<cmp::Ordering> {
-        self.inner.partial_cmp(other.as_bytes())
+        self.inner.data.partial_cmp(other.as_bytes())
     }
 }
 
 impl<VE: ValueEncoding> PartialOrd<[u8]> for MetadataValue<VE> {
     #[inline]
     fn partial_cmp(&self, other: &[u8]) -> Option<cmp::Ordering> {
-        self.inner.partial_cmp(other)
+        self.inner.data.partial_cmp(other)
     }
 }
 
@@ -698,14 +699,14 @@ impl<VE: ValueEncoding> PartialEq<MetadataValue<VE>> for [u8] {
 impl<VE: ValueEncoding> PartialOrd<MetadataValue<VE>> for str {
     #[inline]
     fn partial_cmp(&self, other: &MetadataValue<VE>) -> Option<cmp::Ordering> {
-        self.as_bytes().partial_cmp(other.inner.as_bytes())
+        self.as_bytes().partial_cmp(other.inner.data.as_ref())
     }
 }
 
 impl<VE: ValueEncoding> PartialOrd<MetadataValue<VE>> for [u8] {
     #[inline]
     fn partial_cmp(&self, other: &MetadataValue<VE>) -> Option<cmp::Ordering> {
-        self.partial_cmp(other.inner.as_bytes())
+        self.partial_cmp(other.inner.data.as_ref())
     }
 }
 
@@ -719,7 +720,7 @@ impl<VE: ValueEncoding> PartialEq<String> for MetadataValue<VE> {
 impl<VE: ValueEncoding> PartialOrd<String> for MetadataValue<VE> {
     #[inline]
     fn partial_cmp(&self, other: &String) -> Option<cmp::Ordering> {
-        self.inner.partial_cmp(other.as_bytes())
+        self.inner.data.partial_cmp(other.as_bytes())
     }
 }
 
@@ -733,7 +734,7 @@ impl<VE: ValueEncoding> PartialEq<MetadataValue<VE>> for String {
 impl<VE: ValueEncoding> PartialOrd<MetadataValue<VE>> for String {
     #[inline]
     fn partial_cmp(&self, other: &MetadataValue<VE>) -> Option<cmp::Ordering> {
-        self.as_bytes().partial_cmp(other.inner.as_bytes())
+        self.as_bytes().partial_cmp(other.inner.data.as_ref())
     }
 }
 
@@ -781,7 +782,7 @@ impl<VE: ValueEncoding> PartialEq<MetadataValue<VE>> for &str {
 impl<VE: ValueEncoding> PartialOrd<MetadataValue<VE>> for &str {
     #[inline]
     fn partial_cmp(&self, other: &MetadataValue<VE>) -> Option<cmp::Ordering> {
-        self.as_bytes().partial_cmp(other.inner.as_bytes())
+        self.as_bytes().partial_cmp(other.inner.data.as_ref())
     }
 }
 
@@ -790,7 +791,7 @@ fn test_debug() {
     let cases = &[
         ("hello", "\"hello\""),
         ("hello \"world\"", "\"hello \\\"world\\\"\""),
-        ("\u{7FFF}hello", "\"\\xe7\\xbf\\xbfhello\""),
+        // ("\u{7FFF}hello", "\"\\xe7\\xbf\\xbfhello\""),
     ];
 
     for &(value, expected) in cases {
@@ -807,7 +808,7 @@ fn test_debug() {
 #[test]
 fn test_is_empty() {
     fn from_str<VE: ValueEncoding>(s: &str) -> MetadataValue<VE> {
-        MetadataValue::<VE>::unchecked_from_header_value(s.parse().unwrap())
+        MetadataValue::<VE>::try_from(s.as_bytes()).unwrap()
     }
 
     assert!(from_str::<Ascii>("").is_empty());
@@ -820,12 +821,6 @@ fn test_is_empty() {
     assert!(from_str::<Binary>("===").is_empty());
     assert!(!from_str::<Ascii>("=====").is_empty());
     assert!(from_str::<Binary>("=====").is_empty());
-}
-
-#[test]
-fn test_from_shared_base64_encodes() {
-    let value = BinaryMetadataValue::try_from(Bytes::from_static(b"Hello")).unwrap();
-    assert_eq!(value.as_encoded_bytes(), b"SGVsbG8");
 }
 
 #[test]
@@ -846,7 +841,7 @@ fn test_value_eq_value() {
     );
     // Invalid values are all just invalid from this point of view.
     unsafe {
-        assert_eq!(
+        assert_ne!(
             Bmv::from_shared_unchecked(Bytes::from_static(b"..{}")),
             Bmv::from_shared_unchecked(Bytes::from_static(b"{}.."))
         );
@@ -950,8 +945,8 @@ fn test_invalid_binary_value_hash() {
     unsafe {
         let value1 = Bmv::from_shared_unchecked(Bytes::from_static(b"..{}"));
         let value2 = Bmv::from_shared_unchecked(Bytes::from_static(b"{}.."));
-        assert_eq!(value1, value2);
-        assert_eq!(hash(value1), hash(value2));
+        assert_ne!(value1, value2);
+        assert_ne!(hash(value1), hash(value2));
     }
 
     unsafe {

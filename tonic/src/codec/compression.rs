@@ -1,5 +1,5 @@
 use crate::{metadata::MetadataValue, Status};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 #[cfg(feature = "gzip")]
 use flate2::read::{GzDecoder, GzEncoder};
 #[cfg(feature = "deflate")]
@@ -45,7 +45,7 @@ impl EnabledCompressionEncodings {
             .take()
     }
 
-    pub(crate) fn into_accept_encoding_header_value(self) -> Option<http::HeaderValue> {
+    pub(crate) fn into_accept_encoding_header_value(self) -> Option<Bytes> {
         let mut value = BytesMut::new();
         for encoding in self.inner.into_iter().flatten() {
             value.put_slice(encoding.as_str().as_bytes());
@@ -57,7 +57,7 @@ impl EnabledCompressionEncodings {
         }
 
         value.put_slice(b"identity");
-        Some(http::HeaderValue::from_maybe_shared(value).unwrap())
+        Some(value.freeze())
     }
 
     /// Check if a [`CompressionEncoding`] is enabled.
@@ -162,7 +162,7 @@ impl CompressionEncoding {
 
                 let header_value = enabled_encodings
                     .into_accept_encoding_header_value()
-                    .map(MetadataValue::unchecked_from_header_value)
+                    .map(|x| unsafe { MetadataValue::from_shared_unchecked(x) })
                     .unwrap_or_else(|| MetadataValue::from_static("identity"));
                 status
                     .metadata_mut()
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     #[cfg(feature = "gzip")]
     fn convert_gzip_into_header_value() {
-        const GZIP: HeaderValue = HeaderValue::from_static("gzip,identity");
+        const GZIP: Bytes = Bytes::from_static("gzip,identity".as_bytes());
 
         let encodings = EnabledCompressionEncodings {
             inner: [Some(CompressionEncoding::Gzip), None, None],
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     #[cfg(feature = "zstd")]
     fn convert_zstd_into_header_value() {
-        const ZSTD: HeaderValue = HeaderValue::from_static("zstd,identity");
+        const ZSTD: Bytes = Bytes::from_static("zstd,identity".as_bytes());
 
         let encodings = EnabledCompressionEncodings {
             inner: [Some(CompressionEncoding::Zstd), None, None],
@@ -367,7 +367,7 @@ mod tests {
 
         assert_eq!(
             encodings.into_accept_encoding_header_value().unwrap(),
-            HeaderValue::from_static("gzip,deflate,zstd,identity"),
+            Bytes::from_static("gzip,deflate,zstd,identity".as_bytes()),
         );
 
         let encodings = EnabledCompressionEncodings {
@@ -380,7 +380,7 @@ mod tests {
 
         assert_eq!(
             encodings.into_accept_encoding_header_value().unwrap(),
-            HeaderValue::from_static("zstd,deflate,gzip,identity"),
+            Bytes::from_static("zstd,deflate,gzip,identity".as_bytes()),
         );
     }
 }
