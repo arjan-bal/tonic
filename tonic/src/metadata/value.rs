@@ -484,15 +484,15 @@ impl<VE: ValueEncoding> fmt::Debug for MetadataValue<VE> {
 }
 
 // No longer zero-copy.
-// impl<KeyVE: ValueEncoding> From<MetadataKey<KeyVE>> for MetadataValue<Ascii> {
-//     #[inline]
-//     fn from(h: MetadataKey<KeyVE>) -> MetadataValue<Ascii> {
-//         MetadataValue {
-//             inner: PrivateHeaderValue::from_bytes(h.inner.into()),
-//             phantom: PhantomData,
-//         }
-//     }
-// }
+impl<KeyVE: ValueEncoding> From<MetadataKey<KeyVE>> for MetadataValue<Ascii> {
+    #[inline]
+    fn from(h: MetadataKey<KeyVE>) -> MetadataValue<Ascii> {
+        MetadataValue {
+            inner: UnencodedHeaderValue::from_bytes(Bytes::copy_from_slice(h.as_ref())),
+            phantom: PhantomData,
+        }
+    }
+}
 
 macro_rules! from_integers {
     ($($name:ident: $t:ident => $max_len:expr),*) => {$(
