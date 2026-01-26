@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fmt;
 use std::hash::Hash;
 
-use crate::metadata::value::PrivateHeaderValue;
+use crate::metadata::value::UnencodedHeaderValue;
 
 /// A possible error when converting a `MetadataValue` from a string or byte
 /// slice.
@@ -14,7 +14,7 @@ pub struct InvalidMetadataValue {
 }
 
 mod value_encoding {
-    use crate::metadata::value::PrivateHeaderValue;
+    use crate::metadata::value::UnencodedHeaderValue;
 
     use super::InvalidMetadataValueBytes;
     use bytes::Bytes;
@@ -25,13 +25,13 @@ mod value_encoding {
         fn is_empty(value: &[u8]) -> bool;
 
         #[doc(hidden)]
-        fn from_bytes(value: &[u8]) -> Result<PrivateHeaderValue, InvalidMetadataValueBytes>;
+        fn from_bytes(value: &[u8]) -> Result<UnencodedHeaderValue, InvalidMetadataValueBytes>;
 
         #[doc(hidden)]
-        fn from_shared(value: Bytes) -> Result<PrivateHeaderValue, InvalidMetadataValueBytes>;
+        fn from_shared(value: Bytes) -> Result<UnencodedHeaderValue, InvalidMetadataValueBytes>;
 
         #[doc(hidden)]
-        fn from_static(value: &'static str) -> PrivateHeaderValue;
+        fn from_static(value: &'static str) -> UnencodedHeaderValue;
 
         #[doc(hidden)]
         fn decode(value: &[u8]) -> Result<Bytes, InvalidMetadataValueBytes>;
@@ -40,13 +40,13 @@ mod value_encoding {
         fn encode(value: Bytes) -> Bytes;
 
         #[doc(hidden)]
-        fn equals(a: &PrivateHeaderValue, b: &[u8]) -> bool;
+        fn equals(a: &UnencodedHeaderValue, b: &[u8]) -> bool;
 
         #[doc(hidden)]
-        fn values_equal(a: &PrivateHeaderValue, b: &PrivateHeaderValue) -> bool;
+        fn values_equal(a: &UnencodedHeaderValue, b: &UnencodedHeaderValue) -> bool;
 
         #[doc(hidden)]
-        fn fmt(value: &PrivateHeaderValue, f: &mut fmt::Formatter<'_>) -> fmt::Result;
+        fn fmt(value: &UnencodedHeaderValue, f: &mut fmt::Formatter<'_>) -> fmt::Result;
     }
 }
 
@@ -111,7 +111,7 @@ impl self::value_encoding::Sealed for Ascii {
         value.is_empty()
     }
 
-    fn from_bytes(value: &[u8]) -> Result<PrivateHeaderValue, InvalidMetadataValueBytes> {
+    fn from_bytes(value: &[u8]) -> Result<UnencodedHeaderValue, InvalidMetadataValueBytes> {
         let start = value
             .iter()
             .position(|b| !b.is_ascii_whitespace())
@@ -126,12 +126,12 @@ impl self::value_encoding::Sealed for Ascii {
         if !Ascii::is_valid_value(value) {
             return Err(InvalidMetadataValueBytes::new());
         }
-        Ok(PrivateHeaderValue::from_bytes(Bytes::copy_from_slice(
+        Ok(UnencodedHeaderValue::from_bytes(Bytes::copy_from_slice(
             value,
         )))
     }
 
-    fn from_shared(value: Bytes) -> Result<PrivateHeaderValue, InvalidMetadataValueBytes> {
+    fn from_shared(value: Bytes) -> Result<UnencodedHeaderValue, InvalidMetadataValueBytes> {
         let start = value
             .iter()
             .position(|b| !b.is_ascii_whitespace())
@@ -150,33 +150,43 @@ impl self::value_encoding::Sealed for Ascii {
         if !Ascii::is_valid_value(value.as_ref()) {
             return Err(InvalidMetadataValueBytes::new());
         }
-        Ok(PrivateHeaderValue::from_bytes(value))
+        Ok(UnencodedHeaderValue::from_bytes(value))
     }
 
-    fn from_static(value: &'static str) -> PrivateHeaderValue {
+    fn from_static(value: &'static str) -> UnencodedHeaderValue {
         let value = value.trim();
         if !Ascii::is_valid_value(value) {
             panic!("Invalid ASCII header value: {}", value)
         }
-        PrivateHeaderValue::from_bytes(Bytes::from_static(value.as_bytes()))
+        UnencodedHeaderValue::from_bytes(Bytes::from_static(value.as_bytes()))
     }
 
     fn decode(value: &[u8]) -> Result<Bytes, InvalidMetadataValueBytes> {
+        let start = value
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .map(|p| p + 1)
+            .unwrap_or(start);
+        let value = &value[start..end];
         if !Ascii::is_valid_value(value.as_ref()) {
             return Err(InvalidMetadataValueBytes::new());
         }
         Ok(Bytes::copy_from_slice(value))
     }
 
-    fn equals(a: &PrivateHeaderValue, b: &[u8]) -> bool {
+    fn equals(a: &UnencodedHeaderValue, b: &[u8]) -> bool {
         a.data.as_ref() == b
     }
 
-    fn values_equal(a: &PrivateHeaderValue, b: &PrivateHeaderValue) -> bool {
+    fn values_equal(a: &UnencodedHeaderValue, b: &UnencodedHeaderValue) -> bool {
         a == b
     }
 
-    fn fmt(value: &PrivateHeaderValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(value: &UnencodedHeaderValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(value, f)
     }
 
@@ -185,33 +195,32 @@ impl self::value_encoding::Sealed for Ascii {
     }
 }
 
-// This array maps every byte (0-255) to a boolean (valid/invalid).
-static VALID_HEADER_KEY_CHARS: [bool; 256] = {
-    let mut table = [false; 256];
+fn is_valid_key(key: impl AsRef<[u8]>) -> bool {
+    // This array maps every byte (0-255) to a boolean (valid/invalid).
+    static VALID_HEADER_KEY_CHARS: [bool; 256] = {
+        let mut table = [false; 256];
 
-    // Valid: 0-9
-    let mut i = b'0';
-    while i <= b'9' {
-        table[i as usize] = true;
-        i += 1;
-    }
+        // Valid: 0-9
+        let mut i = b'0';
+        while i <= b'9' {
+            table[i as usize] = true;
+            i += 1;
+        }
 
-    // Valid: a-z
-    let mut i = b'a';
-    while i <= b'z' {
-        table[i as usize] = true;
-        i += 1;
-    }
+        // Valid: a-z
+        let mut i = b'a';
+        while i <= b'z' {
+            table[i as usize] = true;
+            i += 1;
+        }
 
-    // Valid: special chars
-    table[b'_' as usize] = true;
-    table[b'-' as usize] = true;
-    table[b'.' as usize] = true;
+        // Valid: special chars
+        table[b'_' as usize] = true;
+        table[b'-' as usize] = true;
+        table[b'.' as usize] = true;
 
-    table
-};
-
-pub(crate) fn is_valid_key(key: impl AsRef<[u8]>) -> bool {
+        table
+    };
     let bytes = key.as_ref();
     if bytes.is_empty() {
         return false;
@@ -241,19 +250,19 @@ impl self::value_encoding::Sealed for Binary {
         true
     }
 
-    fn from_bytes(value: &[u8]) -> Result<PrivateHeaderValue, InvalidMetadataValueBytes> {
-        Ok(PrivateHeaderValue::from_bytes(Bytes::copy_from_slice(
+    fn from_bytes(value: &[u8]) -> Result<UnencodedHeaderValue, InvalidMetadataValueBytes> {
+        Ok(UnencodedHeaderValue::from_bytes(Bytes::copy_from_slice(
             value,
         )))
     }
 
-    fn from_shared(value: Bytes) -> Result<PrivateHeaderValue, InvalidMetadataValueBytes> {
-        Ok(PrivateHeaderValue::from_bytes(value))
+    fn from_shared(value: Bytes) -> Result<UnencodedHeaderValue, InvalidMetadataValueBytes> {
+        Ok(UnencodedHeaderValue::from_bytes(value))
     }
 
-    fn from_static(value: &'static str) -> PrivateHeaderValue {
+    fn from_static(value: &'static str) -> UnencodedHeaderValue {
         let decoded = crate::util::base64::STANDARD.decode(value).unwrap();
-        PrivateHeaderValue::from_bytes(Bytes::from(decoded))
+        UnencodedHeaderValue::from_bytes(Bytes::from(decoded))
     }
 
     fn decode(value: &[u8]) -> Result<Bytes, InvalidMetadataValueBytes> {
@@ -263,15 +272,15 @@ impl self::value_encoding::Sealed for Binary {
             .map_err(|_| InvalidMetadataValueBytes::new())
     }
 
-    fn equals(a: &PrivateHeaderValue, b: &[u8]) -> bool {
+    fn equals(a: &UnencodedHeaderValue, b: &[u8]) -> bool {
         a.data.as_ref() == b
     }
 
-    fn values_equal(a: &PrivateHeaderValue, b: &PrivateHeaderValue) -> bool {
+    fn values_equal(a: &UnencodedHeaderValue, b: &UnencodedHeaderValue) -> bool {
         a.data == b.data
     }
 
-    fn fmt(value: &PrivateHeaderValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(value: &UnencodedHeaderValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", value.data)
     }
 

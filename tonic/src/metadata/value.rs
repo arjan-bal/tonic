@@ -22,27 +22,27 @@ use std::{cmp, fmt};
 pub struct MetadataValue<VE: ValueEncoding> {
     // Note: There are unsafe transmutes that assume that the memory layout
     // of MetadataValue is identical to PrivateHeaderValue.
-    pub(crate) inner: PrivateHeaderValue,
+    pub(crate) inner: UnencodedHeaderValue,
     phantom: PhantomData<VE>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct PrivateHeaderValue {
+pub struct UnencodedHeaderValue {
     pub(crate) data: Bytes,
     is_sensitive: bool,
 }
 
-impl PrivateHeaderValue {
+impl UnencodedHeaderValue {
     // Assumes that the bytes have already been validated.
     pub(crate) fn from_bytes(bytes: Bytes) -> Self {
-        PrivateHeaderValue {
+        UnencodedHeaderValue {
             data: bytes,
             is_sensitive: false,
         }
     }
 }
 
-impl fmt::Debug for PrivateHeaderValue {
+impl fmt::Debug for UnencodedHeaderValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut hv = unsafe { HeaderValue::from_maybe_shared_unchecked(self.data.clone()) };
         hv.set_sensitive(self.is_sensitive);
@@ -110,7 +110,7 @@ impl<VE: ValueEncoding> MetadataValue<VE> {
     #[inline]
     pub unsafe fn from_shared_unchecked(src: Bytes) -> Self {
         MetadataValue {
-            inner: PrivateHeaderValue::from_bytes(src),
+            inner: UnencodedHeaderValue::from_bytes(src),
             phantom: PhantomData,
         }
     }
@@ -200,12 +200,23 @@ impl<VE: ValueEncoding> MetadataValue<VE> {
         self.inner.is_sensitive
     }
 
+    /// Converts a HeaderValue to a MetadataValue. This method assumes that the
+    /// caller has made sure that the value is of the correct Ascii or Binary
+    /// value encoding.
+    #[inline]
+    pub(crate) fn unchecked_from_header_value(value: UnencodedHeaderValue) -> Self {
+        MetadataValue {
+            inner: value,
+            phantom: PhantomData,
+        }
+    }
+
     /// Converts a HeaderValue reference to a MetadataValue. This method assumes
     /// that the caller has made sure that the value is of the correct Ascii or
     /// Binary value encoding.
     #[inline]
-    pub(crate) fn unchecked_from_header_value_ref(header_value: &PrivateHeaderValue) -> &Self {
-        unsafe { &*(header_value as *const PrivateHeaderValue as *const Self) }
+    pub(crate) fn unchecked_from_header_value_ref(header_value: &UnencodedHeaderValue) -> &Self {
+        unsafe { &*(header_value as *const UnencodedHeaderValue as *const Self) }
     }
 
     /// Converts a HeaderValue reference to a MetadataValue. This method assumes
@@ -213,20 +224,9 @@ impl<VE: ValueEncoding> MetadataValue<VE> {
     /// Binary value encoding.
     #[inline]
     pub(crate) fn unchecked_from_mut_header_value_ref(
-        header_value: &mut PrivateHeaderValue,
+        header_value: &mut UnencodedHeaderValue,
     ) -> &mut Self {
-        unsafe { &mut *(header_value as *mut PrivateHeaderValue as *mut Self) }
-    }
-
-    /// Converts a HeaderValue to a MetadataValue. This method assumes that the
-    /// caller has made sure that the value is of the correct Ascii or Binary
-    /// value encoding.
-    #[inline]
-    pub(crate) fn unchecked_from_header_value(value: PrivateHeaderValue) -> Self {
-        MetadataValue {
-            inner: value,
-            phantom: PhantomData,
-        }
+        unsafe { &mut *(header_value as *mut UnencodedHeaderValue as *mut Self) }
     }
 
     pub(crate) fn encode(value: Bytes) -> Bytes {
@@ -499,7 +499,7 @@ macro_rules! from_integers {
         impl From<$t> for MetadataValue<Ascii> {
             fn from(num: $t) -> MetadataValue<Ascii> {
                 MetadataValue {
-                    inner: PrivateHeaderValue::from_bytes(Bytes::from(num.to_string())),
+                    inner: UnencodedHeaderValue::from_bytes(Bytes::from(num.to_string())),
                     phantom: PhantomData,
                 }
             }
@@ -546,29 +546,6 @@ from_integers! {
 from_integers! {
     from_usize: usize => 20,
     from_isize: isize => 20
-}
-
-#[cfg(test)]
-mod from_metadata_value_tests {
-    use super::*;
-    use crate::metadata::map::MetadataMap;
-
-    // No longer zero copy as HeaderValue doesn't expose it's internals.
-    // #[test]
-    // fn it_can_insert_metadata_key_as_metadata_value() {
-    //     let mut map = MetadataMap::new();
-    //     map.insert(
-    //         "accept",
-    //         MetadataKey::<Ascii>::from_bytes(b"hello-world")
-    //             .unwrap()
-    //             .into(),
-    //     );
-    //
-    //     assert_eq!(
-    //         map.get("accept").unwrap(),
-    //         AsciiMetadataValue::try_from(b"hello-world").unwrap()
-    //     );
-    // }
 }
 
 impl FromStr for MetadataValue<Ascii> {
