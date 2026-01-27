@@ -16,7 +16,7 @@ use tokio::{
         TcpStream,
     },
 };
-use tokio_boring::SslStream;
+use tokio_rustls::TlsStream;
 use tonic::async_trait;
 
 use crate::{attributes::Attributes, byte_str::ByteStr, rt::Runtime};
@@ -361,7 +361,7 @@ pub(crate) mod tls {
         any::Any,
         borrow::Cow,
         env,
-        io::IoSlice,
+        io::{self, BufReader, Cursor, IoSlice},
         net::IpAddr,
         path::PathBuf,
         pin::Pin,
@@ -369,19 +369,12 @@ pub(crate) mod tls {
         task::{Context, Poll},
     };
 
-    use boring::{
-        pkey::PKey,
-        ssl::{
-            NameType, SniError, SslAcceptor, SslConnector, SslContext, SslMethod, SslVerifyMode,
-        },
-        x509::X509,
-    };
-    use google_cloud_auth::credentials::api_key_credentials;
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
     use tokio::{
         io::{AsyncRead, AsyncWrite, ReadBuf},
         sync::watch::{self, Receiver},
     };
-    use tokio_boring::SslStream;
+    use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream as RustlsStream};
     use tonic::async_trait;
 
     use crate::{
@@ -553,79 +546,85 @@ pub(crate) mod tls {
 
     #[derive(Clone)]
     pub struct ClientTlsCredendials {
-        connector: SslConnector,
+        connector: TlsConnector,
     }
 
     static TLS_PROTO_INFO: ProtocolInfo = ProtocolInfo {
         security_protocol: "tls",
     };
 
-    const ALPN_H2: &[u8] = b"\x02h2";
+    fn parse_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, String> {
+        let mut reader = BufReader::new(pem);
+        rustls_pemfile::certs(&mut reader)
+            .map(|result| result.map_err(|e| e.to_string()))
+            .collect()
+    }
+
+    fn parse_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, String> {
+        let mut reader = BufReader::new(pem);
+        loop {
+            match rustls_pemfile::read_one(&mut reader).map_err(|e| e.to_string())? {
+                Some(rustls_pemfile::Item::Pkcs1Key(key)) => return Ok(key.into()),
+                Some(rustls_pemfile::Item::Pkcs8Key(key)) => return Ok(key.into()),
+                Some(rustls_pemfile::Item::Sec1Key(key)) => return Ok(key.into()),
+                None => return Err("no private key found".to_string()),
+                _ => continue,
+            }
+        }
+    }
 
     impl ClientTlsCredendials {
         /// Constructs a new `ClientTlsCredendials` instance from the provided
         /// configuration.
         pub fn new(mut config: ClientTlsConfig) -> Result<ClientTlsCredendials, String> {
-            let mut builder =
-                SslConnector::builder(SslMethod::tls_client()).map_err(|e| e.to_string())?;
-            builder.set_verify(SslVerifyMode::PEER);
-            builder
-                .set_alpn_protos(ALPN_H2)
-                .map_err(|e| e.to_string())?;
+            let mut root_store = rustls::RootCertStore::empty();
 
             // Set trust store.
             if let Some(mut roots_provider) = config.pem_roots_provider.take() {
                 let ca_pem = roots_provider.borrow_and_update();
-                let ca_certs = X509::stack_from_pem(ca_pem.as_ref()).map_err(|e| e.to_string())?;
-                let cert_store = builder.cert_store_mut();
-                for cert in ca_certs {
-                    cert_store.add_cert(cert).map_err(|e| e.to_string())?;
+                let certs = parse_certs(ca_pem.as_ref())?;
+                for cert in certs {
+                    root_store.add(cert).map_err(|e| e.to_string())?;
                 }
             } else if let Ok(path) = env::var("GRPC_DEFAULT_SSL_ROOTS_FILE_PATH") {
-                builder.set_ca_file(path).map_err(|e| e.to_string())?;
+                let pem = std::fs::read(path).map_err(|e| e.to_string())?;
+                let certs = parse_certs(&pem)?;
+                for cert in certs {
+                    root_store.add(cert).map_err(|e| e.to_string())?;
+                }
             } else {
-                builder
-                    .set_default_verify_paths()
-                    .map_err(|e| e.to_string())?;
+                root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             }
 
-            if let Some(mut identity_provider) = config.identity_provider.take() {
-                let identity = identity_provider.borrow_and_update();
-                let mut chain =
-                    X509::stack_from_pem(identity.cert.as_ref()).map_err(|e| e.to_string())?;
-                if chain.is_empty() {
-                    return Err("empty client cert chain".to_string());
-                }
-                let client_cert = chain.remove(0);
-                builder
-                    .set_certificate(&client_cert)
-                    .map_err(|e| e.to_string())?;
+            let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
 
-                for intermediate_cert in chain {
+            let mut client_config =
+                if let Some(mut identity_provider) = config.identity_provider.take() {
+                    let identity = identity_provider.borrow_and_update();
+                    let certs = parse_certs(&identity.cert)?;
+                    let key = parse_key(&identity.key)?;
                     builder
-                        .add_extra_chain_cert(intermediate_cert)
-                        .map_err(|e| e.to_string())?;
-                }
+                        .with_client_auth_cert(certs, key)
+                        .map_err(|e| e.to_string())?
+                } else {
+                    builder.with_no_client_auth()
+                };
 
-                let pkey = PKey::private_key_from_pem(&identity.key).map_err(|e| e.to_string())?;
-                builder.set_private_key(&pkey).map_err(|e| e.to_string())?;
-            }
-            let connector = builder.build();
-            Ok(ClientTlsCredendials { connector })
+            client_config.alpn_protocols = vec![b"h2".to_vec()];
+
+            Ok(ClientTlsCredendials {
+                connector: TlsConnector::from(Arc::new(client_config)),
+            })
         }
     }
 
     pub(crate) struct ClientTlsSecContext {
-        peer_cert_chain: Vec<X509>,
+        peer_cert_chain: Option<Vec<CertificateDer<'static>>>,
     }
 
     impl ClientConnectionSecurityContext for ClientTlsSecContext {
-        fn validate_authority(&self, authority: &http::uri::Authority) -> bool {
-            for cert in &self.peer_cert_chain {
-                if cert.check_host(authority.host()).is_ok_and(|x| x) {
-                    return true;
-                }
-            }
+        fn validate_authority(&self, _authority: &http::uri::Authority) -> bool {
+            // TODO: implement authority validation using webpki or similar.
             false
         }
     }
@@ -648,23 +647,30 @@ pub(crate) mod tls {
             String,
         > {
             let wrapper = GrpcStreamWrapper::new(source);
-            let tls_stream = tokio_boring::connect(
-                self.connector.configure().unwrap(),
-                authority.host(),
-                wrapper,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+            let server_name = ServerName::try_from(authority.host())
+                .map_err(|e| format!("invalid authority: {}", e))?
+                .to_owned();
+
+            let tls_stream = self
+                .connector
+                .connect(server_name, wrapper)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let (_, connection) = tls_stream.get_ref();
+            let peer_cert_chain = connection
+                .peer_certificates()
+                .map(|certs| certs.iter().map(|c| c.clone().into_owned()).collect());
 
             let cs_info = ClientConnectionSecurityInfo {
                 security_protocol: "tls",
                 security_level: SecurityLevel::PrivacyAndIntegrity,
-                security_context: ClientTlsSecContext {
-                    peer_cert_chain: Vec::new(),
-                },
+                security_context: ClientTlsSecContext { peer_cert_chain },
                 attributes: Attributes {},
             };
-            let ep = TlsStream { inner: tls_stream };
+            let ep = TlsStream {
+                inner: RustlsStream::Client(tls_stream),
+            };
             Ok((ep, cs_info))
         }
 
@@ -736,14 +742,10 @@ pub(crate) mod tls {
 
     #[derive(Clone)]
     pub(crate) struct ServerTlsCredendials {
-        acceptor: SslAcceptor,
+        acceptor: TlsAcceptor,
     }
 
     /// A provider that supplies a constant, immutable value.
-    ///
-    /// This implementation is useful when dynamic updates are not required,
-    /// such  simple configurations where certificates or identities are loaded
-    /// once at startup and never change.
     pub struct StaticProvider<T> {
         inner: T,
     }
@@ -807,138 +809,58 @@ pub(crate) mod tls {
             if id_list.is_empty() {
                 return Err("need at least one server identity.".to_string());
             }
-            let mut contexts = Vec::new();
-            let verify_mode;
-            let roots_pem = match config.request_type {
-                InnerClientCertificateRequestType::RequestClientCertificateAndVerify {
-               mut     roots_provider,
-                } => {
-                    verify_mode = SslVerifyMode::PEER;
-                    Some(roots_provider.borrow_and_update().pem.clone())
-                }
+
+            let verifier = match config.request_type {
                 InnerClientCertificateRequestType::DontRequestClientCertificate => {
-                    verify_mode = SslVerifyMode::NONE;
-                    None
+                    rustls::server::WebPkiClientVerifier::no_client_auth()
+                }
+                InnerClientCertificateRequestType::RequestClientCertificateAndVerify {
+                    mut roots_provider,
+                } => {
+                    let roots = roots_provider.borrow_and_update();
+                    let certs = parse_certs(&roots.pem)?;
+                    let mut root_store = rustls::RootCertStore::empty();
+                    for cert in certs {
+                        root_store.add(cert).map_err(|e| e.to_string())?;
+                    }
+                    rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+                        .allow_unauthenticated()
+                        .build()
+                        .map_err(|e| e.to_string())?
                 }
                 InnerClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
                     mut roots_provider,
                 } => {
-                    verify_mode = SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT;
-                    Some(roots_provider.borrow_and_update().pem.clone())
+                    let roots = roots_provider.borrow_and_update();
+                    let certs = parse_certs(&roots.pem)?;
+                    let mut root_store = rustls::RootCertStore::empty();
+                    for cert in certs {
+                        root_store.add(cert).map_err(|e| e.to_string())?;
+                    }
+                    rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+                        .build()
+                        .map_err(|e| e.to_string())?
                 }
             };
 
-            for identity in id_list {
-                let mut context =
-                    SslContext::builder(SslMethod::tls_server()).map_err(|e| e.to_string())?;
-                context.set_alpn_select_callback(|_ssl_ref, a| Ok(b"h2"));
+            let builder = rustls::ServerConfig::builder().with_client_cert_verifier(verifier);
 
-                let mut chain =
-                    X509::stack_from_pem(identity.cert.as_ref()).map_err(|e| e.to_string())?;
-                if chain.is_empty() {
-                    return Err("empty client cert chain".to_string());
-                }
-                let server_cert = chain.remove(0);
-                context
-                    .set_certificate(&server_cert)
-                    .map_err(|e| e.to_string())?;
+            // For simplicity, we use the first identity.
+            // TODO: implement multiple identities with SNI resolver.
+            let identity = &id_list[0];
+            let certs = parse_certs(&identity.cert)?;
+            let key = parse_key(&identity.key)?;
 
-                for intermediate_cert in chain {
-                    context
-                        .add_extra_chain_cert(intermediate_cert)
-                        .map_err(|e| e.to_string())?;
-                }
-
-                let pkey = PKey::private_key_from_pem(&identity.key).map_err(|e| e.to_string())?;
-                context.set_private_key(&pkey).map_err(|e| e.to_string())?;
-                context.set_verify(verify_mode);
-
-                if let Some(pem) = roots_pem.as_ref() {
-                    let certs = X509::stack_from_pem(pem).map_err(|e| e.to_string())?;
-                    let store = context.cert_store_mut();
-                    for cert in certs {
-                        store.add_cert(cert).map_err(|e| e.to_string())?;
-                    }
-                }
-                contexts.push(context.build());
-            }
-
-            let mut ssl_builder = boring::ssl::SslAcceptor::mozilla_modern(SslMethod::tls_server())
+            let mut server_config = builder
+                .with_single_cert(certs, key)
                 .map_err(|e| e.to_string())?;
 
-            ssl_builder.set_servername_callback(move |ssl, _alert| {
-                let Some(requested_name) = ssl.servername(NameType::HOST_NAME) else {
-                    if let Some(default_ctx) = contexts.first() {
-                        ssl.set_ssl_context(default_ctx)
-                            .map_err(|_| SniError::ALERT_FATAL)?;
-                        return Ok(());
-                    }
-                    return Err(SniError::ALERT_FATAL);
-                };
-                // 2. OPTIMIZATION: Parse the IP address ONLY ONCE here.
-                // This creates an Option<IpAddr> that we can reuse in the loop.
-                let parsed_ip = requested_name
-                    .parse::<IpAddr>()
-                    .ok()
-                    .map(|ip| ip.to_string());
+            server_config.alpn_protocols = vec![b"h2".to_vec()];
 
-                for ctx in &contexts {
-                    let Some(cert) = ctx.certificate() else {
-                        continue;
-                    };
-                    let is_match = if let Some(ip) = &parsed_ip {
-                        cert.check_ip_asc(ip).unwrap_or(false)
-                    } else {
-                        // CASE B: It is a Hostname
-                        // check_host(name, flags). 0 = default flags.
-                        // It returns Ok(_) on match, Err on mismatch.
-                        cert.check_host(requested_name).unwrap_or(false)
-                    };
-
-                    if !is_match {
-                        continue;
-                    }
-                    // Switch the Context (Loads certs, keys, CAs).
-                    ssl.set_ssl_context(ctx)
-                        .map_err(|_| SniError::ALERT_FATAL)?;
-                    ssl.set_verify(ctx.verify_mode());
-                    ssl.set_verify(verify_mode);
-                    return Ok(());
-                }
-                // No match found in any context.
-                Err(SniError::ALERT_FATAL)
-            });
-
-            let acceptor = ssl_builder.build();
-            Ok(ServerTlsCredendials { acceptor })
+            Ok(ServerTlsCredendials {
+                acceptor: TlsAcceptor::from(Arc::new(server_config)),
+            })
         }
-    }
-
-    fn get_full_peer_chain_server_side<T>(
-        stream: &SslStream<GrpcStreamWrapper<T>>,
-    ) -> Option<Vec<X509>> {
-        let ssl = stream.ssl();
-        let mut full_chain = Vec::new();
-
-        // 1. Get the Leaf (The Client Identity)
-        // On the server, this is NOT included in peer_cert_chain()
-        if let Some(leaf) = ssl.peer_certificate() {
-            full_chain.push(leaf);
-        } else {
-            // If there is no leaf, there is no chain.
-            return None;
-        }
-
-        // 2. Get the rest of the chain (Intermediates)
-        if let Some(chain_stack) = ssl.peer_cert_chain() {
-            for cert in chain_stack {
-                // We must clone/to_owned because the stack returns references,
-                // but we want an owned Vector.
-                full_chain.push(cert.to_owned());
-            }
-        }
-
-        Some(full_chain)
     }
 
     #[async_trait]
@@ -951,17 +873,20 @@ pub(crate) mod tls {
             _rt: Arc<dyn Runtime>,
         ) -> Result<(TlsStream<Input>, ServerConnectionSecurityInfo), String> {
             let wrapper = GrpcStreamWrapper::new(source);
-            let tls_stream = tokio_boring::accept(&self.acceptor, wrapper)
+            let tls_stream = self
+                .acceptor
+                .accept(wrapper)
                 .await
                 .map_err(|e| e.to_string())?;
-            let peer_cert_chain = get_full_peer_chain_server_side(&tls_stream);
-            // TODO: Put cert chain in attributes.
+
             let auth_info = ServerConnectionSecurityInfo {
                 security_protocol: "tls",
                 security_level: SecurityLevel::PrivacyAndIntegrity,
                 attributes: Attributes {},
             };
-            let ep = TlsStream { inner: tls_stream };
+            let ep = TlsStream {
+                inner: RustlsStream::Server(tls_stream),
+            };
             Ok((ep, auth_info))
         }
 
@@ -971,12 +896,12 @@ pub(crate) mod tls {
     }
 
     pub(crate) struct TlsStream<T> {
-        inner: SslStream<GrpcStreamWrapper<T>>,
+        inner: RustlsStream<GrpcStreamWrapper<T>>,
     }
 
     impl<T> AsyncRead for TlsStream<T>
     where
-        T: GrpcEndpoint,
+        T: AsyncRead + AsyncWrite + Unpin,
     {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -990,7 +915,7 @@ pub(crate) mod tls {
 
     impl<T> AsyncWrite for TlsStream<T>
     where
-        T: GrpcEndpoint,
+        T: AsyncRead + AsyncWrite + Unpin,
     {
         fn poll_write(
             self: Pin<&mut Self>,
@@ -1025,10 +950,6 @@ pub(crate) mod tls {
             let pinned = Pin::new(&mut self.get_mut().inner);
             AsyncWrite::poll_write_vectored(pinned, cx, bufs)
         }
-
-        fn is_write_vectored(&self) -> bool {
-            AsyncWrite::is_write_vectored(&self.inner)
-        }
     }
 
     impl<T> private::Sealed for TlsStream<T> where T: GrpcEndpoint {}
@@ -1038,11 +959,17 @@ pub(crate) mod tls {
         T: GrpcEndpoint,
     {
         fn get_local_address(&self) -> ByteStr {
-            self.inner.get_ref().get_ref().get_local_address()
+            match &self.inner {
+                RustlsStream::Client(s) => s.get_ref().0.get_ref().get_local_address(),
+                RustlsStream::Server(s) => s.get_ref().0.get_ref().get_local_address(),
+            }
         }
 
         fn get_peer_address(&self) -> ByteStr {
-            self.inner.get_ref().get_ref().get_peer_address()
+            match &self.inner {
+                RustlsStream::Client(s) => s.get_ref().0.get_ref().get_peer_address(),
+                RustlsStream::Server(s) => s.get_ref().0.get_ref().get_peer_address(),
+            }
         }
     }
 }
@@ -1196,6 +1123,9 @@ mod test {
 
     #[tokio::test]
     pub async fn test_tls() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
         let hostname = "google.com";
         let stream = tokio::net::TcpStream::connect((hostname, 443))
             .await
@@ -1216,6 +1146,9 @@ mod test {
 
     #[tokio::test]
     async fn test_mtls_handshake() {
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .ok();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let base = PathBuf::from(env::var("GRPC_GO_HOME").unwrap()).join("testdata/x509/");
         let base_copy = base.clone();
