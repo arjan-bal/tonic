@@ -553,6 +553,22 @@ pub(crate) mod tls {
         security_protocol: "tls",
     };
 
+    fn get_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+        rustls::crypto::CryptoProvider::get_default()
+            .cloned()
+            .or_else(|| {
+                #[cfg(feature = "tls-aws-lc")]
+                {
+                    Some(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+                }
+                #[cfg(not(feature = "tls-aws-lc"))]
+                {
+                    None
+                }
+            })
+            .expect("No crypto provider installed. Enable `tls-aws-lc` feature or install one manually.")
+    }
+
     fn parse_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, String> {
         let mut reader = BufReader::new(pem);
         rustls_pemfile::certs(&mut reader)
@@ -596,7 +612,10 @@ pub(crate) mod tls {
                 root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             }
 
-            let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
+            let builder = rustls::ClientConfig::builder_with_provider(get_crypto_provider())
+                .with_safe_default_protocol_versions()
+                .expect("gRPC requires safe default TLS versions")
+                .with_root_certificates(root_store);
 
             let mut client_config =
                 if let Some(mut identity_provider) = config.identity_provider.take() {
@@ -843,7 +862,10 @@ pub(crate) mod tls {
                 }
             };
 
-            let builder = rustls::ServerConfig::builder().with_client_cert_verifier(verifier);
+            let builder = rustls::ServerConfig::builder_with_provider(get_crypto_provider())
+                .with_safe_default_protocol_versions()
+                .expect("gRPC requires safe default TLS versions")
+                .with_client_cert_verifier(verifier);
 
             // For simplicity, we use the first identity.
             // TODO: implement multiple identities with SNI resolver.
@@ -1123,7 +1145,7 @@ mod test {
 
     #[tokio::test]
     pub async fn test_tls() {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
         let hostname = "google.com";
@@ -1146,7 +1168,7 @@ mod test {
 
     #[tokio::test]
     async fn test_mtls_handshake() {
-        rustls::crypto::ring::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
         let (tx, rx) = tokio::sync::oneshot::channel();
