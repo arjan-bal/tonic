@@ -8,7 +8,6 @@ use std::{
     task::{Context, Poll},
 };
 
-use http::uri::Authority;
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{
@@ -303,24 +302,24 @@ where
 
 /// Defines the level of protection provided by an established connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub(crate) enum SecurityLevel {
     /// The connection is insecure; no protection is applied.
     NoSecurity,
-    /// The connection guarantees data integrity (tamper-proofing) but not privacy.
-    ///
-    /// Payloads are visible to observers but cannot be modified without detection.
-    IntegrityOnly,
     /// The connection guarantees both privacy (confidentiality) and data integrity.
     ///
     /// This is the standard level for secure transports like TLS.
     PrivacyAndIntegrity,
 }
 
-/// Represents the security state of an established client-side connection.
-///
-/// This trait abstracts over specific security protocols (e.g., TLS, ALTS) to allow
-/// the transport layer to query security properties without knowing the implementation details.
-pub(crate) trait ClientConnectionSecurityContext: Send + Sync + 'static {
+/// Represents the value passed as the `:authority` pseudo-header, typically in
+/// the form `host:port`.
+pub struct Authority<'a> {
+    pub host: &'a str,
+    pub port: Option<u16>,
+}
+
+pub trait ClientConnectionSecurityContext: Send + Sync + 'static {
     /// Checks if the established connection is authorized to send requests to the given authority.
     ///
     /// This is primarily used for HTTP/2 connection reuse (coalescing). If the
@@ -336,6 +335,7 @@ pub(crate) trait ClientConnectionSecurityContext: Send + Sync + 'static {
     }
 }
 
+/// Represents the security state of an established client-side connection.
 pub(crate) struct ClientConnectionSecurityInfo<C> {
     pub(crate) security_protocol: &'static str,
     pub(crate) security_level: SecurityLevel,
@@ -344,6 +344,7 @@ pub(crate) struct ClientConnectionSecurityInfo<C> {
     pub(crate) attributes: Attributes,
 }
 
+/// Represents the security state of an established server-side connection.
 pub(crate) struct ServerConnectionSecurityInfo {
     pub(crate) security_protocol: &'static str,
     pub(crate) security_level: SecurityLevel,
@@ -369,7 +370,9 @@ pub(crate) mod tls {
         task::{Context, Poll},
     };
 
+    use hyper::client;
     use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+    use serde::ser;
     use tokio::{
         io::{AsyncRead, AsyncWrite, ReadBuf},
         sync::watch::{self, Receiver},
@@ -381,7 +384,7 @@ pub(crate) mod tls {
         attributes::Attributes,
         byte_str::ByteStr,
         endpoint::{
-            private, tls::provider::Sealed as _, ClientChannelCredential,
+            private, tls::provider::Sealed as _, Authority, ClientChannelCredential,
             ClientConnectionSecurityContext, ClientConnectionSecurityInfo, ClientHandshakeInfo,
             GrpcEndpoint, GrpcStreamWrapper, ProtocolInfo, SecurityLevel, ServerChannelCredentials,
             ServerConnectionSecurityInfo,
@@ -391,11 +394,11 @@ pub(crate) mod tls {
 
     /// Represents a X509 certificate chain.
     #[derive(Debug, Clone)]
-    pub struct Roots {
+    pub struct RootCertificates {
         pem: Vec<u8>,
     }
 
-    impl Roots {
+    impl RootCertificates {
         /// Parse a PEM encoded X509 Certificate.
         ///
         /// The provided PEM should include at least one PEM encoded certificate.
@@ -420,13 +423,13 @@ pub(crate) mod tls {
         }
     }
 
-    impl AsRef<[u8]> for Roots {
+    impl AsRef<[u8]> for RootCertificates {
         fn as_ref(&self) -> &[u8] {
             self.pem.as_ref()
         }
     }
 
-    impl AsMut<[u8]> for Roots {
+    impl AsMut<[u8]> for RootCertificates {
         fn as_mut(&mut self) -> &mut [u8] {
             self.pem.as_mut()
         }
@@ -452,7 +455,7 @@ pub(crate) mod tls {
 
     /// Configuration for client-side TLS settings.
     pub(crate) struct ClientTlsConfig {
-        pem_roots_provider: Option<Receiver<Roots>>,
+        pem_roots_provider: Option<Receiver<RootCertificates>>,
         identity_provider: Option<Receiver<Identity>>,
         key_log_path: Option<PathBuf>,
     }
@@ -494,7 +497,7 @@ pub(crate) mod tls {
     /// `StaticIdentityProvider`, `StaticRootsProvider`).
     pub trait Provider<T>: provider::Sealed<T> {}
 
-    pub type StaticRootsProvider = StaticProvider<Roots>;
+    pub type StaticRootCertificatesProvider = StaticProvider<RootCertificates>;
     pub type StaticIdentityProvider = StaticProvider<Identity>;
 
     impl ClientTlsConfig {
@@ -511,9 +514,9 @@ pub(crate) mod tls {
         /// These certificates are used to validate the server's certificate chain.
         /// If this is not called, the client generally defaults to using the
         /// system's native certificate store.
-        pub fn with_roots_provider<R>(mut self, provider: R) -> Self
+        pub fn with_root_certificates_provider<R>(mut self, provider: R) -> Self
         where
-            R: Provider<Roots>,
+            R: Provider<RootCertificates>,
         {
             self.pem_roots_provider = Some(provider.get_receiver());
             self
@@ -545,7 +548,7 @@ pub(crate) mod tls {
     }
 
     #[derive(Clone)]
-    pub struct ClientTlsCredendials {
+    pub struct RustlsClientTlsCredendials {
         connector: TlsConnector,
     }
 
@@ -553,20 +556,36 @@ pub(crate) mod tls {
         security_protocol: "tls",
     };
 
-    fn get_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
-        rustls::crypto::CryptoProvider::get_default()
-            .cloned()
-            .or_else(|| {
-                #[cfg(feature = "tls-aws-lc")]
-                {
-                    Some(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
-                }
-                #[cfg(not(feature = "tls-aws-lc"))]
-                {
-                    None
-                }
-            })
-            .expect("No crypto provider installed. Enable `tls-aws-lc` feature or install one manually.")
+    fn get_crypto_provider() -> Result<Arc<rustls::crypto::CryptoProvider>, String> {
+        let mut provider = if let Some(p) = rustls::crypto::CryptoProvider::get_default() {
+            p.as_ref().clone()
+        } else {
+            return Err(
+            "No crypto provider installed. Enable `tls-aws-lc` feature or install one manually."
+                .to_string(),
+        );
+        };
+
+        provider.cipher_suites.retain(|suite| match suite {
+            rustls::SupportedCipherSuite::Tls13(suite) => true,
+            rustls::SupportedCipherSuite::Tls12(suite) => {
+                matches!(
+                    suite.common.suite,
+                    rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+                        | rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+                        | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+                        | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+                        | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+                        | rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+                )
+            }
+        });
+
+        if provider.cipher_suites.is_empty() {
+            return Err("Crypto provider has no cipher suites matching the security policy (TLS1.3 or TLS1.2+ECDHE)".to_string());
+        }
+
+        Ok(Arc::new(provider))
     }
 
     fn parse_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, String> {
@@ -589,10 +608,10 @@ pub(crate) mod tls {
         }
     }
 
-    impl ClientTlsCredendials {
+    impl RustlsClientTlsCredendials {
         /// Constructs a new `ClientTlsCredendials` instance from the provided
         /// configuration.
-        pub fn new(mut config: ClientTlsConfig) -> Result<ClientTlsCredendials, String> {
+        pub fn new(mut config: ClientTlsConfig) -> Result<RustlsClientTlsCredendials, String> {
             let mut root_store = rustls::RootCertStore::empty();
 
             // Set trust store.
@@ -612,8 +631,8 @@ pub(crate) mod tls {
                 root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             }
 
-            let builder = rustls::ClientConfig::builder_with_provider(get_crypto_provider())
-                .with_safe_default_protocol_versions()
+            let builder = rustls::ClientConfig::builder_with_provider(get_crypto_provider()?)
+                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
                 .expect("gRPC requires safe default TLS versions")
                 .with_root_certificates(root_store);
 
@@ -630,8 +649,9 @@ pub(crate) mod tls {
                 };
 
             client_config.alpn_protocols = vec![b"h2".to_vec()];
+            client_config.resumption = rustls::client::Resumption::disabled();
 
-            Ok(ClientTlsCredendials {
+            Ok(RustlsClientTlsCredendials {
                 connector: TlsConnector::from(Arc::new(client_config)),
             })
         }
@@ -642,14 +662,14 @@ pub(crate) mod tls {
     }
 
     impl ClientConnectionSecurityContext for ClientTlsSecContext {
-        fn validate_authority(&self, _authority: &http::uri::Authority) -> bool {
+        fn validate_authority(&self, _authority: &Authority) -> bool {
             // TODO: implement authority validation using webpki or similar.
             false
         }
     }
 
     #[async_trait]
-    impl ClientChannelCredential for ClientTlsCredendials {
+    impl ClientChannelCredential for RustlsClientTlsCredendials {
         type ContextType = ClientTlsSecContext;
         type Output<I> = TlsStream<I>;
         async fn connect<Input: GrpcEndpoint + 'static>(
@@ -677,6 +697,14 @@ pub(crate) mod tls {
                 .map_err(|e| e.to_string())?;
 
             let (_, connection) = tls_stream.get_ref();
+            if let Some(negotiated) = connection.alpn_protocol() {
+                if negotiated != b"h2" {
+                    return Err("Server negotiated unexpected ALPN protocol".into());
+                }
+            } else {
+                // Strict Enforcement: Fail if server didn't select ALPN
+                return Err("Server did not negotiate ALPN (h2 required)".into());
+            }
             let peer_cert_chain = connection
                 .peer_certificates()
                 .map(|certs| certs.iter().map(|c| c.clone().into_owned()).collect());
@@ -699,8 +727,10 @@ pub(crate) mod tls {
     }
 
     #[non_exhaustive]
-    pub enum TlsClientCertificateRequestType<R = StaticRootsProvider> {
+    pub enum TlsClientCertificateRequestType<R = StaticRootCertificatesProvider> {
         /// Server does not request client certificate.
+        ///
+        /// This is the default behavior.
         ///
         /// The certificate presented by the client is not checked by the server at
         /// all. (A client may present a self-signed or signed certificate or not
@@ -715,7 +745,7 @@ pub(crate) mod tls {
         /// present a certificate that can be verified against the `pem_root_certs`
         /// or not present a certificate at all.
         ///
-        /// The client's key certificate pair must be valid for the SSL connection to
+        /// The client's key certificate pair must be valid for the TLS connection to
         /// be established.
         RequestClientCertificateAndVerify { roots_provider: R },
 
@@ -726,15 +756,19 @@ pub(crate) mod tls {
         /// For a successful connection the client needs to present a certificate that
         /// can be verified against the `pem_root_certs`.
         ///
-        /// The client's key certificate pair must be valid for the SSL connection to
+        /// The client's key certificate pair must be valid for the TLS connection to
         /// be established.
         RequestAndRequireClientCertificateAndVerify { roots_provider: R },
     }
 
     enum InnerClientCertificateRequestType {
         DontRequestClientCertificate,
-        RequestClientCertificateAndVerify { roots_provider: Receiver<Roots> },
-        RequestAndRequireClientCertificateAndVerify { roots_provider: Receiver<Roots> },
+        RequestClientCertificateAndVerify {
+            roots_provider: Receiver<RootCertificates>,
+        },
+        RequestAndRequireClientCertificateAndVerify {
+            roots_provider: Receiver<RootCertificates>,
+        },
     }
 
     impl From<TlsClientCertificateRequestType> for InnerClientCertificateRequestType {
@@ -760,7 +794,7 @@ pub(crate) mod tls {
     }
 
     #[derive(Clone)]
-    pub(crate) struct ServerTlsCredendials {
+    pub(crate) struct RustlsServerTlsCredendials {
         acceptor: TlsAcceptor,
     }
 
@@ -799,15 +833,24 @@ pub(crate) mod tls {
     }
 
     impl ServerTlsConfig {
-        pub fn new<I>(identities_provider: I, request_type: TlsClientCertificateRequestType) -> Self
+        pub fn new<I>(identities_provider: I) -> Self
         where
             I: Provider<IdentityList>,
         {
             ServerTlsConfig {
                 identities_provider: identities_provider.get_receiver(),
-                request_type: request_type.into(),
+                request_type: TlsClientCertificateRequestType::DontRequestClientCertificate.into(),
                 key_log_path: None,
             }
+        }
+
+        /// Configures the client certificate request policy for the server.
+        ///
+        /// This determines whether the server requests a client certificate and how
+        /// it verifies it.
+        pub fn with_request_type(mut self, request_type: TlsClientCertificateRequestType) -> Self {
+            self.request_type = request_type.into();
+            self
         }
 
         /// Sets the path where TLS session keys will be logged.
@@ -816,14 +859,14 @@ pub(crate) mod tls {
         ///
         /// This should be used **only for debugging purposes**. It should never be
         /// used in a production environment due to security concerns.
-        pub(crate) fn with_key_log_path(mut self, path: impl Into<PathBuf>) -> Self {
+        pub fn with_key_log_path(mut self, path: impl Into<PathBuf>) -> Self {
             self.key_log_path = Some(path.into());
             self
         }
     }
 
-    impl ServerTlsCredendials {
-        pub fn new(mut config: ServerTlsConfig) -> Result<ServerTlsCredendials, String> {
+    impl RustlsServerTlsCredendials {
+        pub fn new(mut config: ServerTlsConfig) -> Result<RustlsServerTlsCredendials, String> {
             let id_list = config.identities_provider.borrow_and_update().clone();
             if id_list.is_empty() {
                 return Err("need at least one server identity.".to_string());
@@ -862,8 +905,8 @@ pub(crate) mod tls {
                 }
             };
 
-            let builder = rustls::ServerConfig::builder_with_provider(get_crypto_provider())
-                .with_safe_default_protocol_versions()
+            let builder = rustls::ServerConfig::builder_with_provider(get_crypto_provider()?)
+                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
                 .expect("gRPC requires safe default TLS versions")
                 .with_client_cert_verifier(verifier);
 
@@ -878,15 +921,42 @@ pub(crate) mod tls {
                 .map_err(|e| e.to_string())?;
 
             server_config.alpn_protocols = vec![b"h2".to_vec()];
+            // Disable Stateful Resumption (Session IDs).
+            server_config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
 
-            Ok(ServerTlsCredendials {
+            // Disable Stateless Resumption (TLS 1.3 Tickets).
+            server_config.send_tls13_tickets = 0;
+            // Disable Stateless Resumption (TLS 1.2 Tickets)
+            // Install a dummy ticketer that refuses to issue tickets.
+            server_config.ticketer = Arc::new(NoTicketer);
+
+            Ok(RustlsServerTlsCredendials {
                 acceptor: TlsAcceptor::from(Arc::new(server_config)),
             })
         }
     }
 
+    // --- Helper Struct to Disable Tickets ---
+    #[derive(Debug)]
+    struct NoTicketer;
+
+    impl rustls::server::ProducesTickets for NoTicketer {
+        fn enabled(&self) -> bool {
+            false
+        }
+        fn lifetime(&self) -> u32 {
+            0
+        }
+        fn encrypt(&self, _plain: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+        fn decrypt(&self, _cipher: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
     #[async_trait]
-    impl ServerChannelCredentials for ServerTlsCredendials {
+    impl ServerChannelCredentials for RustlsServerTlsCredendials {
         type Output<Input> = TlsStream<Input>;
 
         async fn accept<Input: GrpcEndpoint + 'static>(
@@ -900,6 +970,11 @@ pub(crate) mod tls {
                 .accept(wrapper)
                 .await
                 .map_err(|e| e.to_string())?;
+
+            let (_, conn) = tls_stream.get_ref();
+            if conn.alpn_protocol() != Some(b"h2") {
+                return Err("Client ignored ALPN requirements".into());
+            }
 
             let auth_info = ServerConnectionSecurityInfo {
                 security_protocol: "tls",
@@ -1129,9 +1204,10 @@ mod test {
             call_credentials::{CallCredentials, CallDetails, ChannelSecurityInfo},
             gcp,
             tls::{
-                ClientTlsConfig, ClientTlsCredendials, Identity, Roots, ServerTlsConfig,
-                ServerTlsCredendials, StaticIdentityListProvider, StaticIdentityProvider,
-                StaticRootsProvider, TlsClientCertificateRequestType,
+                ClientTlsConfig, Identity, RootCertificates, RustlsClientTlsCredendials,
+                RustlsServerTlsCredendials, ServerTlsConfig, StaticIdentityListProvider,
+                StaticIdentityProvider, StaticRootCertificatesProvider,
+                TlsClientCertificateRequestType,
             },
             ClientChannelCredential, ClientHandshakeInfo, DynClientChannelCredential,
             DynServerChannelCredentials, ServerChannelCredentials,
@@ -1153,7 +1229,7 @@ mod test {
             .await
             .unwrap();
         let ge = stream;
-        let creds = ClientTlsCredendials::new(ClientTlsConfig::new()).unwrap();
+        let creds = RustlsClientTlsCredendials::new(ClientTlsConfig::new()).unwrap();
         let authority: Authority = "google.com".parse().unwrap();
         let authenticated = creds
             .connect(
@@ -1168,7 +1244,7 @@ mod test {
 
     #[tokio::test]
     async fn test_mtls_handshake() {
-        rustls::crypto::aws_lc_rs::default_provider()
+        rustls::crypto::default_fips_provider()
             .install_default()
             .ok();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1185,13 +1261,18 @@ mod test {
             let cert = fs::read(base.join("server1_cert.pem")).unwrap();
             let key = fs::read(base.join("server1_key.pem")).unwrap();
 
-            let config = ServerTlsConfig::new(
-                StaticIdentityListProvider::new(vec![Identity::from_pem(cert, key)]),
-                TlsClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
-                    roots_provider: StaticRootsProvider::new(Roots::from_pem(ca)),
-                },
-            );
-            let creds = ServerTlsCredendials::new(config).unwrap();
+            let config =
+                ServerTlsConfig::new(StaticIdentityListProvider::new(vec![Identity::from_pem(
+                    cert, key,
+                )]))
+                .with_request_type(
+                    TlsClientCertificateRequestType::RequestAndRequireClientCertificateAndVerify {
+                        roots_provider: StaticRootCertificatesProvider::new(
+                            RootCertificates::from_pem(ca),
+                        ),
+                    },
+                );
+            let creds = RustlsServerTlsCredendials::new(config).unwrap();
             let any_creds: Box<dyn DynServerChannelCredentials> = Box::new(creds);
             let stream = any_creds
                 .accept_dyn(Box::new(stream), rt::default_runtime())
@@ -1209,9 +1290,11 @@ mod test {
             let key = fs::read(base_copy.join("client1_key.pem")).unwrap();
 
             let config = ClientTlsConfig::new()
-                .with_roots_provider(StaticRootsProvider::new(Roots::from_pem(ca)))
+                .with_root_certificates_provider(StaticRootCertificatesProvider::new(
+                    RootCertificates::from_pem(ca),
+                ))
                 .with_identity_provider(StaticIdentityProvider::new(Identity::from_pem(cert, key)));
-            let creds = ClientTlsCredendials::new(config).unwrap();
+            let creds = RustlsClientTlsCredendials::new(config).unwrap();
             let any_creds: Box<dyn DynClientChannelCredential> = Box::new(creds);
             let stream = any_creds
                 .connect_dyn(

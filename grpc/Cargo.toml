@@ -77,4 +77,5 @@ tonic = { version = "0.14.0", path = "../tonic", default-features = false, featu
 tonic-prost = { version = "0.14.0", path = "../tonic-prost" }
 rustls = { version = "0.23", default-features = false, features = [
     "aws_lc_rs",
+    "fips",
 ] }
