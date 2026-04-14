@@ -23,6 +23,7 @@
  */
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +52,7 @@ use crate::client::name_resolution::global_registry;
 use crate::client::service_config::ServiceConfig;
 use crate::rt::BoxFuture;
 use crate::rt::GrpcRuntime;
+use crate::rt::Runtime;
 use crate::rt::TcpOptions;
 use crate::rt::tokio::TokioRuntime;
 use crate::rt::{self};
@@ -288,7 +290,7 @@ struct FakeRuntime {
     dns: FakeDns,
 }
 
-impl rt::Runtime for FakeRuntime {
+impl Runtime for FakeRuntime {
     fn spawn(
         &self,
         task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
@@ -317,6 +319,22 @@ impl rt::Runtime for FakeRuntime {
         _addr: std::net::SocketAddr,
         _opts: TcpOptions,
     ) -> BoxFuture<Result<Box<dyn rt::TcpListener>, String>> {
+        unimplemented!()
+    }
+
+    fn unix_stream(
+        &self,
+        _path: PathBuf,
+        _opts: rt::UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn rt::GrpcEndpoint>, String>> {
+        unimplemented!()
+    }
+
+    fn listen_unix(
+        &self,
+        _path: PathBuf,
+        _opts: rt::UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn rt::UnixListener>, String>> {
         unimplemented!()
     }
 }

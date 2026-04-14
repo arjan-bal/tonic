@@ -25,15 +25,20 @@
 use std::future::Future;
 use std::net::IpAddr;
 use std::net::SocketAddr;
+use std::os::unix::net::SocketAddr as UnixSocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Duration;
 
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
+use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
 
+use super::UnixSocketOptions;
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
+use crate::client::name_resolution::UNIX_NETWORK_TYPE;
 use crate::private;
 use crate::rt::BoxEndpoint;
 use crate::rt::BoxFuture;
@@ -126,13 +131,14 @@ impl Runtime for TokioRuntime {
                     .set_tcp_keepalive(&ka)
                     .map_err(|err| err.to_string())?;
             }
-            let stream: Box<dyn super::GrpcEndpoint> = Box::new(TokioTcpStream {
+            let stream: Box<dyn super::GrpcEndpoint> = Box::new(TokioIoStream {
                 peer_addr: target.to_string().into_boxed_str(),
                 local_addr: stream
                     .local_addr()
                     .map_err(|err| err.to_string())?
                     .to_string()
                     .into_boxed_str(),
+                network_type: TCP_IP_NETWORK_TYPE,
                 inner: stream,
             });
             Ok(stream)
@@ -156,6 +162,44 @@ impl Runtime for TokioRuntime {
             Ok(Box::new(listener) as Box<dyn super::TcpListener>)
         })
     }
+
+    fn unix_stream(
+        &self,
+        path: PathBuf,
+        _opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn GrpcEndpoint>, String>> {
+        Box::pin(async move {
+            let stream = UnixStream::connect(&path)
+                .await
+                .map_err(|err| err.to_string())?;
+            let peer_addr = stream.peer_addr().map_err(|err| err.to_string())?;
+            let local_addr = stream.local_addr().map_err(|err| err.to_string())?;
+
+            let stream: Box<dyn super::GrpcEndpoint> = Box::new(TokioIoStream {
+                peer_addr: format!("{peer_addr:?}").into_boxed_str(),
+                local_addr: format!("{local_addr:?}").into_boxed_str(),
+                network_type: UNIX_NETWORK_TYPE,
+                inner: stream,
+            });
+            Ok(stream)
+        })
+    }
+
+    fn listen_unix(
+        &self,
+        path: PathBuf,
+        _opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn super::UnixListener>, String>> {
+        Box::pin(async move {
+            let listener = tokio::net::UnixListener::bind(path).map_err(|err| err.to_string())?;
+            let local_addr = listener.local_addr().map_err(|e| e.to_string())?;
+            let listener = TokioUnixListener {
+                inner: listener,
+                local_addr: local_addr.into(),
+            };
+            Ok(Box::new(listener) as Box<dyn super::UnixListener>)
+        })
+    }
 }
 
 impl TokioDefaultDnsResolver {
@@ -167,13 +211,14 @@ impl TokioDefaultDnsResolver {
     }
 }
 
-struct TokioTcpStream {
-    inner: TcpStream,
+struct TokioIoStream<T> {
+    inner: T,
     peer_addr: Box<str>,
     local_addr: Box<str>,
+    network_type: &'static str,
 }
 
-impl super::GrpcEndpoint for TokioTcpStream {
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> super::GrpcEndpoint for TokioIoStream<T> {
     fn get_local_address(&self) -> &str {
         &self.local_addr
     }
@@ -183,7 +228,7 @@ impl super::GrpcEndpoint for TokioTcpStream {
     }
 
     fn get_network_type(&self) -> &'static str {
-        TCP_IP_NETWORK_TYPE
+        self.network_type
     }
 
     fn poll_read_private(
@@ -244,13 +289,14 @@ impl super::TcpListener for TokioListener {
         Box::pin(async move {
             let (stream, addr) = self.inner.accept().await.map_err(|e| e.to_string())?;
             Ok((
-                Box::new(TokioTcpStream {
+                Box::new(TokioIoStream {
                     local_addr: stream
                         .local_addr()
                         .map_err(|err| err.to_string())?
                         .to_string()
                         .into_boxed_str(),
                     peer_addr: addr.to_string().into_boxed_str(),
+                    network_type: TCP_IP_NETWORK_TYPE,
                     inner: stream,
                 }) as Box<dyn GrpcEndpoint>,
                 addr,
@@ -259,6 +305,36 @@ impl super::TcpListener for TokioListener {
     }
 
     fn local_addr(&self) -> &SocketAddr {
+        &self.local_addr
+    }
+}
+
+struct TokioUnixListener {
+    inner: tokio::net::UnixListener,
+    local_addr: UnixSocketAddr,
+}
+
+impl super::UnixListener for TokioUnixListener {
+    fn accept(&mut self) -> ScopedBoxFuture<'_, Result<(BoxEndpoint, UnixSocketAddr), String>> {
+        Box::pin(async move {
+            let (stream, addr) = self.inner.accept().await.map_err(|e| e.to_string())?;
+            Ok((
+                Box::new(TokioIoStream {
+                    local_addr: format!(
+                        "{:?}",
+                        stream.local_addr().map_err(|err| err.to_string())?
+                    )
+                    .into_boxed_str(),
+                    peer_addr: format!("{addr:?}").into_boxed_str(),
+                    network_type: UNIX_NETWORK_TYPE,
+                    inner: stream,
+                }) as Box<dyn GrpcEndpoint>,
+                addr.into(),
+            ))
+        })
+    }
+
+    fn local_addr(&self) -> &UnixSocketAddr {
         &self.local_addr
     }
 }

@@ -27,6 +27,8 @@ use std::future::Future;
 use std::io;
 use std::io::IoSlice;
 use std::net::SocketAddr;
+use std::os::unix::net::SocketAddr as UnixSocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
@@ -81,6 +83,21 @@ pub trait Runtime: Send + Sync + Debug {
         addr: SocketAddr,
         opts: TcpOptions,
     ) -> BoxFuture<Result<Box<dyn TcpListener>, String>>;
+
+    /// Establishes a Unix connection to the given `path` with the
+    /// specified `opts`.
+    fn unix_stream(
+        &self,
+        path: PathBuf,
+        opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn GrpcEndpoint>, String>>;
+
+    /// Create a new listener for the given path.
+    fn listen_unix(
+        &self,
+        path: PathBuf,
+        opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn UnixListener>, String>>;
 }
 
 /// A future that resolves after a specified duration.
@@ -112,6 +129,11 @@ pub struct ResolverOptions {
 pub struct TcpOptions {
     pub(crate) enable_nodelay: bool,
     pub(crate) keepalive: Option<Duration>,
+}
+
+#[derive(Default)]
+pub struct UnixSocketOptions {
+    _priv: (),
 }
 
 /// GrpcEndpoint is a generic stream-oriented network connection.
@@ -301,6 +323,20 @@ pub trait TcpListener: Send + Sync {
     fn local_addr(&self) -> &SocketAddr;
 }
 
+/// A trait representing a Unix socket listener capable of accepting incoming
+/// connections.
+pub trait UnixListener: Send + Sync {
+    /// Accepts a new incoming connection.
+    ///
+    /// Returns a future that resolves to a result containing the new
+    /// `GrpcEndpoint` and the remote peer's `SocketAddr`, or an error string
+    /// if acceptance fails.
+    fn accept(&mut self) -> ScopedBoxFuture<'_, Result<(BoxEndpoint, UnixSocketAddr), String>>;
+
+    /// Returns the local socket address this listener is bound to.
+    fn local_addr(&self) -> &UnixSocketAddr;
+}
+
 /// A fake runtime to satisfy the compiler when no runtime is enabled. This will
 ///
 /// # Panics
@@ -324,17 +360,33 @@ impl Runtime for NoOpRuntime {
 
     fn tcp_stream(
         &self,
-        target: SocketAddr,
-        opts: TcpOptions,
+        _target: SocketAddr,
+        _opts: TcpOptions,
     ) -> Pin<Box<dyn Future<Output = Result<Box<dyn GrpcEndpoint>, String>> + Send>> {
         unimplemented!()
     }
 
     fn listen_tcp(
         &self,
-        addr: SocketAddr,
+        _addr: SocketAddr,
         _opts: TcpOptions,
     ) -> BoxFuture<Result<Box<dyn TcpListener>, String>> {
+        unimplemented!()
+    }
+
+    fn unix_stream(
+        &self,
+        _path: PathBuf,
+        _opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn GrpcEndpoint>, String>> {
+        unimplemented!()
+    }
+
+    fn listen_unix(
+        &self,
+        _path: PathBuf,
+        _opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn UnixListener>, String>> {
         unimplemented!()
     }
 }
@@ -389,5 +441,21 @@ impl GrpcRuntime {
         opts: TcpOptions,
     ) -> BoxFuture<Result<Box<dyn TcpListener>, String>> {
         self.inner.listen_tcp(addr, opts)
+    }
+
+    pub fn unix_stream(
+        &self,
+        path: PathBuf,
+        opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn GrpcEndpoint>, String>> {
+        self.inner.unix_stream(path, opts)
+    }
+
+    pub fn listen_unix(
+        &self,
+        path: PathBuf,
+        opts: UnixSocketOptions,
+    ) -> BoxFuture<Result<Box<dyn UnixListener>, String>> {
+        self.inner.listen_unix(path, opts)
     }
 }
