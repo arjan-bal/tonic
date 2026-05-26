@@ -207,6 +207,10 @@ impl<T: GrpcEndpoint> AsyncIoAdapter<T> {
     pub(crate) fn get_ref(&self) -> &T {
         &self.inner
     }
+
+    pub(crate) fn into_inner(self) -> T {
+        self.inner
+    }
 }
 
 impl<T: GrpcEndpoint> AsyncRead for AsyncIoAdapter<T> {

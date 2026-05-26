@@ -81,6 +81,7 @@ use crate::client::name_resolution::UNIX_NETWORK_TYPE;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::Transport;
 use crate::client::transport::TransportOptions;
+use crate::client::transport::http_connect::do_connect_handshake;
 use crate::client::transport::registry::GLOBAL_TRANSPORT_REGISTRY;
 use crate::core::RecvMessage;
 use crate::core::RequestHeaders;
@@ -363,7 +364,7 @@ impl Transport for TransportBuilder {
 
     async fn connect(
         &self,
-        address: String,
+        address: &str,
         runtime: GrpcRuntime,
         security_info: &SecurityOpts,
         opts: &TransportOptions,
@@ -406,7 +407,7 @@ impl Transport for TransportBuilder {
         let transport_fut = match self.network_type {
             NetworkType::Tcp => {
                 let addr: SocketAddr =
-                    SocketAddr::from_str(&address).map_err(|err| err.to_string())?;
+                    SocketAddr::from_str(address).map_err(|err| err.to_string())?;
                 runtime.tcp_stream(
                     addr,
                     TcpOptions {
@@ -415,30 +416,45 @@ impl Transport for TransportBuilder {
                     },
                 )
             }
-            NetworkType::Unix => {
-                runtime.unix_stream(PathBuf::from(&address), UnixSocketOptions::default())
-            }
+            NetworkType::Unix => runtime.unix_stream(
+                PathBuf::from(address),
+                UnixSocketOptions::default(),
+            ),
         };
-        let transport = if let Some(deadline) = opts.connect_deadline {
+
+        let runtime_ref = &runtime;
+        let connect_fut = async move {
+            // Establish the connection.
+            let transport = transport_fut.await?;
+            // Establish the HTTP connect tunnel.
+            let transport = if let Some(proxy_opts) = &opts.http_connect_proxy_options {
+                do_connect_handshake(transport, proxy_opts).await?
+            } else {
+                transport
+            };
+            // Perform the security handshake.
+            security_info
+                .credentials
+                .dyn_connect(
+                    &security_info.authority,
+                    transport,
+                    &security_info.handshake_info,
+                    runtime_ref,
+                )
+                .await
+        };
+
+        let handshake_ouput = if let Some(deadline) = opts.connect_deadline {
             let timeout = deadline.saturating_duration_since(Instant::now());
             tokio::select! {
                 _ = runtime.sleep(timeout) => {
-                    return Err("timed out waiting for transport stream to connect".to_string());
+                    return Err("timed out waiting for connection and handshake".to_string());
                 }
-                transport = transport_fut => transport?,
+                res = connect_fut => res?,
             }
         } else {
-            transport_fut.await?
+            connect_fut.await?
         };
-        let credentials = &security_info.credentials;
-        let handshake_ouput = credentials
-            .dyn_connect(
-                &security_info.authority,
-                transport,
-                &security_info.handshake_info,
-                &runtime,
-            )
-            .await?;
 
         let transport = HyperStream::new(handshake_ouput.endpoint);
 

@@ -68,6 +68,7 @@ use crate::client::name_resolution::ResolverUpdate;
 use crate::client::name_resolution::Target;
 use crate::client::name_resolution::dns;
 use crate::client::name_resolution::global_registry;
+use crate::client::name_resolution::proxy_resolver;
 use crate::client::name_resolution::{self};
 use crate::client::service_config::LbPolicyType;
 use crate::client::service_config::ServiceConfig;
@@ -251,6 +252,7 @@ impl PersistentChannel {
         // TODO(arjan-bal): Return errors here instead of panicking.
         let target = Url::from_str(&target.into()).unwrap();
         let resolver_builder = global_registry().get(target.scheme()).unwrap();
+        let resolver_builder = Arc::new(proxy_resolver::Builder::new(resolver_builder));
         let target = name_resolution::Target::from(target);
         let authority = options
             .channel_authority

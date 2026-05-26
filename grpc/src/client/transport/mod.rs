@@ -28,12 +28,14 @@ use std::time::Instant;
 
 use crate::client::DynInvoke;
 use crate::client::Invoke;
+use crate::client::name_resolution::proxy_resolver::ProxyOptions;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::client::DynClientConnectionSecurityInfo;
 use crate::credentials::common::Authority;
 use crate::credentials::dyn_wrapper::DynChannelCredentials;
 use crate::rt::GrpcRuntime;
 
+mod http_connect;
 mod registry;
 
 // Using tower/buffer enables tokio's rt feature even though it's possible to
@@ -63,6 +65,7 @@ pub(crate) struct TransportOptions {
     pub(crate) tcp_keepalive: Option<Duration>,
     pub(crate) tcp_nodelay: bool,
     pub(crate) connect_deadline: Option<Instant>,
+    pub(crate) http_connect_proxy_options: Option<ProxyOptions>,
 }
 
 #[trait_variant::make(Send)]
@@ -71,7 +74,7 @@ pub(crate) trait Transport: Sync {
 
     async fn connect(
         &self,
-        address: String,
+        address: &str,
         runtime: GrpcRuntime,
         security_opts: &SecurityOpts,
         opts: &TransportOptions,
@@ -89,7 +92,7 @@ pub(crate) trait Transport: Sync {
 pub(crate) trait DynTransport: Send + Sync {
     async fn dyn_connect(
         &self,
-        address: String,
+        address: &str,
         runtime: GrpcRuntime,
         security_opts: &SecurityOpts,
         opts: &TransportOptions,
@@ -107,7 +110,7 @@ pub(crate) trait DynTransport: Send + Sync {
 impl<T: Transport> DynTransport for T {
     async fn dyn_connect(
         &self,
-        address: String,
+        address: &str,
         runtime: GrpcRuntime,
         security_opts: &SecurityOpts,
         opts: &TransportOptions,

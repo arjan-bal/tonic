@@ -39,6 +39,7 @@ use tonic::async_trait;
 
 use crate::StatusCodeError;
 use crate::StatusError;
+use crate::byte_str::ByteStr;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
 use crate::client::DynInvoke;
@@ -50,6 +51,7 @@ use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::load_balancing::subchannel::private::Sealed;
 use crate::client::name_resolution::Address;
+use crate::client::name_resolution::proxy_resolver::proxy_options_for_addr;
 use crate::client::stream_util::FailingRecvStream;
 use crate::client::transport::DynTransport;
 use crate::client::transport::SecurityOpts;
@@ -243,7 +245,7 @@ pub(crate) struct InternalSubchannel {
 }
 
 struct InternalSubchannelData {
-    address: String,
+    address: ByteStr,
     state: InternalSubchannelState,
     work_queue: WorkQueueTx,
     on_drop: Arc<Notify>,
@@ -306,12 +308,15 @@ impl InternalSubchannel {
         work_queue: WorkQueueTx,
     ) -> Arc<dyn Subchannel> {
         let on_drop = Arc::new(Notify::new());
-        let address_string = address.address.to_string();
+        let mut transport_options = TransportOptions::default();
+        if let Some(proxy_opts) = proxy_options_for_addr(&address) {
+            transport_options.http_connect_proxy_options = Some(proxy_opts.clone());
+        }
         let this = Arc::new_cyclic(|weak_self| Self {
-            address,
+            address: address.clone(),
             on_drop: on_drop.clone(),
             data: Arc::new(Mutex::new(InternalSubchannelData {
-                address: address_string,
+                address: address.address.clone(),
                 transport_builder: transport,
                 backoff,
                 weak_self: weak_self.clone(),
@@ -319,7 +324,7 @@ impl InternalSubchannel {
                 state: InternalSubchannelState::Idle,
                 work_queue,
                 on_drop,
-                transport_options: TransportOptions::default(), // TODO: should be configurable
+                transport_options, // TODO: should be configurable
                 security_opts,
             })),
         });
@@ -363,7 +368,7 @@ fn begin_connecting_if_idle(data: Arc<Mutex<InternalSubchannelData>>) {
             }
             _ = on_drop.notified() => {
             }
-            result = transport_builder.dyn_connect(address, runtime, &security_opts, &transport_opts) => {
+            result = transport_builder.dyn_connect(&address, runtime, &security_opts, &transport_opts) => {
                     match result {
                         Ok((service, security_info, disconnection_listener)) => {
                             move_to_ready(data, Arc::new(ReadyState{

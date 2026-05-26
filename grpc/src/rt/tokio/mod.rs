@@ -193,6 +193,22 @@ impl TokioIoStream<TcpStream> {
     }
 }
 
+impl<T> TokioIoStream<T> {
+    pub(crate) fn new(
+        inner: T,
+        local_addr: Box<str>,
+        peer_addr: Box<str>,
+        network_type: &'static str,
+    ) -> Self {
+        Self {
+            inner,
+            peer_addr,
+            local_addr,
+            network_type,
+        }
+    }
+}
+
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> super::GrpcEndpoint for TokioIoStream<T> {
     fn get_local_address(&self) -> &str {
         &self.local_addr

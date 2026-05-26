@@ -343,7 +343,7 @@ impl Transport for InMemoryTransport {
 
     async fn connect(
         &self,
-        target: String,
+        target: &str,
         _runtime: GrpcRuntime,
         _security_opts: &SecurityOpts,
         _options: &TransportOptions,
@@ -357,7 +357,7 @@ impl Transport for InMemoryTransport {
     > {
         let listeners = LISTENERS.lock().unwrap();
         let s = listeners
-            .get(&target)
+            .get(target)
             .ok_or_else(|| format!("no listener for target: {}", target))?;
 
         let (closed_tx, closed_rx) = oneshot::channel();
