@@ -47,6 +47,12 @@ impl<T> Rewind<T> {
             inner: io,
         }
     }
+    pub(crate) fn new_unbuffered(io: T) -> Self {
+        Rewind {
+            pre: None,
+            inner: io,
+        }
+    }
 }
 
 impl<T> AsyncRead for Rewind<T>

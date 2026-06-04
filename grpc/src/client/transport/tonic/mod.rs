@@ -81,7 +81,6 @@ use crate::client::name_resolution::UNIX_NETWORK_TYPE;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::Transport;
 use crate::client::transport::TransportOptions;
-use crate::client::transport::http_connect::do_connect_handshake;
 use crate::client::transport::registry::GLOBAL_TRANSPORT_REGISTRY;
 use crate::core::RecvMessage;
 use crate::core::RequestHeaders;
@@ -416,22 +415,15 @@ impl Transport for TransportBuilder {
                     },
                 )
             }
-            NetworkType::Unix => runtime.unix_stream(
-                PathBuf::from(address),
-                UnixSocketOptions::default(),
-            ),
+            NetworkType::Unix => {
+                runtime.unix_stream(PathBuf::from(address), UnixSocketOptions::default())
+            }
         };
 
         let runtime_ref = &runtime;
         let connect_fut = async move {
             // Establish the connection.
             let transport = transport_fut.await?;
-            // Establish the HTTP connect tunnel.
-            let transport = if let Some(proxy_opts) = &opts.http_connect_proxy_options {
-                do_connect_handshake(transport, proxy_opts).await?
-            } else {
-                transport
-            };
             // Perform the security handshake.
             security_info
                 .credentials

@@ -26,6 +26,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
+use http::HeaderValue;
 use hyper_util::client::proxy::matcher::Matcher;
 
 use super::ResolverOptions;
@@ -40,8 +41,29 @@ use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
 use crate::client::name_resolution::global_registry;
 use crate::client::service_config::ServiceConfig;
 
-static MATCHER: LazyLock<Matcher> = LazyLock::new(Matcher::from_env);
+static MATCHER: LazyLock<Matcher> = LazyLock::new(build_matcher);
 
+fn build_matcher() -> Matcher {
+    let builder = Matcher::builder();
+    // Avoid using a proxy in a Common Gateway Interface (CGI) environment.
+    if std::env::var_os("REQUEST_METHOD").is_some() {
+        return builder.build();
+    }
+    // Only read NO_PROXY and HTTPS_PROXY. This avoids reading ALL_PROXY,
+    // which is not read by gRPC Go and C++.
+    builder
+        .no(get_first_env(&["NO_PROXY", "no_proxy"]))
+        .https(get_first_env(&["HTTPS_PROXY", "https_proxy"]))
+        .build()
+}
+
+/// A resolver builder that wraps another `ResolverBuilder` and applies proxy
+/// configuration.
+///
+/// This builder checks if the target URI should be proxied based on environment
+/// variables (like `HTTPS_PROXY`, `NO_PROXY`). If a proxy is needed, it creates
+/// a resolver that resolves the proxy address and injects proxy options into
+/// the resolved addresses.
 pub(crate) struct Builder {
     child_builder: Arc<dyn ResolverBuilder>,
 }
@@ -68,6 +90,7 @@ impl ResolverBuilder for Builder {
 }
 
 impl Builder {
+    /// Creates a new `Builder` that wraps the given `child_builder`.
     pub(crate) fn new(child_builder: Arc<dyn ResolverBuilder>) -> Self {
         Self { child_builder }
     }
@@ -94,12 +117,12 @@ impl Builder {
             return Ok(self.child_builder.build(target, options));
         };
 
-        let credentials = intercept.basic_auth().map(|hv| Credentials {
-            header_value: hv.clone(),
-        });
+        let credentials = intercept.basic_auth().cloned();
 
         let proxy_options = ProxyOptions {
-            credentials,
+            proxy_authorization_header: credentials,
+            // TODO: target host must always contain the port.
+            // TODO: Add user agent header.
             connect_addr: target_host.to_owned(),
         };
 
@@ -140,29 +163,22 @@ struct HttpsProxyResolver {
     proxy_options: Arc<ProxyOptions>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Credentials {
-    header_value: http::HeaderValue,
-}
-
-impl Credentials {
-    pub(crate) fn header_value(&self) -> &http::HeaderValue {
-        &self.header_value
-    }
-}
-
+/// Options for establishing an HTTP CONNECT proxy tunnel.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 pub(crate) struct ProxyOptions {
-    credentials: Option<Credentials>,
+    proxy_authorization_header: Option<HeaderValue>,
     connect_addr: String,
 }
 
 impl ProxyOptions {
-    pub(crate) fn credentials(&self) -> Option<&Credentials> {
-        self.credentials.as_ref()
+    /// Returns the value of the `Proxy-Authorization` header, if present.
+    pub(crate) fn proxy_authorization_header(&self) -> Option<&http::HeaderValue> {
+        self.proxy_authorization_header.as_ref()
     }
 
-    pub(crate) fn connect_addr(&self) -> &str {
+    /// Returns the address of the proxy server to connect to (host:port).
+    /// This is Punycode-encoded, i.e., it's a valid URL host:port.
+    pub(crate) fn target_authority(&self) -> &str {
         &self.connect_addr
     }
 }
@@ -205,8 +221,19 @@ impl<'a> ChannelController for InterceptingController<'a> {
     }
 }
 
+/// Extracts `ProxyOptions` from the given `Address` attributes, if present.
 pub(crate) fn proxy_options_for_addr(addr: &Address) -> Option<&ProxyOptions> {
     addr.attributes
         .get::<Arc<ProxyOptions>>()
         .map(AsRef::as_ref)
+}
+
+fn get_first_env(names: &[&str]) -> String {
+    for name in names {
+        if let Ok(val) = std::env::var(name) {
+            return val;
+        }
+    }
+
+    String::new()
 }

@@ -56,6 +56,7 @@ use crate::client::stream_util::FailingRecvStream;
 use crate::client::transport::DynTransport;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportOptions;
+use crate::client::transport::http_connect::HttpConnectHandshaker;
 use crate::core::RequestHeaders;
 use crate::credentials::call::CallDetails;
 use crate::credentials::call::ClientConnectionSecurityInfo as CallClientConnectionSecurityInfo;
@@ -304,13 +305,16 @@ impl InternalSubchannel {
         transport: Arc<dyn DynTransport>,
         backoff: Arc<dyn Backoff>,
         runtime: GrpcRuntime,
-        security_opts: SecurityOpts,
+        mut security_opts: SecurityOpts,
         work_queue: WorkQueueTx,
     ) -> Arc<dyn Subchannel> {
         let on_drop = Arc::new(Notify::new());
-        let mut transport_options = TransportOptions::default();
+        let transport_options = TransportOptions::default();
         if let Some(proxy_opts) = proxy_options_for_addr(&address) {
-            transport_options.http_connect_proxy_options = Some(proxy_opts.clone());
+            security_opts.credentials = Arc::new(HttpConnectHandshaker::new(
+                security_opts.credentials,
+                proxy_opts,
+            ));
         }
         let this = Arc::new_cyclic(|weak_self| Self {
             address: address.clone(),

@@ -22,35 +22,50 @@
  *
  */
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
 use crate::client::name_resolution::proxy_resolver::ProxyOptions;
 use crate::client::transport::http_connect::rewind::Rewind;
+use crate::credentials::ChannelCredentials;
+use crate::credentials::ProtocolInfo;
+use crate::credentials::call::CallCredentials;
+use crate::credentials::client::ClientHandshakeInfo;
+use crate::credentials::client::HandshakeOutput;
+use crate::credentials::common::Authority;
+use crate::private;
 use crate::rt::AsyncIoAdapter;
-use crate::rt::BoxEndpoint;
+use crate::rt::GrpcEndpoint;
+use crate::rt::GrpcRuntime;
 use crate::rt::tokio::TokioIoStream;
 
 mod rewind;
 
-pub(crate) async fn do_connect_handshake(
-    input: BoxEndpoint,
+/// Performs the HTTP CONNECT handshake on the given endpoint.
+///
+/// This function sends an HTTP CONNECT request to the proxy specified in `opts`,
+/// reads the response, and returns a new endpoint that yields any buffered data
+/// read during the handshake before delegating to the original endpoint.
+async fn do_connect_handshake<I: GrpcEndpoint>(
+    input: I,
     opts: &ProxyOptions,
-) -> Result<BoxEndpoint, String> {
+) -> Result<ProxyStream<I>, String> {
     let mut io = AsyncIoAdapter::new(input);
 
     // 2. Write http connect request with dest as opts.connect_addr and
     // optionally, the opts.credentials header value.
     let mut req = format!(
         "CONNECT {} HTTP/1.1\r\nHost: {}\r\n",
-        opts.connect_addr(),
-        opts.connect_addr()
+        opts.target_authority(),
+        opts.target_authority()
     )
     .into_bytes();
-    if let Some(creds) = opts.credentials() {
+    if let Some(creds) = opts.proxy_authorization_header() {
         req.extend_from_slice(b"Proxy-Authorization: ");
-        req.extend_from_slice(creds.header_value().as_bytes());
+        req.extend_from_slice(creds.as_bytes());
         req.extend_from_slice(b"\r\n");
     }
     // headers end
@@ -102,18 +117,17 @@ pub(crate) async fn do_connect_handshake(
                 // Add a new pub(crate) constructor that accepts peer address and local addresses.
                 // In most cases, the buffer should be empty as the server waits
                 // for the client to send the first message, e.g. in TLS.
-                let endpoint: BoxEndpoint = if let Some(data) = buffered_data {
-                    let rewind = Rewind::new_buffered(io, data);
-                    Box::new(TokioIoStream::new(
-                        rewind,
-                        local_addr,
-                        peer_addr,
-                        network_type,
-                    ))
+                let endpoint = if let Some(data) = buffered_data {
+                    Rewind::new_buffered(io, data)
                 } else {
-                    io.into_inner()
+                    Rewind::new_unbuffered(io)
                 };
-                return Ok(endpoint);
+                return Ok(TokioIoStream::new(
+                    endpoint,
+                    local_addr,
+                    peer_addr,
+                    network_type,
+                ));
             }
             Ok(httparse::Status::Partial) => {
                 if read >= READ_BUF_SIZE {
@@ -124,5 +138,64 @@ pub(crate) async fn do_connect_handshake(
                 return Err(format!("Failed to parse HTTP response: {}", e));
             }
         }
+    }
+}
+
+/// A credential wrapper that performs an HTTP CONNECT handshake before
+/// delegating to an inner security credential (like TLS).
+pub(crate) struct HttpConnectHandshaker<C> {
+    inner: C,
+    options: ProxyOptions,
+}
+
+impl<C: ChannelCredentials> HttpConnectHandshaker<C> {
+    /// Constructs a new `ProxyChannelCredentials` wrapping the inner credentials.
+    pub(crate) fn new(inner: C, options: &ProxyOptions) -> Self {
+        Self {
+            inner,
+            options: options.clone(),
+        }
+    }
+}
+
+/// The I/O stream wrapper returned after the HTTP CONNECT handshake succeeds.
+type ProxyStream<I> = TokioIoStream<Rewind<AsyncIoAdapter<I>>>;
+
+impl<C: ChannelCredentials> ChannelCredentials for HttpConnectHandshaker<C> {
+    // The security context is entirely dictated by the inner credential (e.g., TLS).
+    type ContextType = C::ContextType;
+
+    // The inner credential will consume our `ProxyStream`, so its output type
+    // reflects that nesting.
+    type Output<I> = C::Output<ProxyStream<I>>;
+
+    fn info(&self) -> &ProtocolInfo {
+        // Pass-through to the inner credentials
+        self.inner.info()
+    }
+
+    fn get_call_credentials(&self, token: private::Internal) -> Option<&Arc<dyn CallCredentials>> {
+        // Pass-through to the inner credentials
+        self.inner.get_call_credentials(token)
+    }
+
+    async fn connect<Input: GrpcEndpoint>(
+        &self,
+        authority: &Authority,
+        source: Input,
+        info: &ClientHandshakeInfo,
+        runtime: &GrpcRuntime,
+        token: private::Internal,
+    ) -> Result<HandshakeOutput<Self::Output<Input>, Self::ContextType>, String> {
+        // 1. Perform the HTTP CONNECT handshake here.
+
+        // For the skeleton, we just wrap the source directly.
+        let proxied_stream = do_connect_handshake(source, &self.options).await?;
+
+        // 2. Delegate the actual security handshake (e.g., TLS) to the
+        // wrapped credentials.
+        self.inner
+            .connect(authority, proxied_stream, info, runtime, token)
+            .await
     }
 }
