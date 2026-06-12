@@ -43,7 +43,7 @@ jobs:
         id: protoc-binaries-cache
         with:
           path: protoc-cache
-          key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
+          key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs', '.github/workflows/CI.yml') }}
       - uses: hecrj/setup-rust-action@v2
         if: steps.protoc-binaries-cache.outputs.cache-hit != 'true'
       - uses: Swatinem/rust-cache@v2
@@ -91,7 +91,7 @@ jobs:
     - uses: actions/cache@v4
       with:
         path: protoc-cache
-        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
+        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs', '.github/workflows/CI.yml') }}
     - name: Add cached binaries to PATH
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
@@ -107,7 +107,7 @@ jobs:
     - uses: actions/cache@v4
       with:
         path: protoc-cache
-        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
+        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs', '.github/workflows/CI.yml') }}
     - name: Add cached binaries to PATH
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
@@ -128,7 +128,7 @@ jobs:
     - uses: actions/cache@v4
       with:
         path: protoc-cache
-        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
+        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs', '.github/workflows/CI.yml') }}
     - name: Add cached binaries to PATH
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
@@ -157,7 +157,7 @@ jobs:
     - uses: actions/cache@v4
       with:
         path: protoc-cache
-        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
+        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs', '.github/workflows/CI.yml') }}
     - name: Add cached binaries to PATH
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
@@ -182,13 +182,13 @@ jobs:
       id: msrv
       run: echo "version=$(yq '.workspace.package.rust-version' Cargo.toml)" >> "$GITHUB_OUTPUT"
     - uses: hecrj/setup-rust-action@v2
-      with:
+      with: 
         rust-version: ${{ steps.msrv.outputs.version }}
     - uses: taiki-e/install-action@cargo-no-dev-deps
     - uses: actions/cache@v4
       with:
         path: protoc-cache
-        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
+        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs', '.github/workflows/CI.yml') }}
     - name: Add cached binaries to PATH
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
@@ -205,7 +205,7 @@ jobs:
     - uses: actions/cache@v4
       with:
         path: protoc-cache
-        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
+        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs', '.github/workflows/CI.yml') }}
     - name: Add cached binaries to PATH
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
@@ -228,7 +228,7 @@ jobs:
     - uses: actions/cache@v4
       with:
         path: protoc-cache
-        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
+        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs', '.github/workflows/CI.yml') }}
     - name: Add cached binaries to PATH
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
@@ -246,7 +246,7 @@ jobs:
     - uses: actions/cache@v4
       with:
         path: protoc-cache
-        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
+        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs', '.github/workflows/CI.yml') }}
     - name: Add cached binaries to PATH
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
@@ -266,7 +266,7 @@ jobs:
     - uses: actions/cache@v4
       with:
         path: protoc-cache
-        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
+        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs', '.github/workflows/CI.yml') }}
     - name: Add cached binaries to PATH
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
@@ -302,7 +302,7 @@ jobs:
     - uses: actions/cache@v4
       with:
         path: protoc-cache
-        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs') }}
+        key: protoc-binaries-${{ runner.os }}-${{ hashFiles('protoc-gen-rust-grpc/src/cpp_source/**', 'protoc-gen-rust-grpc/build.rs', '.github/workflows/CI.yml') }}
     - name: Add cached binaries to PATH
       shell: bash
       run: echo "${{ github.workspace }}/protoc-cache/bin" >> $GITHUB_PATH
