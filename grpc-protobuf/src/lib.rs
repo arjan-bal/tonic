@@ -58,14 +58,10 @@ use protobuf::MutProxied;
 use protobuf::Proxied;
 use protobuf::Serialize;
 
-mod client;
+pub mod client;
+pub mod server;
 mod status;
 mod trailers_conv;
-pub use client::bidi::*;
-pub use client::client_streaming::*;
-pub use client::server_streaming::*;
-pub use client::unary::*;
-pub use client::*;
 pub use status::*;
 
 /// Implements [`SendMessage`] for protobuf message views.

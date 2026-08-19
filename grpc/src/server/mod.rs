@@ -56,7 +56,9 @@ use crate::core::SendMessage;
 use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
 
+pub mod descriptor;
 pub(crate) mod interceptor;
+pub mod service;
 
 /// Settings to configure RPCs sent using the [`Handle`] trait.
 ///
