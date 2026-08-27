@@ -22,7 +22,7 @@
  *
  */
 
-use crate::client::CallOptions;
+use crate::server::CallOptions;
 use crate::server::Handle;
 use crate::server::RecvStream;
 use crate::server::RequestHeaders;
@@ -96,8 +96,8 @@ mod test {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::client::CallOptions;
     use crate::core::RecvMessage;
+    use crate::core::test_connection_info;
     use crate::server::RequestHeaders;
     use crate::server::ResponseStreamItem;
     use crate::server::SendOptions;
@@ -177,7 +177,7 @@ mod test {
 
         chain
             .handle(
-                RequestHeaders::default(),
+                RequestHeaders::new("", test_connection_info()),
                 CallOptions::default(),
                 &mut tx,
                 rx,
@@ -251,7 +251,7 @@ mod test {
 
         chain
             .handle(
-                RequestHeaders::default(),
+                RequestHeaders::new("", test_connection_info()),
                 CallOptions::default(),
                 &mut tx,
                 rx,

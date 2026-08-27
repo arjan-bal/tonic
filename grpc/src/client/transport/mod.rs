@@ -30,8 +30,8 @@ use http::HeaderValue;
 use crate::client::DynInvoke;
 use crate::client::Invoke;
 use crate::core::Address;
+use crate::core::ConnectionInfo;
 use crate::credentials::ChannelCredentials;
-use crate::credentials::client::ChannelSecurityInfo;
 use crate::credentials::client::ClientHandshakeInfo;
 use crate::credentials::common::Authority;
 use crate::rt::GrpcRuntime;
@@ -98,7 +98,7 @@ pub(crate) trait Transport: Sync {
     ) -> Result<
         (
             Self::Service,
-            ChannelSecurityInfo,
+            ConnectionInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -116,7 +116,7 @@ pub(crate) trait DynTransport: Send + Sync {
     ) -> Result<
         (
             Box<dyn DynInvoke>,
-            ChannelSecurityInfo,
+            ConnectionInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -134,7 +134,7 @@ impl<T: Transport> DynTransport for T {
     ) -> Result<
         (
             Box<dyn DynInvoke>,
-            ChannelSecurityInfo,
+            ConnectionInfo,
             oneshot::Receiver<Result<(), String>>,
         ),
         String,
@@ -156,7 +156,7 @@ pub(crate) struct SecurityOpts {
 /// This may be added as an [`Address`] attribute by a
 /// [`crate::client::name_resolution::Resolver`]. If present, the subchannel
 /// will automatically handle the HTTP `CONNECT` handshake.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) struct ProxyOptions {
     proxy_authorization_header: Option<HeaderValue>,
     target_authority: String,
