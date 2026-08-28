@@ -41,6 +41,7 @@ use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
 
 pub(crate) mod hierarchy;
+pub(crate) mod priority;
 pub(crate) mod subchannel_sharing;
 
 pub mod child_manager;
