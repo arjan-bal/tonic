@@ -63,7 +63,6 @@ mod rt;
 mod send_future;
 mod server;
 mod status;
-mod timeout_cache;
 
 pub use status::Result;
 pub use status::StatusCodeError;

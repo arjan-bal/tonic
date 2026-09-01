@@ -24,18 +24,11 @@
 
 use std::collections::HashMap;
 
-use super::GLOBAL_LB_REGISTRY;
-use crate::client::load_balancing::LbPolicy;
-use crate::client::load_balancing::LbPolicyBuilder;
-use crate::client::load_balancing::LbPolicyOptions;
-use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::service_config::serde_bindings::LbConfigSerde;
-
-pub static POLICY_NAME: &str = "priority_experimental";
 
 #[derive(Debug, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct PriorityConfig {
+pub(crate) struct PriorityConfig {
     // priorities is a list of child balancer names. They are sorted from
     // highest priority to low. The type/config for each child can be found in
     // field Children, with the balancer name as the key.
@@ -45,7 +38,7 @@ struct PriorityConfig {
     // Children is a map from the child balancer names to their configs. Child
     // names can be found in field Priorities.
     #[serde(default)]
-    pub children: HashMap<String, Child>,
+    pub children: HashMap<String, ChildConfig>,
 }
 
 impl PriorityConfig {
@@ -70,72 +63,10 @@ impl PriorityConfig {
     }
 }
 
-#[derive(Debug)]
-struct Builder {}
-
-impl LbPolicyBuilder for Builder {
-    type LbPolicy = PiorityPolicy;
-
-    fn build(&self, options: LbPolicyOptions) -> Self::LbPolicy {
-        PiorityPolicy {}
-    }
-
-    fn name(&self) -> &'static str {
-        POLICY_NAME
-    }
-
-    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<Option<PriorityConfig>, String> {
-        let cfg: PriorityConfig = config.convert_to().map_err(|e| e.to_string())?;
-        cfg.validate()?;
-        Ok(Some(cfg))
-    }
-}
-
-pub(crate) fn reg() {
-    GLOBAL_LB_REGISTRY.add_builder(Builder {})
-}
-
-#[derive(Debug)]
-struct PiorityPolicy {}
-
-impl LbPolicy for PiorityPolicy {
-    type LbConfig = PriorityConfig;
-
-    fn resolver_update(
-        &mut self,
-        update: crate::client::name_resolution::ResolverUpdate,
-        config: Option<&Self::LbConfig>,
-        channel_controller: &mut dyn super::ChannelController,
-    ) -> Result<(), String> {
-        todo!()
-    }
-
-    fn subchannel_update(
-        &mut self,
-        subchannel: std::sync::Arc<dyn super::subchannel::Subchannel>,
-        state: &super::subchannel::SubchannelState,
-        channel_controller: &mut dyn super::ChannelController,
-    ) {
-        todo!()
-    }
-
-    fn work(
-        &mut self,
-        data: Option<super::WorkData>,
-        channel_controller: &mut dyn super::ChannelController,
-    ) {
-        todo!()
-    }
-
-    fn exit_idle(&mut self, channel_controller: &mut dyn super::ChannelController) {
-        todo!()
-    }
-}
-
 // Child is a child of priority balancer.
 #[derive(Debug, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct Child {
+pub struct ChildConfig {
     #[serde(default)]
     pub ignore_reresolution_requests: bool,
     pub config: LbConfigSerde,
@@ -143,7 +74,9 @@ pub struct Child {
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use crate::client::load_balancing::LbPolicyBuilder;
+    use crate::client::load_balancing::ParsedJsonLbConfig;
+    use crate::client::load_balancing::priority::Builder;
 
     #[test]
     fn parse_config_child_not_found() {
