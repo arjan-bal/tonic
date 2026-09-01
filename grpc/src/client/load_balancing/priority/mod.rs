@@ -122,8 +122,8 @@ impl LbPolicy for PriorityPolicy {
         self.child_data
             .retain(|k, v| config.children.contains_key(k));
 
-        // Update resolver state for all children, adding missing ones as
-        // uninitialized.
+        let mut child_updates = Vec::new();
+
         for (k, child_cfg) in &config.children {
             let endpoints = match &mut sharded_endpoints {
                 Ok(grouped) => Ok(grouped.remove(k).unwrap_or_default()),
@@ -139,20 +139,36 @@ impl LbPolicy for PriorityPolicy {
 
             match self.child_data.entry(k.clone()) {
                 Entry::Occupied(mut entry) => {
-                    entry.get_mut().resolver_update = resolver_update;
+                    let data = entry.get_mut();
+                    data.child_config = child_cfg.clone();
+
+                    match &mut data.state {
+                        ChildState::Uninitialized(_) => {
+                            data.state = ChildState::Uninitialized(resolver_update);
+                        }
+                        _ => {
+                            child_updates.push(ChildUpdate {
+                                child_identifier: k.clone(),
+                                child_policy_builder: data.child_config.config.builder.clone(),
+                                child_update: Some((
+                                    resolver_update,
+                                    child_cfg.config.config.as_ref(),
+                                )),
+                            });
+                        }
+                    }
                 }
                 Entry::Vacant(entry) => {
                     entry.insert(ChildData {
-                        state: ChildState::Uninitialized,
+                        state: ChildState::Uninitialized(resolver_update),
                         child_config: child_cfg.clone(),
-                        resolver_update,
                     });
                 }
             }
         }
 
         // Update children.
-        let res = self.push_child_resolver_updates(channel_controller);
+        let res = self.child_mgr.update(child_updates, channel_controller);
         self.reconcile(channel_controller);
         res
     }
@@ -180,30 +196,6 @@ impl LbPolicy for PriorityPolicy {
 }
 
 impl PriorityPolicy {
-    fn push_child_resolver_updates(
-        &mut self,
-        channel_controller: &mut dyn ChannelController,
-    ) -> Result<(), String> {
-        let child_updates = self
-            .child_data
-            .iter()
-            .filter(|(_, data)| {
-                if let ChildState::Uninitialized = data.state {
-                    false
-                } else {
-                    true
-                }
-            })
-            .map(|(k, v)| ChildUpdate {
-                child_identifier: k.clone(),
-                child_policy_builder: Arc::new(ChildBuilder {}),
-                child_update: Some(),
-            });
-        let res = self.child_mgr.update(child_updates, channel_controller);
-
-        todo!()
-    }
-
     fn reconcile(&mut self, channel_controller: &mut dyn ChannelController) {
         self.handle_deactivation_timer();
         self.handle_connectivity_timer();
@@ -223,7 +215,9 @@ impl PriorityPolicy {
             child_data.state = match child.state.connectivity_state {
                 ConnectivityState::Idle => ChildState::Steady,
                 ConnectivityState::Connecting => match old_state {
-                    ChildState::Uninitialized => ChildState::Uninitialized,
+                    ChildState::Uninitialized(resolver_update) => {
+                        ChildState::Uninitialized(resolver_update)
+                    }
                     ChildState::Connecting(timer) => ChildState::Connecting(timer),
                     ChildState::Retrying => ChildState::Retrying,
                     ChildState::Steady => ChildState::Connecting(Timer::new(
@@ -278,19 +272,35 @@ impl PriorityPolicy {
                 };
                 child_data.state = new_state;
             }
-            match &child_data.state {
-                ChildState::Uninitialized => {
-                    // Move to connecting.
-                    child_data.state = ChildState::Connecting(Timer::new(
+
+            if let ChildState::Uninitialized(_) = child_data.state {
+                // Move a placeholder state into child_data.state to extract
+                // ownership.
+                let old_state = std::mem::replace(
+                    &mut child_data.state,
+                    ChildState::Connecting(Timer::new(
                         CONNECTING_TIMEOUT,
                         self.work_scheduler.clone(),
                         self.rt.clone(),
-                    ));
-                    // Call Child manager.
-                    self.set_current_priority(channel_controller, idx, false);
+                    )),
+                );
+
+                // Destructure the owned old_state to get owned `resolver_update`.
+                if let ChildState::Uninitialized(resolver_update) = old_state {
+                    let _ =
+                        self.update_child(child_id.clone(), resolver_update, channel_controller);
+                    // Re-calculate the priority based on the updated child state.
+                    // The recursion should break in the next call as the newly
+                    // initialized child would be Connecting.
+                    self.choose_priority(channel_controller);
                     return;
                 }
-                ChildState::Connecting(timer) => {
+            }
+            match &child_data.state {
+                ChildState::Uninitialized(resolver_update) => {
+                    unreachable!("child initilized previously")
+                }
+                ChildState::Connecting(_) => {
                     self.set_current_priority(channel_controller, idx, false);
                     return;
                 }
@@ -300,7 +310,7 @@ impl PriorityPolicy {
                     return;
                 }
                 ChildState::Deactivated(timer) => {
-                    unreachable!("child re-activate previously")
+                    unreachable!("child previously re-activated")
                 }
             };
         }
@@ -309,6 +319,15 @@ impl PriorityPolicy {
         // was pending, so check for one in CONNECTING.
 
         // We didn't find a child in CONNECTING, so delegate to the last child.
+        todo!()
+    }
+
+    fn update_child(
+        &mut self,
+        child_id: String,
+        resolver_update: ResolverUpdate,
+        channel_controller: &mut dyn ChannelController,
+    ) -> Result<(), String> {
         todo!()
     }
 

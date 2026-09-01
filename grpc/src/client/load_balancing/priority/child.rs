@@ -41,7 +41,6 @@ use crate::rt::GrpcRuntime;
 #[derive(Debug)]
 pub(crate) struct ChildData {
     pub(crate) state: ChildState,
-    pub(crate) resolver_update: ResolverUpdate,
     pub(crate) child_config: ChildConfig,
     // TODO: Figure out how to intercept re-resolution requests from children.
 }
@@ -86,7 +85,7 @@ impl Timer {
 #[derive(Debug)]
 pub(crate) enum ChildState {
     /// Child not part of child manager.
-    Uninitialized,
+    Uninitialized(ResolverUpdate),
     /// Connection attempt started, timer running.
     Connecting(Timer),
     /// Connection timer expired, in Connecting or Transient Failure.
