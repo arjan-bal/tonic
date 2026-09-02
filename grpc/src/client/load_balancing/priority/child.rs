@@ -31,6 +31,7 @@ use crate::client::load_balancing::DynLbPolicy;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
+use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::priority::config::ChildConfig;
@@ -87,13 +88,13 @@ pub(crate) enum ChildState {
     /// Child not part of child manager.
     Uninitialized(ResolverUpdate),
     /// Connection attempt started, timer running.
-    Connecting(Timer),
+    Connecting(Timer, LbState),
     /// Connection timer expired, in Connecting or Transient Failure.
-    Retrying,
+    Retrying(LbState),
     /// Idle or Ready.
-    Steady,
+    Steady(LbState),
     // Child present in child manager and cache.
-    Deactivated(Timer),
+    Deactivated(Timer, LbState),
 }
 
 #[derive(Debug)]

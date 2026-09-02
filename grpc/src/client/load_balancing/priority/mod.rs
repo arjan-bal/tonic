@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::debug_assert_matches;
 use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +62,7 @@ mod config;
 
 pub static POLICY_NAME: &str = "priority_experimental";
 const CONNECTING_TIMEOUT: Duration = Duration::from_secs(10);
+const DEACTIVATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 pub(crate) fn reg() {
     GLOBAL_LB_REGISTRY.add_builder(Builder {})
@@ -211,24 +213,30 @@ impl PriorityPolicy {
                 .expect("missing priority child entry");
             // Take ownership of the current state and replace it with a temporary
             // value.
-            let old_state = mem::replace(&mut child_data.state, ChildState::Retrying);
+            let old_state = mem::replace(
+                &mut child_data.state,
+                ChildState::Uninitialized(ResolverUpdate::default()),
+            );
+            let lb_state = child.state.clone();
             child_data.state = match child.state.connectivity_state {
-                ConnectivityState::Idle => ChildState::Steady,
+                ConnectivityState::Idle | ConnectivityState::Ready => ChildState::Steady(lb_state),
                 ConnectivityState::Connecting => match old_state {
-                    ChildState::Uninitialized(resolver_update) => {
-                        ChildState::Uninitialized(resolver_update)
+                    ChildState::Uninitialized(_) => {
+                        unreachable!("uninitialized child present in child manager")
                     }
-                    ChildState::Connecting(timer) => ChildState::Connecting(timer),
-                    ChildState::Retrying => ChildState::Retrying,
-                    ChildState::Steady => ChildState::Connecting(Timer::new(
-                        CONNECTING_TIMEOUT,
-                        self.work_scheduler.clone(),
-                        self.rt.clone(),
-                    )),
-                    ChildState::Deactivated(timer) => Deactivated(timer),
+                    ChildState::Connecting(timer, _) => ChildState::Connecting(timer, lb_state),
+                    ChildState::Retrying(_) => ChildState::Retrying(lb_state),
+                    ChildState::Steady(_) => ChildState::Connecting(
+                        Timer::new(
+                            CONNECTING_TIMEOUT,
+                            self.work_scheduler.clone(),
+                            self.rt.clone(),
+                        ),
+                        lb_state,
+                    ),
+                    ChildState::Deactivated(timer, _) => Deactivated(timer, lb_state),
                 },
-                ConnectivityState::Ready => ChildState::Steady,
-                ConnectivityState::TransientFailure => ChildState::Retrying,
+                ConnectivityState::TransientFailure => ChildState::Retrying(lb_state),
             };
         }
     }
@@ -245,30 +253,27 @@ impl PriorityPolicy {
             return;
         }
 
-        let initialized_child_states: HashMap<&String, &LbState> = self
-            .child_mgr
-            .children()
-            .map(|child| (&child.identifier, &child.state))
-            .collect();
-
         for (idx, child_id) in self.priorities.iter().enumerate() {
             let child_data = self
                 .child_data
                 .get_mut(child_id)
                 .expect("missing entry for child priority");
+
             // Re-activate child if necessary.
-            if let ChildState::Deactivated(_) = child_data.state {
-                let cur_state = initialized_child_states
-                    .get(child_id)
-                    .expect("missing child manager entry for priority child");
-                let new_state = match cur_state.connectivity_state {
-                    ConnectivityState::Idle | ConnectivityState::Ready => ChildState::Steady,
-                    ConnectivityState::Connecting => ChildState::Connecting(Timer::new(
-                        CONNECTING_TIMEOUT,
-                        self.work_scheduler.clone(),
-                        self.rt.clone(),
-                    )),
-                    ConnectivityState::TransientFailure => ChildState::Retrying,
+            if let ChildState::Deactivated(_, lb_state) = &child_data.state {
+                let new_state = match lb_state.connectivity_state {
+                    ConnectivityState::Idle | ConnectivityState::Ready => {
+                        ChildState::Steady(lb_state.clone())
+                    }
+                    ConnectivityState::Connecting => ChildState::Connecting(
+                        Timer::new(
+                            CONNECTING_TIMEOUT,
+                            self.work_scheduler.clone(),
+                            self.rt.clone(),
+                        ),
+                        lb_state.clone(),
+                    ),
+                    ConnectivityState::TransientFailure => ChildState::Retrying(lb_state.clone()),
                 };
                 child_data.state = new_state;
             }
@@ -278,38 +283,38 @@ impl PriorityPolicy {
                 // ownership.
                 let old_state = std::mem::replace(
                     &mut child_data.state,
-                    ChildState::Connecting(Timer::new(
-                        CONNECTING_TIMEOUT,
-                        self.work_scheduler.clone(),
-                        self.rt.clone(),
-                    )),
+                    ChildState::Uninitialized(ResolverUpdate::default()),
                 );
 
-                // Destructure the owned old_state to get owned `resolver_update`.
+                // De-structure the owned old_state to get owned `resolver_update`.
                 if let ChildState::Uninitialized(resolver_update) = old_state {
-                    let _ =
-                        self.update_child(child_id.clone(), resolver_update, channel_controller);
+                    if self
+                        .update_child(child_id.clone(), resolver_update, channel_controller)
+                        .is_err()
+                    {
+                        channel_controller.request_resolution();
+                    }
                     // Re-calculate the priority based on the updated child state.
                     // The recursion should break in the next call as the newly
                     // initialized child would be Connecting.
-                    self.choose_priority(channel_controller);
+                    self.reconcile(channel_controller);
                     return;
                 }
             }
             match &child_data.state {
                 ChildState::Uninitialized(resolver_update) => {
-                    unreachable!("child initilized previously")
+                    unreachable!("child initialized previously")
                 }
-                ChildState::Connecting(_) => {
+                ChildState::Connecting(_, _) => {
                     self.set_current_priority(channel_controller, idx, false);
                     return;
                 }
-                ChildState::Retrying => {}
-                ChildState::Steady => {
+                ChildState::Retrying(_) => {}
+                ChildState::Steady(_) => {
                     self.set_current_priority(channel_controller, idx, true);
                     return;
                 }
-                ChildState::Deactivated(timer) => {
+                ChildState::Deactivated(timer, _) => {
                     unreachable!("child previously re-activated")
                 }
             };
@@ -317,18 +322,35 @@ impl PriorityPolicy {
 
         // We did not find a priority in READY or IDLE or whose failover timer
         // was pending, so check for one in CONNECTING.
+        for (idx, child_id) in self.priorities.iter().enumerate() {
+            let child_data = self
+                .child_data
+                .get_mut(child_id)
+                .expect("missing entry for child priority");
+            let is_connecting = match &child_data.state {
+                ChildState::Uninitialized(_) => unreachable!(),
+                ChildState::Connecting(_, lb_state) => {
+                    debug_assert_matches!(
+                        lb_state.connectivity_state,
+                        ConnectivityState::Connecting
+                    );
+                    true
+                }
+                ChildState::Retrying(lb_state) => {
+                    matches!(lb_state.connectivity_state, ConnectivityState::Connecting)
+                }
+                ChildState::Steady(_) => unreachable!(),
+                Deactivated(_, _) => unreachable!(),
+            };
+            if !is_connecting {
+                continue;
+            }
+            self.set_current_priority(channel_controller, idx, false);
+            return;
+        }
 
         // We didn't find a child in CONNECTING, so delegate to the last child.
-        todo!()
-    }
-
-    fn update_child(
-        &mut self,
-        child_id: String,
-        resolver_update: ResolverUpdate,
-        channel_controller: &mut dyn ChannelController,
-    ) -> Result<(), String> {
-        todo!()
+        self.set_current_priority(channel_controller, self.priorities.len() - 1, false);
     }
 
     fn set_current_priority(
@@ -337,22 +359,114 @@ impl PriorityPolicy {
         index: usize,
         deactivate_lower_priorities: bool,
     ) {
-        todo!()
+        // Deactivate lower priorities if needed.
+        if deactivate_lower_priorities {
+            for child_id in self.priorities.iter().skip(index + 1) {
+                let child_data = self
+                    .child_data
+                    .get_mut(child_id)
+                    .unwrap_or_else(|| panic!("missing child data for {child_id}"));
+                let old_state = mem::replace(
+                    &mut child_data.state,
+                    ChildState::Uninitialized(ResolverUpdate::default()),
+                );
+                child_data.state = match old_state {
+                    ChildState::Uninitialized(resolver_update) => {
+                        ChildState::Uninitialized(resolver_update)
+                    }
+                    ChildState::Connecting(_, lb_state) => ChildState::Deactivated(
+                        Timer::new(
+                            DEACTIVATION_TIMEOUT,
+                            self.work_scheduler.clone(),
+                            self.rt.clone(),
+                        ),
+                        lb_state,
+                    ),
+                    ChildState::Retrying(lb_state) => ChildState::Deactivated(
+                        Timer::new(
+                            DEACTIVATION_TIMEOUT,
+                            self.work_scheduler.clone(),
+                            self.rt.clone(),
+                        ),
+                        lb_state,
+                    ),
+                    ChildState::Steady(lb_state) => ChildState::Deactivated(
+                        Timer::new(
+                            DEACTIVATION_TIMEOUT,
+                            self.work_scheduler.clone(),
+                            self.rt.clone(),
+                        ),
+                        lb_state,
+                    ),
+                    Deactivated(timer, lb_state) => Deactivated(timer, lb_state),
+                }
+            }
+        }
+
+        // Use this child's picker.
+        let child_name = &self.priorities[index];
+        let child_data = self
+            .child_data
+            .get(child_name)
+            .expect("inconsistent child data and priorities list");
+        let lb_state = match &child_data.state {
+            ChildState::Uninitialized(_) => {
+                unreachable!("can't set priority to un-initialized child")
+            }
+            ChildState::Connecting(_, lb_state) => lb_state,
+            ChildState::Retrying(lb_state) => lb_state,
+            ChildState::Steady(lb_state) => lb_state,
+            Deactivated(_, lb_state) => lb_state,
+        }
+        .clone();
+        channel_controller.update_picker(lb_state);
+    }
+
+    fn update_child(
+        &mut self,
+        child_id: String,
+        resolver_update: ResolverUpdate,
+        channel_controller: &mut dyn ChannelController,
+    ) -> Result<(), String> {
+        let mut resolver_update = Some(resolver_update);
+        let child_updates = self
+            .child_data
+            .iter()
+            .filter(|(_, cd)| !matches!(cd.state, ChildState::Uninitialized(_)))
+            .map(|(id, data)| {
+                let update = if &child_id == id {
+                    // .take() moves the owned value out without cloning.
+                    // Since id is the key of a HashMap, there's at most one
+                    // element that matches.
+                    resolver_update
+                        .take()
+                        .map(|ru| (ru, data.child_config.config.config.as_ref()))
+                } else {
+                    None
+                };
+                ChildUpdate {
+                    child_identifier: id.clone(),
+                    child_policy_builder: data.child_config.config.builder.clone(),
+                    child_update: update,
+                }
+            });
+
+        self.child_mgr.update(child_updates, channel_controller)
     }
 
     fn handle_connectivity_timer(&mut self) {
         for (_, child_data) in self.child_data.iter_mut() {
-            if let ChildState::Connecting(connecting_state) = &child_data.state
+            if let ChildState::Connecting(connecting_state, lb_state) = &child_data.state
                 && connecting_state.deadline >= Instant::now()
             {
-                child_data.state = ChildState::Retrying;
+                child_data.state = ChildState::Retrying(lb_state.clone());
             }
         }
     }
 
     fn handle_deactivation_timer(&mut self) {
         self.child_data.retain(|id, s| match &s.state {
-            ChildState::Deactivated(timer) => timer.deadline >= Instant::now(),
+            ChildState::Deactivated(timer, _) => timer.deadline >= Instant::now(),
             _ => true,
         });
 
