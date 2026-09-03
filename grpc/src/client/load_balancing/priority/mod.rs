@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::debug_assert_matches;
+use std::fmt;
 use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +34,7 @@ use tokio::time::Instant;
 
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
+use crate::client::load_balancing::DynLbConfig;
 use crate::client::load_balancing::DynLbPolicyBuilder;
 use crate::client::load_balancing::FailingPicker;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
@@ -47,18 +49,15 @@ use crate::client::load_balancing::child_manager::ChildManager;
 use crate::client::load_balancing::child_manager::ChildUpdate;
 use crate::client::load_balancing::hierarchy;
 use crate::client::load_balancing::priority::child::ChildBuilder;
-use crate::client::load_balancing::priority::child::ChildData;
-use crate::client::load_balancing::priority::child::ChildState;
-use crate::client::load_balancing::priority::child::ChildState::Deactivated;
-use crate::client::load_balancing::priority::child::Timer;
-use crate::client::load_balancing::priority::config::PriorityConfig;
+use crate::client::load_balancing::priority::child::ChildConfig;
+use crate::client::load_balancing::registry::DynAdapter;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::name_resolution::ResolverUpdate;
+use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
 
 mod child;
-mod config;
 
 pub static POLICY_NAME: &str = "priority_experimental";
 const CONNECTING_TIMEOUT: Duration = Duration::from_secs(10);
@@ -66,6 +65,95 @@ const DEACTIVATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 pub(crate) fn reg() {
     GLOBAL_LB_REGISTRY.add_builder(Builder {})
+}
+
+#[derive(Debug, serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PriorityConfig {
+    // priorities is a list of child balancer names. They are sorted from
+    // highest priority to low. The type/config for each child can be found in
+    // field Children, with the balancer name as the key.
+    priorities: Vec<String>,
+
+    // Children is a map from the child balancer names to their configs. Child
+    // names can be found in field Priorities.
+    children: HashMap<String, ChildConfig>,
+}
+
+impl PriorityConfig {
+    fn validate(&self) -> Result<(), String> {
+        for name in &self.priorities {
+            if !self.children.contains_key(name) {
+                return Err(format!(
+                    "LB policy name \"{name}\" found in Priorities field ({:?}) is not found in Children field ({:?})",
+                    self.priorities, self.children
+                ));
+            }
+        }
+        for name in self.children.keys() {
+            if !self.priorities.contains(name) {
+                return Err(format!(
+                    "LB policy name \"{name}\" found in Children field ({:?}) is not found in Priorities field ({:?})",
+                    self.children, self.priorities
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ChildData {
+    state: ChildState,
+    child_builder: Arc<DynLbPolicyBuilder>,
+    child_config: DynLbConfig,
+}
+
+struct Timer {
+    deadline: Instant,
+    task_handle: BoxedTaskHandle,
+}
+
+impl fmt::Debug for Timer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectingState")
+            .field("deadline", &self.deadline)
+            .finish()
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        self.task_handle.abort();
+    }
+}
+
+impl Timer {
+    fn new(duration: Duration, work_scheduler: Arc<dyn WorkScheduler>, rt: GrpcRuntime) -> Timer {
+        let rt_clone = rt.clone();
+        let task_handle = rt.spawn(Box::pin(async move {
+            rt_clone.sleep(duration).await;
+            work_scheduler.schedule_work(None);
+        }));
+        Timer {
+            deadline: Instant::now() + duration,
+            task_handle,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ChildState {
+    /// Child not part of child manager.
+    Uninitialized(ResolverUpdate),
+    /// Connection attempt started, timer running.
+    Connecting(Timer, LbState),
+    /// Connection timer expired, in Connecting or Transient Failure.
+    Retrying(LbState),
+    /// Idle or Ready.
+    Steady(LbState),
+    // Child present in child manager and cache.
+    Deactivated(Timer, LbState),
 }
 
 #[derive(Debug)]
@@ -120,11 +208,11 @@ impl LbPolicy for PriorityPolicy {
         // Shard by hierarchy.
         let mut sharded_endpoints = update.endpoints.map(hierarchy::group);
 
-        // Remove children no-longer present in any priority.
+        // Remove children no-longer present in any priority, see gRFC A115.
         self.child_data
             .retain(|k, v| config.children.contains_key(k));
 
-        let mut child_updates = Vec::new();
+        let mut updates_to_emit = Vec::new();
 
         for (k, child_cfg) in &config.children {
             let endpoints = match &mut sharded_endpoints {
@@ -142,32 +230,43 @@ impl LbPolicy for PriorityPolicy {
             match self.child_data.entry(k.clone()) {
                 Entry::Occupied(mut entry) => {
                     let data = entry.get_mut();
-                    data.child_config = child_cfg.clone();
+                    data.child_config = Arc::new(child_cfg.clone());
 
                     match &mut data.state {
                         ChildState::Uninitialized(_) => {
                             data.state = ChildState::Uninitialized(resolver_update);
                         }
                         _ => {
-                            child_updates.push(ChildUpdate {
-                                child_identifier: k.clone(),
-                                child_policy_builder: data.child_config.config.builder.clone(),
-                                child_update: Some((
-                                    resolver_update,
-                                    child_cfg.config.config.as_ref(),
-                                )),
-                            });
+                            // Stash key and resolver_update to assemble
+                            // ChildUpdates in a second pass.
+                            updates_to_emit.push((k.clone(), resolver_update));
                         }
                     }
                 }
                 Entry::Vacant(entry) => {
                     entry.insert(ChildData {
                         state: ChildState::Uninitialized(resolver_update),
-                        child_config: child_cfg.clone(),
+                        child_config: Arc::new(child_cfg.clone()),
+                        child_builder: DynAdapter::new_arc(ChildBuilder {}),
                     });
                 }
             }
         }
+
+        // Build child_updates with immutable references from self.child_data.
+        let child_updates = updates_to_emit
+            .into_iter()
+            .map(|(child_id, resolver_update)| {
+                let data = self
+                    .child_data
+                    .get(&child_id)
+                    .expect("missing priority child entry");
+                ChildUpdate {
+                    child_identifier: child_id,
+                    child_policy_builder: data.child_builder.clone(),
+                    child_update: Some((resolver_update, Some(&data.child_config))),
+                }
+            });
 
         // Update children.
         let res = self.child_mgr.update(child_updates, channel_controller);
@@ -234,7 +333,7 @@ impl PriorityPolicy {
                         ),
                         lb_state,
                     ),
-                    ChildState::Deactivated(timer, _) => Deactivated(timer, lb_state),
+                    ChildState::Deactivated(timer, _) => ChildState::Deactivated(timer, lb_state),
                 },
                 ConnectivityState::TransientFailure => ChildState::Retrying(lb_state),
             };
@@ -340,7 +439,7 @@ impl PriorityPolicy {
                     matches!(lb_state.connectivity_state, ConnectivityState::Connecting)
                 }
                 ChildState::Steady(_) => unreachable!(),
-                Deactivated(_, _) => unreachable!(),
+                ChildState::Deactivated(_, _) => unreachable!(),
             };
             if !is_connecting {
                 continue;
@@ -398,7 +497,9 @@ impl PriorityPolicy {
                         ),
                         lb_state,
                     ),
-                    Deactivated(timer, lb_state) => Deactivated(timer, lb_state),
+                    ChildState::Deactivated(timer, lb_state) => {
+                        ChildState::Deactivated(timer, lb_state)
+                    }
                 }
             }
         }
@@ -416,7 +517,7 @@ impl PriorityPolicy {
             ChildState::Connecting(_, lb_state) => lb_state,
             ChildState::Retrying(lb_state) => lb_state,
             ChildState::Steady(lb_state) => lb_state,
-            Deactivated(_, lb_state) => lb_state,
+            ChildState::Deactivated(_, lb_state) => lb_state,
         }
         .clone();
         channel_controller.update_picker(lb_state);
@@ -440,13 +541,13 @@ impl PriorityPolicy {
                     // element that matches.
                     resolver_update
                         .take()
-                        .map(|ru| (ru, data.child_config.config.config.as_ref()))
+                        .map(|ru| (ru, Some(&data.child_config)))
                 } else {
                     None
                 };
                 ChildUpdate {
                     child_identifier: id.clone(),
-                    child_policy_builder: data.child_config.config.builder.clone(),
+                    child_policy_builder: data.child_builder.clone(),
                     child_update: update,
                 }
             });
@@ -470,13 +571,89 @@ impl PriorityPolicy {
             _ => true,
         });
 
-        let iter = self.child_data.keys().map(|id| {
-            (
-                id.clone(),
-                Arc::new(ChildBuilder {}) as Arc<DynLbPolicyBuilder>,
-            )
-        });
+        let iter = self
+            .child_data
+            .iter()
+            .map(|(id, data)| (id.clone(), data.child_builder.clone()));
 
         self.child_mgr.retain_children(iter);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::client::load_balancing::LbPolicyBuilder;
+    use crate::client::load_balancing::ParsedJsonLbConfig;
+    use crate::client::load_balancing::priority::Builder;
+
+    #[test]
+    fn parse_config_child_not_found() {
+        let js = r#"{
+  "priorities": ["child-1", "child-2", "child-3"],
+  "children": {
+    "child-1": {"config": [{"round_robin":{}}]},
+    "child-3": {"config": [{"round_robin":{}}]}
+  }
+}"#;
+        let builder = Builder {};
+        let got = ParsedJsonLbConfig::new(js).and_then(|cfg| builder.parse_config(&cfg));
+        assert!(got.is_err());
+    }
+
+    #[test]
+    fn parse_config_child_not_used() {
+        let js = r#"{
+  "priorities": ["child-1", "child-2"],
+  "children": {
+    "child-1": {"config": [{"round_robin":{}}]},
+    "child-2": {"config": [{"round_robin":{}}]},
+    "child-3": {"config": [{"round_robin":{}}]}
+  }
+}"#;
+        let builder = Builder {};
+        let got = ParsedJsonLbConfig::new(js).and_then(|cfg| builder.parse_config(&cfg));
+        assert!(got.is_err());
+    }
+
+    #[test]
+    fn parse_config_success() {
+        let js = r#"{
+  "priorities": ["child-1", "child-2", "child-3"],
+  "children": {
+    "child-1": {"config": [{"round_robin":{}}], "ignoreReresolutionRequests": true},
+    "child-2": {"config": [{"pick_first": {"shuffleAddressList": true}}]},
+    "child-3": {"config": [{"round_robin":{}}]}
+  }
+}"#;
+        let builder = Builder {};
+        let got = ParsedJsonLbConfig::new(js)
+            .and_then(|cfg| builder.parse_config(&cfg))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(got.priorities, vec!["child-1", "child-2", "child-3"]);
+        assert_eq!(got.children.len(), 3);
+
+        let child1 = got.children.get("child-1").unwrap();
+        assert!(child1.ignore_reresolution_requests);
+        assert_eq!(child1.config.builder.name(), "round_robin");
+        assert!(child1.config.config.is_none());
+
+        let child2 = got.children.get("child-2").unwrap();
+        assert!(!child2.ignore_reresolution_requests);
+        assert_eq!(child2.config.builder.name(), "pick_first");
+        let pf_cfg = child2
+            .config
+            .config
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<crate::client::load_balancing::pick_first::PickFirstConfig>()
+            .unwrap();
+        assert!(pf_cfg.shuffle_address_list);
+
+        let child3 = got.children.get("child-3").unwrap();
+        assert!(!child3.ignore_reresolution_requests);
+        assert_eq!(child3.config.builder.name(), "round_robin");
+        assert!(child3.config.config.is_none());
     }
 }

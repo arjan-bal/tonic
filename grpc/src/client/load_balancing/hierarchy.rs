@@ -115,7 +115,7 @@ fn set_in_endpoint_path(mut endpoint: Endpoint, path: HierarchicalPath) -> Endpo
 }
 
 /// Overrides the hierarchical path in endpoint with path.
-pub(crate) fn set_in_endpoint(endpoint: Endpoint, path: Vec<String>) -> Endpoint {
+pub fn set_in_endpoint(endpoint: Endpoint, path: Vec<String>) -> Endpoint {
     set_in_endpoint_path(endpoint, HierarchicalPath::new(path))
 }
 
