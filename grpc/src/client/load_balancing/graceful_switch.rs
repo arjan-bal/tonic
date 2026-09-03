@@ -93,7 +93,7 @@ impl LbPolicy for GracefulSwitchPolicy {
         children.push(ChildUpdate {
             child_policy_builder: config.child_builder.clone(),
             child_identifier: (),
-            child_update: Some((update, config.child_config.clone())),
+            child_update: Some((update, config.child_config.as_ref())),
         });
 
         // Include the active child if it does not match the updated child so

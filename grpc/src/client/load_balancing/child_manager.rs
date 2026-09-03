@@ -70,7 +70,7 @@ pub struct Child<T, B: LbPolicyBuilder = Arc<DynLbPolicyBuilder>> {
 }
 
 /// A collection of data sent to a child of the ChildManager.
-pub struct ChildUpdate<T, B: LbPolicyBuilder = Arc<DynLbPolicyBuilder>> {
+pub struct ChildUpdate<'a, T, B: LbPolicyBuilder = Arc<DynLbPolicyBuilder>> {
     /// The identifier the ChildManager should use for this child.
     pub child_identifier: T,
     /// The builder the ChildManager should use to create this child if it does
@@ -82,7 +82,10 @@ pub struct ChildUpdate<T, B: LbPolicyBuilder = Arc<DynLbPolicyBuilder>> {
     /// None, then resolver_update will not be called on the child.  Should
     /// generally be Some for any new children, otherwise they will not be
     /// called.
-    pub child_update: Option<(ResolverUpdate, Option<<B::LbPolicy as LbPolicy>::LbConfig>)>,
+    pub child_update: Option<(
+        ResolverUpdate,
+        Option<&'a <B::LbPolicy as LbPolicy>::LbConfig>,
+    )>,
 }
 
 impl<T, B> ChildManager<T, B>
@@ -279,9 +282,9 @@ where
     /// for each item), how to construct them if they don't already, and what to
     /// send to their `resolver_update` methods, if anything.  Any existing
     /// children not present in child_updates will be removed.
-    pub fn update(
+    pub fn update<'a>(
         &mut self,
-        child_updates: impl IntoIterator<Item = ChildUpdate<T, B>>,
+        child_updates: impl IntoIterator<Item = ChildUpdate<'a, T, B>>,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
         // Split the child updates into the IDs and builders, and the
@@ -303,11 +306,11 @@ where
                 continue;
             };
             let mut channel_controller = WrappedController::new(channel_controller);
-            if let Err(err) = child.policy.resolver_update(
-                resolver_update,
-                config.as_ref(),
-                &mut channel_controller,
-            ) {
+            if let Err(err) =
+                child
+                    .policy
+                    .resolver_update(resolver_update, config, &mut channel_controller)
+            {
                 errs.push(err);
             }
             self.resolve_child_controller(channel_controller, child_idx);
@@ -929,7 +932,7 @@ mod test {
             ChildUpdate {
                 child_identifier: (),
                 child_policy_builder,
-                child_update: Some((ResolverUpdate::default(), Some(cfg.clone()))),
+                child_update: Some((ResolverUpdate::default(), Some(&cfg))),
             }
         });
         child_manager.update(updates.clone(), &mut tcc).unwrap();
