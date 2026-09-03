@@ -238,3 +238,111 @@ impl ChannelController for WrappedController<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+    use std::sync::mpsc;
+
+    use super::*;
+    use crate::client::ConnectivityState;
+    use crate::client::load_balancing::test_utils::TestChannelController;
+    use crate::client::load_balancing::test_utils::TestEvent;
+    use crate::client::load_balancing::test_utils::TestWorkScheduler;
+    use crate::client::name_resolution::Endpoint;
+    use crate::rt::default_runtime;
+
+    /// Runs an end-to-end test using a [`ChildPolicy`] wrapping a `pick_first`
+    /// child. Sends a resolver update with a single endpoint, triggers a
+    /// failure on the created subchannel, and checks whether
+    /// `RequestResolution` was forwarded to the channel controller.
+    fn test_pick_first_child_resolution_request(ignore: bool) -> bool {
+        let (tx_events, rx_events) = mpsc::channel();
+        let mut tcc = TestChannelController {
+            tx_events: tx_events.clone(),
+        };
+        let work_scheduler = Arc::new(TestWorkScheduler { tx_events });
+        let rt = default_runtime();
+
+        let mut child_lb = ChildBuilder {}.build(LbPolicyOptions {
+            runtime: rt,
+            work_scheduler,
+        });
+
+        let json = format!(
+            r#"{{
+              "config": [{{"pick_first": {{"shuffleAddressList": false}}}}],
+              "ignoreReresolutionRequests": {ignore}
+            }}"#
+        );
+        let cfg: ChildConfig = serde_json::from_str(&json).unwrap();
+
+        let endpoint = Endpoint {
+            addresses: vec![Address {
+                address: "127.0.0.1:8000".to_string().into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let update = ResolverUpdate {
+            endpoints: Ok(vec![endpoint]),
+            ..Default::default()
+        };
+
+        child_lb
+            .resolver_update(update, Some(&cfg), &mut tcc)
+            .unwrap();
+
+        let mut subchannel = None;
+        while let Ok(event) = rx_events.try_recv() {
+            if let TestEvent::NewSubchannel(sc) = event {
+                subchannel = Some(sc);
+                break;
+            }
+        }
+        let subchannel = subchannel.expect("expected NewSubchannel event");
+
+        // Drain any initial events (e.g. connect, update_picker).
+        while rx_events.try_recv().is_ok() {}
+
+        // Fail the single subchannel. Since all addresses in pick_first fail,
+        // it enters TRANSIENT_FAILURE and requests re-resolution.
+        child_lb.subchannel_update(
+            subchannel,
+            &SubchannelState {
+                connectivity_state: ConnectivityState::TransientFailure,
+                last_connection_error: Some("connection refused".to_string()),
+            },
+            &mut tcc,
+        );
+
+        // Check whether RequestResolution was received by the channel.
+        let mut requested_resolution = false;
+        while let Ok(event) = rx_events.try_recv() {
+            if matches!(event, TestEvent::RequestResolution) {
+                requested_resolution = true;
+            }
+        }
+        requested_resolution
+    }
+
+    /// Verifies that [`ChildPolicy`] (ChildLb) wrapping a `pick_first` child
+    /// forwards re-resolution requests when `ignore_reresolution_requests` is
+    /// disabled, and suppresses them when enabled (per gRFC A37 / gRFC A56).
+    #[tokio::test]
+    async fn wrapped_controller_ignore_resolve_now() {
+        // When ignore_reresolution_requests is false, pick_first failing its
+        // single subchannel triggers a re-resolution request that is detected.
+        assert!(
+            test_pick_first_child_resolution_request(false),
+            "expected pick_first child to request resolution when ignore is false"
+        );
+
+        // When ignore_reresolution_requests is true, the re-resolution request
+        // is intercepted and suppressed by WrappedController.
+        assert!(
+            !test_pick_first_child_resolution_request(true),
+            "expected pick_first resolution request to be suppressed when ignore is true"
+        );
+    }
+}
