@@ -22,6 +22,27 @@
  *
  */
 
+//! Child policy wrapper for the `priority_experimental` load balancing policy.
+//!
+//! Each priority in the priority policy is represented by an instance of
+//! [`ChildPolicy`], constructed via [`ChildBuilder`].
+//!
+//! [`ChildPolicy`] wraps a [`GracefulSwitchPolicy`] to support dynamic
+//! switching between child LB policies (e.g., transitioning from `round_robin`
+//! to `pick_first`) without dropping in-flight RPCs or abruptly terminating
+//! connections.
+//!
+//! It also implements re-resolution filtering as specified in [gRFC A37] and
+//! [gRFC A56]: if `ignore_reresolution_requests` is set to `true` in
+//! [`ChildConfig`], re-resolution requests triggered by this child (e.g., when
+//! it enters `TRANSIENT_FAILURE`) are intercepted and suppressed via
+//! [`WrappedController`], preventing redundant name resolution churn.
+//!
+//! [gRFC A37]:
+//!   https://github.com/grpc/proposal/blob/master/A37-xds-aggregate-and-logical-dns-clusters.md
+//! [gRFC A56]:
+//!   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md
+
 use std::sync::Arc;
 
 use crate::client::load_balancing::ChannelController;
@@ -39,18 +60,57 @@ use crate::client::name_resolution::ResolverUpdate;
 use crate::client::service_config::serde_bindings::LbConfigSerde;
 use crate::core::Address;
 
-// Child is a child of priority balancer.
+/// Configuration for an individual child under the `priority_experimental`
+/// LB policy.
+///
+/// Corresponds to the protobuf message
+/// `PriorityLoadBalancingPolicyConfig.Child` defined in
+/// [gRFC A56 §LB Policy Configuration]:
+///
+/// ```proto
+/// message Child {
+///   repeated LoadBalancingConfig config = 1;
+///   bool ignore_reresolution_requests = 2;
+/// }
+/// ```
+///
+/// [gRFC A56 §LB Policy Configuration]:
+///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#lb-policy-configuration
 #[derive(Debug, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ChildConfig {
+    /// If `true`, re-resolution requests from this child policy will be ignored
+    /// and not forwarded to the channel controller.
+    ///
+    /// This prevents lower-priority or failover children from triggering
+    /// unnecessary name resolution when they enter `TRANSIENT_FAILURE`.
+    /// See [gRFC A37] and [gRFC A56] for details.
+    ///
+    /// [gRFC A37]:
+    ///   https://github.com/grpc/proposal/blob/master/A37-xds-aggregate-and-logical-dns-clusters.md
+    /// [gRFC A56]:
+    ///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md
     #[serde(default)]
     pub(super) ignore_reresolution_requests: bool,
+
+    /// The child load balancing policy configuration, specifying the policy
+    /// to instantiate (e.g., `round_robin`, `pick_first`, `weighted_target`)
+    /// and its policy-specific configuration.
     pub(super) config: LbConfigSerde,
 }
 
-/// Produces wrapped LB policies that can block re-resolution requests from the
-/// wrapped policy if the ignore_reresolution_requests is set in the LbConfig.
-/// It is not registered in the global registry.
+/// Builder for [`ChildPolicy`].
+///
+/// Produces wrapped LB policy instances that wrap a [`GracefulSwitchPolicy`]
+/// and filter re-resolution requests if
+/// [`ChildConfig::ignore_reresolution_requests`] is set to `true`.
+///
+/// This builder is used internally by the priority policy to instantiate
+/// children managed by [`ChildManager`], and is not registered in
+/// [`GLOBAL_LB_REGISTRY`].
+///
+/// [`ChildManager`]: crate::client::load_balancing::child_manager::ChildManager
+/// [`GLOBAL_LB_REGISTRY`]: crate::client::load_balancing::GLOBAL_LB_REGISTRY
 #[derive(Debug)]
 pub(super) struct ChildBuilder {}
 
@@ -69,6 +129,9 @@ impl LbPolicyBuilder for ChildBuilder {
         "priority_child_lb"
     }
 
+    /// Config parsing is a no-op here because child configurations are
+    /// deserialized and validated as part of `PriorityConfig` in the parent
+    /// priority policy.
     fn parse_config(
         &self,
         _config: &ParsedJsonLbConfig,
@@ -77,8 +140,14 @@ impl LbPolicyBuilder for ChildBuilder {
     }
 }
 
-/// A policy that can block re-resolution requests from its children. It's child
-/// is a graceful-switch balancer.
+/// A child load balancing policy wrapper for the priority balancer.
+///
+/// It delegates load balancing duties to an inner [`GracefulSwitchPolicy`]
+/// while intercepting control operations from the child to the channel
+/// controller. Specifically, if `ignore_reresolution_requests` is enabled in
+/// the active [`ChildConfig`], re-resolution requests from the child are
+/// filtered out to prevent unnecessary DNS/resolver queries during priority
+/// failovers.
 #[derive(Debug)]
 pub(super) struct ChildPolicy {
     graceful_switch: GracefulSwitchPolicy,
@@ -100,14 +169,14 @@ impl LbPolicy for ChildPolicy {
             );
         };
         self.ignore_reresolution_requests = config.ignore_reresolution_requests;
-        let channe_controller =
+        let mut wrapped_controller =
             WrappedController::new(channel_controller, self.ignore_reresolution_requests);
         let gs_cfg = GracefulSwitchLbConfig::new(
             config.config.builder.clone(),
             config.config.config.clone(),
         );
         self.graceful_switch
-            .resolver_update(update, Some(&gs_cfg), channel_controller)
+            .resolver_update(update, Some(&gs_cfg), &mut wrapped_controller)
     }
 
     fn subchannel_update(
@@ -116,25 +185,27 @@ impl LbPolicy for ChildPolicy {
         state: &SubchannelState,
         channel_controller: &mut dyn ChannelController,
     ) {
-        let channe_controller =
+        let mut wrapped_controller =
             WrappedController::new(channel_controller, self.ignore_reresolution_requests);
         self.graceful_switch
-            .subchannel_update(subchannel, state, channel_controller)
+            .subchannel_update(subchannel, state, &mut wrapped_controller)
     }
 
     fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
-        let channe_controller =
+        let mut wrapped_controller =
             WrappedController::new(channel_controller, self.ignore_reresolution_requests);
-        self.graceful_switch.work(data, channel_controller)
+        self.graceful_switch.work(data, &mut wrapped_controller)
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
-        let channe_controller =
+        let mut wrapped_controller =
             WrappedController::new(channel_controller, self.ignore_reresolution_requests);
-        self.graceful_switch.exit_idle(channel_controller)
+        self.graceful_switch.exit_idle(&mut wrapped_controller)
     }
 }
 
+/// A [`ChannelController`] proxy that conditionally filters re-resolution
+/// requests.
 struct WrappedController<'a> {
     channel_controller: &'a mut dyn ChannelController,
     ignore_reresolution_requests: bool,
