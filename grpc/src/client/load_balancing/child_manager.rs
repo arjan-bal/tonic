@@ -34,9 +34,9 @@ use std::sync::Arc;
 
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
-use crate::client::load_balancing::DynLbConfig;
 use crate::client::load_balancing::DynLbPolicy;
-use crate::client::load_balancing::DynLbPolicyBuilder;
+use crate::client::load_balancing::LbPolicy;
+use crate::client::load_balancing::LbPolicyBuilder;
 use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::Subchannel;
@@ -50,10 +50,10 @@ use crate::rt::GrpcRuntime;
 
 // An LbPolicy implementation that manages multiple children.
 #[derive(Debug)]
-pub struct ChildManager<T: Debug> {
+pub struct ChildManager<T: Debug, P: LbPolicy = Box<DynLbPolicy>> {
     subchannel_to_child_idx: HashMap<WeakSubchannel, usize>,
     handle_to_child_idx: HashMap<ChildHandle, usize>,
-    children: Vec<Child<T>>,
+    children: Vec<Child<T, P>>,
     runtime: GrpcRuntime,
     updated: bool, // Set when any child updates its picker; cleared when accessed.
     work_scheduler: Arc<dyn WorkScheduler>,
@@ -61,33 +61,34 @@ pub struct ChildManager<T: Debug> {
 
 #[non_exhaustive]
 #[derive(Debug)]
-pub struct Child<T> {
+pub struct Child<T, P: LbPolicy = Box<DynLbPolicy>> {
     pub identifier: T,
-    pub builder: Arc<DynLbPolicyBuilder>,
+    pub builder: Arc<dyn LbPolicyBuilder<LbPolicy = P>>,
     pub state: LbState,
-    policy: Box<DynLbPolicy>,
+    policy: P,
     work_scheduler: Arc<ChildWorkScheduler>,
 }
 
 /// A collection of data sent to a child of the ChildManager.
-pub struct ChildUpdate<T> {
+pub struct ChildUpdate<T, P: LbPolicy = Box<DynLbPolicy>> {
     /// The identifier the ChildManager should use for this child.
     pub child_identifier: T,
     /// The builder the ChildManager should use to create this child if it does
     /// not exist.  The child_policy_builder's name is effectively a part of the
     /// child_identifier.  If two identifiers are identical but have different
     /// builder names, they are treated as different children.
-    pub child_policy_builder: Arc<DynLbPolicyBuilder>,
+    pub child_policy_builder: Arc<dyn LbPolicyBuilder<LbPolicy = P>>,
     /// The relevant ResolverUpdate and LbConfig to send to this child.  If
     /// None, then resolver_update will not be called on the child.  Should
     /// generally be Some for any new children, otherwise they will not be
     /// called.
-    pub child_update: Option<(ResolverUpdate, Option<DynLbConfig>)>,
+    pub child_update: Option<(ResolverUpdate, Option<P::LbConfig>)>,
 }
 
-impl<T> ChildManager<T>
+impl<T, P> ChildManager<T, P>
 where
     T: Debug + PartialEq + Hash + Eq + Send + Sync + 'static,
+    P: LbPolicy,
 {
     /// Creates a new ChildManager LB policy.  shard_update is called whenever a
     /// resolver_update operation occurs.
@@ -103,7 +104,7 @@ where
     }
 
     /// Returns data for all current children.
-    pub fn children(&self) -> impl Iterator<Item = &Child<T>> {
+    pub fn children(&self) -> impl Iterator<Item = &Child<T, P>> {
         self.children.iter()
     }
 
@@ -178,7 +179,7 @@ where
     /// ignored.
     pub fn retain_children(
         &mut self,
-        ids_builders: impl IntoIterator<Item = (T, Arc<DynLbPolicyBuilder>)>,
+        ids_builders: impl IntoIterator<Item = (T, Arc<dyn LbPolicyBuilder<LbPolicy = P>>)>,
     ) {
         self.reset_children(ids_builders, true);
     }
@@ -189,7 +190,7 @@ where
     /// otherwise a new child will be built for it.
     fn reset_children(
         &mut self,
-        ids_builders: impl IntoIterator<Item = (T, Arc<DynLbPolicyBuilder>)>,
+        ids_builders: impl IntoIterator<Item = (T, Arc<dyn LbPolicyBuilder<LbPolicy = P>>)>,
         retain_only: bool,
     ) {
         // Replace self.children with an empty vec.
@@ -283,7 +284,7 @@ where
     /// children not present in child_updates will be removed.
     pub fn update(
         &mut self,
-        child_updates: impl IntoIterator<Item = ChildUpdate<T>>,
+        child_updates: impl IntoIterator<Item = ChildUpdate<T, P>>,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
         // Split the child updates into the IDs and builders, and the
@@ -332,7 +333,7 @@ where
     pub fn resolver_update(
         &mut self,
         resolver_update: ResolverUpdate,
-        config: Option<&DynLbConfig>,
+        config: Option<&P::LbConfig>,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut errs = Vec::with_capacity(self.children.len());
@@ -508,6 +509,8 @@ mod test {
     use crate::client::load_balancing::SubchannelState;
     use crate::client::load_balancing::child_manager::ChildManager;
     use crate::client::load_balancing::child_manager::ChildUpdate;
+    use crate::client::load_balancing::pick_first::PickFirstBuilder;
+    use crate::client::load_balancing::pick_first::PickFirstPolicy;
     use crate::client::load_balancing::test_utils::StubPolicyFuncs;
     use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEvent;
@@ -1009,5 +1012,60 @@ mod test {
         // Call work for child 2.
         child_manager.work(child2_work, &mut tcc);
         assert!(*work_called.lock().unwrap().get(name2).unwrap_or(&false));
+    }
+
+    #[tokio::test]
+    async fn childmanager_with_pick_first_generic() {
+        let (tx_events, rx_events) = mpsc::channel::<TestEvent>();
+        let mut tcc = TestChannelController {
+            tx_events: tx_events.clone(),
+        };
+        let mut child_manager: ChildManager<Endpoint, PickFirstPolicy> =
+            ChildManager::new(default_runtime(), Arc::new(TestWorkScheduler { tx_events }));
+
+        let endpoints = create_n_endpoints_with_k_addresses(2, 1);
+        let builder = Arc::new(PickFirstBuilder {});
+
+        let updates = endpoints.iter().map(|e| ChildUpdate {
+            child_identifier: e.clone(),
+            child_policy_builder: builder.clone(),
+            child_update: Some((
+                ResolverUpdate {
+                    attributes: crate::attributes::Attributes::default(),
+                    endpoints: Ok(vec![e.clone()]),
+                    service_config: Ok(None),
+                    resolution_note: None,
+                },
+                None,
+            )),
+        });
+
+        child_manager.update(updates, &mut tcc).unwrap();
+        assert_eq!(child_manager.children().count(), 2);
+
+        // Verify subchannels were created by PickFirst children.
+        let mut subchannels = Vec::new();
+        while subchannels.len() < 2 {
+            match rx_events.recv().unwrap() {
+                TestEvent::NewSubchannel(sc) => subchannels.push(sc),
+                TestEvent::Connect(_) => {}
+                TestEvent::UpdatePicker(_) => {}
+                other => panic!("unexpected event {:?}", other),
+            }
+        }
+        let sc1 = subchannels[0].clone();
+        let sc2 = subchannels[1].clone();
+        assert_ne!(sc1.address(), sc2.address());
+
+        // Move subchannel 1 to Ready.
+        child_manager.subchannel_update(
+            sc1,
+            &SubchannelState {
+                connectivity_state: ConnectivityState::Ready,
+                last_connection_error: None,
+            },
+            &mut tcc,
+        );
+        assert_eq!(child_manager.aggregate_states(), ConnectivityState::Ready);
     }
 }

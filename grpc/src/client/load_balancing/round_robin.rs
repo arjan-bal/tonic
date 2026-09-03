@@ -31,7 +31,6 @@ use std::sync::atomic::Ordering;
 use crate::client::ConnectivityState;
 use crate::client::RequestHeaders;
 use crate::client::load_balancing::ChannelController;
-use crate::client::load_balancing::DynLbPolicyBuilder;
 use crate::client::load_balancing::FailingPicker;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
 use crate::client::load_balancing::LbPolicy;
@@ -46,6 +45,7 @@ use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::child_manager::ChildManager;
 use crate::client::load_balancing::child_manager::ChildUpdate;
 use crate::client::load_balancing::pick_first;
+use crate::client::load_balancing::pick_first::PickFirstPolicy;
 use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::ResolverUpdate;
 
@@ -56,20 +56,11 @@ static START: Once = Once::new();
 pub struct RoundRobinBuilder {}
 
 impl LbPolicyBuilder for RoundRobinBuilder {
-    type LbPolicy = RoundRobinPolicy;
+    type LbPolicy = RoundRobinPolicy<PickFirstPolicy>;
 
     fn build(&self, options: LbPolicyOptions) -> Self::LbPolicy {
         let child_manager = ChildManager::new(options.runtime, options.work_scheduler);
-        // TODO: do we want to use the pick first builder directly instead of
-        // going through the dynamic-converting registry?  That requires either
-        // making the RR policy generic or making it non-configurable, which the
-        // current tests take advantage of.
-        RoundRobinPolicy::new(
-            child_manager,
-            GLOBAL_LB_REGISTRY
-                .get_policy(pick_first::POLICY_NAME)
-                .unwrap(),
-        )
+        RoundRobinPolicy::new(child_manager, Arc::new(pick_first::PickFirstBuilder {}))
     }
 
     fn name(&self) -> &'static str {
@@ -78,19 +69,19 @@ impl LbPolicyBuilder for RoundRobinBuilder {
 }
 
 #[derive(Debug)]
-pub struct RoundRobinPolicy {
-    child_manager: ChildManager<Endpoint>,
-    pick_first_builder: Arc<DynLbPolicyBuilder>,
+pub struct RoundRobinPolicy<P: LbPolicy = PickFirstPolicy> {
+    child_manager: ChildManager<Endpoint, P>,
+    child_policy_builder: Arc<dyn LbPolicyBuilder<LbPolicy = P>>,
 }
 
-impl RoundRobinPolicy {
-    fn new(
-        child_manager: ChildManager<Endpoint>,
-        pick_first_builder: Arc<DynLbPolicyBuilder>,
+impl<P: LbPolicy> RoundRobinPolicy<P> {
+    pub fn new(
+        child_manager: ChildManager<Endpoint, P>,
+        child_policy_builder: Arc<dyn LbPolicyBuilder<LbPolicy = P>>,
     ) -> Self {
         Self {
             child_manager,
-            pick_first_builder,
+            child_policy_builder,
         }
     }
 
@@ -156,7 +147,7 @@ impl RoundRobinPolicy {
     }
 }
 
-impl LbPolicy for RoundRobinPolicy {
+impl<P: LbPolicy> LbPolicy for RoundRobinPolicy<P> {
     type LbConfig = ();
     fn resolver_update(
         &mut self,
@@ -178,7 +169,7 @@ impl LbPolicy for RoundRobinPolicy {
             };
             ChildUpdate {
                 child_identifier: e.clone(),
-                child_policy_builder: self.pick_first_builder.clone(),
+                child_policy_builder: self.child_policy_builder.clone(),
                 child_update: Some((update, None)),
             }
         });
@@ -262,9 +253,12 @@ mod test {
     use crate::client::ConnectivityState;
     use crate::client::RequestHeaders;
     use crate::client::load_balancing::ChannelController;
+    use crate::client::load_balancing::DynLbPolicy;
     use crate::client::load_balancing::FailingPicker;
     use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
     use crate::client::load_balancing::LbPolicy;
+    use crate::client::load_balancing::LbPolicyBuilder;
+    use crate::client::load_balancing::LbPolicyOptions;
     use crate::client::load_balancing::LbState;
     use crate::client::load_balancing::Pick;
     use crate::client::load_balancing::PickResult;
@@ -274,6 +268,7 @@ mod test {
     use crate::client::load_balancing::SubchannelState;
     use crate::client::load_balancing::child_manager::ChildManager;
     use crate::client::load_balancing::pick_first;
+    use crate::client::load_balancing::round_robin::RoundRobinBuilder;
     use crate::client::load_balancing::round_robin::RoundRobinPolicy;
     use crate::client::load_balancing::round_robin::{self};
     use crate::client::load_balancing::test_utils::StubPolicyData;
@@ -306,7 +301,7 @@ mod test {
     // 3. The controller to pass to the LB policy as part of the updates.
     type SetupResult = (
         mpsc::Receiver<TestEvent>,
-        RoundRobinPolicy,
+        RoundRobinPolicy<Box<DynLbPolicy>>,
         Box<dyn ChannelController>,
     );
 
@@ -376,8 +371,8 @@ mod test {
         let _ = lb_policy.resolver_update(update, None, tcc);
     }
 
-    fn send_resolver_error_to_policy(
-        lb_policy: &mut RoundRobinPolicy,
+    fn send_resolver_error_to_policy<P: LbPolicy>(
+        lb_policy: &mut RoundRobinPolicy<P>,
         err: String,
         tcc: &mut dyn ChannelController,
     ) {
@@ -1314,5 +1309,62 @@ mod test {
         lb_policy.subchannel_update(subchannels[2].clone(), &SubchannelState::idle(), tcc);
         lb_policy.subchannel_update(subchannels[3].clone(), &SubchannelState::ready(), tcc);
         verify_ready_picker(&mut rx_events, subchannels[3].clone());
+    }
+
+    #[tokio::test]
+    async fn roundrobin_builder_creates_pick_first_child() {
+        let (tx_events, rx_events) = mpsc::channel::<TestEvent>();
+        let mut tcc = TestChannelController {
+            tx_events: tx_events.clone(),
+        };
+        let builder = RoundRobinBuilder {};
+        let options = LbPolicyOptions {
+            work_scheduler: Arc::new(TestWorkScheduler { tx_events }),
+            runtime: default_runtime(),
+        };
+        let mut rr_policy = builder.build(options);
+
+        let endpoints = create_endpoints(2, 1);
+        let update = ResolverUpdate {
+            endpoints: Ok(endpoints),
+            ..Default::default()
+        };
+        rr_policy.resolver_update(update, None, &mut tcc).unwrap();
+
+        // Verify subchannels were created by PickFirst children.
+        let mut subchannels = Vec::new();
+        while subchannels.len() < 2 {
+            match rx_events.recv().unwrap() {
+                TestEvent::NewSubchannel(sc) => subchannels.push(sc),
+                TestEvent::Connect(_) => {}
+                TestEvent::UpdatePicker(_) => {}
+                other => panic!("unexpected event {:?}", other),
+            }
+        }
+        let sc1 = subchannels[0].clone();
+        let sc2 = subchannels[1].clone();
+        assert_ne!(sc1.address(), sc2.address());
+
+        // Move sc1 to Ready.
+        rr_policy.subchannel_update(
+            sc1.clone(),
+            &SubchannelState {
+                connectivity_state: ConnectivityState::Ready,
+                last_connection_error: None,
+            },
+            &mut tcc,
+        );
+
+        // Should receive picker update with Ready state.
+        let picker = loop {
+            if let TestEvent::UpdatePicker(state) = rx_events.recv().unwrap()
+                && state.connectivity_state == ConnectivityState::Ready
+            {
+                break state.picker;
+            }
+        };
+
+        let res = picker.pick(&crate::client::load_balancing::test_utils::new_request_headers());
+        assert_eq!(res.unwrap_pick().subchannel.address(), sc1.address());
     }
 }
