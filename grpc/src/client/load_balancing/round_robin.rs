@@ -45,7 +45,7 @@ use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::child_manager::ChildManager;
 use crate::client::load_balancing::child_manager::ChildUpdate;
 use crate::client::load_balancing::pick_first;
-use crate::client::load_balancing::pick_first::PickFirstPolicy;
+use crate::client::load_balancing::pick_first::PickFirstBuilder;
 use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::ResolverUpdate;
 
@@ -56,11 +56,11 @@ static START: Once = Once::new();
 pub struct RoundRobinBuilder {}
 
 impl LbPolicyBuilder for RoundRobinBuilder {
-    type LbPolicy = RoundRobinPolicy<PickFirstPolicy>;
+    type LbPolicy = RoundRobinPolicy<PickFirstBuilder>;
 
     fn build(&self, options: LbPolicyOptions) -> Self::LbPolicy {
         let child_manager = ChildManager::new(options.runtime, options.work_scheduler);
-        RoundRobinPolicy::new(child_manager, Arc::new(pick_first::PickFirstBuilder {}))
+        RoundRobinPolicy::new(child_manager, pick_first::PickFirstBuilder {})
     }
 
     fn name(&self) -> &'static str {
@@ -69,19 +69,16 @@ impl LbPolicyBuilder for RoundRobinBuilder {
 }
 
 #[derive(Debug)]
-pub struct RoundRobinPolicy<P: LbPolicy = PickFirstPolicy> {
-    child_manager: ChildManager<Endpoint, P>,
-    child_policy_builder: Arc<dyn LbPolicyBuilder<LbPolicy = P>>,
+pub struct RoundRobinPolicy<B: LbPolicyBuilder = PickFirstBuilder> {
+    child_manager: ChildManager<Endpoint, Arc<B>>,
+    child_policy_builder: Arc<B>,
 }
 
-impl<P: LbPolicy> RoundRobinPolicy<P> {
-    pub fn new(
-        child_manager: ChildManager<Endpoint, P>,
-        child_policy_builder: Arc<dyn LbPolicyBuilder<LbPolicy = P>>,
-    ) -> Self {
+impl<B: LbPolicyBuilder> RoundRobinPolicy<B> {
+    pub fn new(child_manager: ChildManager<Endpoint, Arc<B>>, child_policy_builder: B) -> Self {
         Self {
             child_manager,
-            child_policy_builder,
+            child_policy_builder: Arc::new(child_policy_builder),
         }
     }
 
@@ -147,7 +144,7 @@ impl<P: LbPolicy> RoundRobinPolicy<P> {
     }
 }
 
-impl<P: LbPolicy> LbPolicy for RoundRobinPolicy<P> {
+impl<B: LbPolicyBuilder> LbPolicy for RoundRobinPolicy<B> {
     type LbConfig = ();
     fn resolver_update(
         &mut self,
@@ -253,7 +250,7 @@ mod test {
     use crate::client::ConnectivityState;
     use crate::client::RequestHeaders;
     use crate::client::load_balancing::ChannelController;
-    use crate::client::load_balancing::DynLbPolicy;
+    use crate::client::load_balancing::DynLbPolicyBuilder;
     use crate::client::load_balancing::FailingPicker;
     use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
     use crate::client::load_balancing::LbPolicy;
@@ -301,7 +298,7 @@ mod test {
     // 3. The controller to pass to the LB policy as part of the updates.
     type SetupResult = (
         mpsc::Receiver<TestEvent>,
-        RoundRobinPolicy<Box<DynLbPolicy>>,
+        RoundRobinPolicy<Arc<DynLbPolicyBuilder>>,
         Box<dyn ChannelController>,
     );
 
@@ -371,8 +368,8 @@ mod test {
         let _ = lb_policy.resolver_update(update, None, tcc);
     }
 
-    fn send_resolver_error_to_policy<P: LbPolicy>(
-        lb_policy: &mut RoundRobinPolicy<P>,
+    fn send_resolver_error_to_policy<B: LbPolicyBuilder>(
+        lb_policy: &mut RoundRobinPolicy<B>,
         err: String,
         tcc: &mut dyn ChannelController,
     ) {

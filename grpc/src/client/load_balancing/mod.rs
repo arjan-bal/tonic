@@ -431,6 +431,25 @@ pub(crate) type DynLbPolicyBuilder = dyn LbPolicyBuilder<LbPolicy = Box<DynLbPol
 /// An LB policy that accepts dynamic configs.
 pub(crate) type DynLbPolicy = dyn LbPolicy<LbConfig = DynLbConfig>;
 
+impl<B: LbPolicyBuilder + ?Sized> LbPolicyBuilder for Arc<B> {
+    type LbPolicy = B::LbPolicy;
+
+    fn build(&self, options: LbPolicyOptions) -> Self::LbPolicy {
+        (**self).build(options)
+    }
+
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+
+    fn parse_config(
+        &self,
+        config: &ParsedJsonLbConfig,
+    ) -> Result<Option<<B::LbPolicy as LbPolicy>::LbConfig>, String> {
+        (**self).parse_config(config)
+    }
+}
+
 impl<T: LbPolicy + ?Sized> LbPolicy for Box<T> {
     type LbConfig = T::LbConfig;
 
