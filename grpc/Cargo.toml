@@ -51,6 +51,7 @@ __unstable = []
 gzip = ["dep:flate2"]
 
 [dependencies]
+auto_impl = { version = "1", default-features = false }
 base64 = "0.22"
 bytes = "1.10.1"
 flate2 = { version = "1.0", optional = true, default-features = false, features = [
