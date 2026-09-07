@@ -49,6 +49,7 @@ pub mod pick_first;
 pub mod registry;
 pub mod round_robin;
 pub mod subchannel;
+use auto_impl::auto_impl;
 pub use registry::GLOBAL_LB_REGISTRY;
 
 #[cfg(test)]
@@ -56,6 +57,7 @@ pub(crate) mod test_utils;
 
 /// An LB policy factory that produces LbPolicy instances used by the channel
 /// to manage connections and pick connections for RPCs.
+#[auto_impl(Arc)]
 pub trait LbPolicyBuilder: Send + Sync + Debug + 'static {
     type LbPolicy: LbPolicy;
 
@@ -88,6 +90,7 @@ pub trait LbPolicyBuilder: Send + Sync + Debug + 'static {
 /// LB policies are responsible for creating connections (modeled as
 /// Subchannels) and producing Picker instances for picking connections for
 /// RPCs.
+#[auto_impl(Box)]
 pub trait LbPolicy: Send + Sync + Debug + 'static {
     type LbConfig: Any + Send + Sync + Debug + 'static;
 
@@ -430,52 +433,3 @@ pub(crate) type DynLbPolicyBuilder = dyn LbPolicyBuilder<LbPolicy = Box<DynLbPol
 
 /// An LB policy that accepts dynamic configs.
 pub(crate) type DynLbPolicy = dyn LbPolicy<LbConfig = DynLbConfig>;
-
-impl<B: LbPolicyBuilder + ?Sized> LbPolicyBuilder for Arc<B> {
-    type LbPolicy = B::LbPolicy;
-
-    fn build(&self, options: LbPolicyOptions) -> Self::LbPolicy {
-        (**self).build(options)
-    }
-
-    fn name(&self) -> &'static str {
-        (**self).name()
-    }
-
-    fn parse_config(
-        &self,
-        config: &ParsedJsonLbConfig,
-    ) -> Result<Option<<B::LbPolicy as LbPolicy>::LbConfig>, String> {
-        (**self).parse_config(config)
-    }
-}
-
-impl<T: LbPolicy + ?Sized> LbPolicy for Box<T> {
-    type LbConfig = T::LbConfig;
-
-    fn resolver_update(
-        &mut self,
-        update: ResolverUpdate,
-        config: Option<&Self::LbConfig>,
-        channel_controller: &mut dyn ChannelController,
-    ) -> Result<(), String> {
-        (**self).resolver_update(update, config, channel_controller)
-    }
-
-    fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        (**self).subchannel_update(subchannel, state, channel_controller);
-    }
-
-    fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
-        (**self).work(data, channel_controller);
-    }
-
-    fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
-        (**self).exit_idle(channel_controller)
-    }
-}
