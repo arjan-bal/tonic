@@ -113,8 +113,6 @@ use tokio::time::Instant;
 
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::ChannelController;
-use crate::client::load_balancing::DynLbConfig;
-use crate::client::load_balancing::DynLbPolicyBuilder;
 use crate::client::load_balancing::FailingPicker;
 use crate::client::load_balancing::GLOBAL_LB_REGISTRY;
 use crate::client::load_balancing::LbPolicy;
@@ -129,7 +127,6 @@ use crate::client::load_balancing::child_manager::ChildUpdate;
 use crate::client::load_balancing::hierarchy;
 use crate::client::load_balancing::priority::child::ChildBuilder;
 use crate::client::load_balancing::priority::child::ChildConfig;
-use crate::client::load_balancing::registry::DynAdapter;
 use crate::client::load_balancing::subchannel::Subchannel;
 use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::name_resolution::ResolverUpdate;
@@ -231,11 +228,8 @@ impl PriorityConfig {
 struct ChildData {
     /// The current lifecycle and connectivity state of the child policy.
     state: ChildState,
-    /// Policy builder adapter used to instantiate the child in
-    /// [`ChildManager`].
-    child_builder: Arc<DynLbPolicyBuilder>,
     /// The active dynamic LB configuration for this child.
-    child_config: DynLbConfig,
+    child_config: ChildConfig,
     /// The latest name resolver update received for this child.
     ///
     /// Preserved so that if this child is deactivated and later reactivated,
@@ -405,7 +399,7 @@ impl LbPolicyBuilder for Builder {
 /// Manages a prioritized collection of child policies.
 #[derive(Debug)]
 struct PriorityPolicy {
-    child_mgr: ChildManager<String>,
+    child_mgr: ChildManager<String, ChildBuilder>,
     child_data: HashMap<String, ChildData>,
     /// Current priority hierarchy: list of child names sorted from highest
     /// priority (0) to lowest.
@@ -456,7 +450,7 @@ impl LbPolicy for PriorityPolicy {
             match self.child_data.entry(k.clone()) {
                 Entry::Occupied(mut entry) => {
                     let data = entry.get_mut();
-                    data.child_config = Arc::new(child_cfg.clone());
+                    data.child_config = child_cfg.clone();
                     data.latest_update = resolver_update.clone();
 
                     if !matches!(data.state, ChildState::Uninitialized) {
@@ -468,8 +462,7 @@ impl LbPolicy for PriorityPolicy {
                 Entry::Vacant(entry) => {
                     entry.insert(ChildData {
                         state: ChildState::Uninitialized,
-                        child_config: Arc::new(child_cfg.clone()),
-                        child_builder: DynAdapter::new_arc(ChildBuilder {}),
+                        child_config: child_cfg.clone(),
                         latest_update: resolver_update,
                     });
                 }
@@ -485,7 +478,7 @@ impl LbPolicy for PriorityPolicy {
                 );
                 ChildUpdate {
                     child_identifier: child_id,
-                    child_policy_builder: data.child_builder.clone(),
+                    child_policy_builder: ChildBuilder {},
                     child_update: Some((resolver_update, Some(&data.child_config))),
                 }
             });
@@ -815,7 +808,7 @@ impl PriorityPolicy {
                 };
                 ChildUpdate {
                     child_identifier: id.clone(),
-                    child_policy_builder: data.child_builder.clone(),
+                    child_policy_builder: ChildBuilder {},
                     child_update: update,
                 }
             });
@@ -861,7 +854,7 @@ impl PriorityPolicy {
             .child_data
             .iter()
             .filter(|(_, cd)| !matches!(cd.state, ChildState::Uninitialized))
-            .map(|(id, data)| (id.clone(), data.child_builder.clone()));
+            .map(|(id, data)| (id.clone(), ChildBuilder {}));
 
         self.child_mgr.retain_children(iter);
     }

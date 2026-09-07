@@ -91,7 +91,7 @@ pub static GLOBAL_LB_REGISTRY: LazyLock<LbPolicyRegistry> = LazyLock::new(|| {
 /// Implements `DynLbPolicy` and `DynLbPolicyBuilder` around the enclosed
 /// `LbPolicy` or `LbPolicyBuilder`, respectively.
 #[derive(Debug)]
-pub(crate) struct DynAdapter<T>(T);
+struct DynAdapter<T>(T);
 
 impl<T: LbPolicyBuilder> LbPolicyBuilder for DynAdapter<T> {
     type LbPolicy = Box<DynLbPolicy>;
@@ -148,7 +148,7 @@ impl<T: LbPolicy> LbPolicy for DynAdapter<T> {
 }
 
 impl<T> DynAdapter<T> {
-    pub(crate) fn new_arc(policy: T) -> Arc<Self> {
+    fn new_arc(policy: T) -> Arc<Self> {
         Arc::new(DynAdapter(policy))
     }
 }
