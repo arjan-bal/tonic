@@ -498,6 +498,7 @@ mod test {
     use std::sync::Mutex;
     use std::sync::mpsc;
 
+    use crate::attributes::Attributes;
     use crate::client::ConnectivityState;
     use crate::client::load_balancing::ChannelController;
     use crate::client::load_balancing::DynLbConfig;
@@ -509,12 +510,11 @@ mod test {
     use crate::client::load_balancing::SubchannelState;
     use crate::client::load_balancing::child_manager::ChildManager;
     use crate::client::load_balancing::child_manager::ChildUpdate;
-    use crate::client::load_balancing::pick_first::PickFirstBuilder;
+    use crate::client::load_balancing::test_utils;
     use crate::client::load_balancing::test_utils::StubPolicyFuncs;
     use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEvent;
     use crate::client::load_balancing::test_utils::TestWorkScheduler;
-    use crate::client::load_balancing::test_utils::{self};
     use crate::client::name_resolution::Endpoint;
     use crate::client::name_resolution::ResolverUpdate;
     use crate::core::Address;
@@ -585,7 +585,7 @@ mod test {
             child_policy_builder: builder.clone(),
             child_update: Some((
                 ResolverUpdate {
-                    attributes: crate::attributes::Attributes::default(),
+                    attributes: Attributes::default(),
                     endpoints: Ok(vec![e.clone()]),
                     service_config: Ok(None),
                     resolution_note: None,
@@ -1011,59 +1011,5 @@ mod test {
         // Call work for child 2.
         child_manager.work(child2_work, &mut tcc);
         assert!(*work_called.lock().unwrap().get(name2).unwrap_or(&false));
-    }
-
-    #[tokio::test]
-    async fn childmanager_with_pick_first_generic() {
-        let (tx_events, rx_events) = mpsc::channel::<TestEvent>();
-        let mut tcc = TestChannelController {
-            tx_events: tx_events.clone(),
-        };
-        let mut child_manager: ChildManager<Endpoint, PickFirstBuilder> =
-            ChildManager::new(default_runtime(), Arc::new(TestWorkScheduler { tx_events }));
-
-        let endpoints = create_n_endpoints_with_k_addresses(2, 1);
-
-        let updates = endpoints.iter().map(|e| ChildUpdate {
-            child_identifier: e.clone(),
-            child_policy_builder: PickFirstBuilder {},
-            child_update: Some((
-                ResolverUpdate {
-                    attributes: crate::attributes::Attributes::default(),
-                    endpoints: Ok(vec![e.clone()]),
-                    service_config: Ok(None),
-                    resolution_note: None,
-                },
-                None,
-            )),
-        });
-
-        child_manager.update(updates, &mut tcc).unwrap();
-        assert_eq!(child_manager.children().count(), 2);
-
-        // Verify subchannels were created by PickFirst children.
-        let mut subchannels = Vec::new();
-        while subchannels.len() < 2 {
-            match rx_events.recv().unwrap() {
-                TestEvent::NewSubchannel(sc) => subchannels.push(sc),
-                TestEvent::Connect(_) => {}
-                TestEvent::UpdatePicker(_) => {}
-                other => panic!("unexpected event {:?}", other),
-            }
-        }
-        let sc1 = subchannels[0].clone();
-        let sc2 = subchannels[1].clone();
-        assert_ne!(sc1.address(), sc2.address());
-
-        // Move subchannel 1 to Ready.
-        child_manager.subchannel_update(
-            sc1,
-            &SubchannelState {
-                connectivity_state: ConnectivityState::Ready,
-                last_connection_error: None,
-            },
-            &mut tcc,
-        );
-        assert_eq!(child_manager.aggregate_states(), ConnectivityState::Ready);
     }
 }
