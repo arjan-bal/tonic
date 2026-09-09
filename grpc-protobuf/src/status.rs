@@ -224,6 +224,10 @@ impl StatusError {
 }
 
 /// Represents a gRPC error status on the server.
+///
+/// This is a separate type from [`StatusError`] to prevent accidental
+/// conversion and leaking of sensitive information from the server to the
+/// client.
 #[derive(Debug, Clone)]
 pub struct ServerStatusError(StatusError);
 
@@ -242,6 +246,10 @@ impl ServerStatusError {
     }
 
     /// Creates a new [`ServerStatusError`] from a [`StatusError`].
+    ///
+    /// The [`From`] trait is intentionally not implemented to ensure a client
+    /// error cannot be accidentally propagated using the `?` operator without
+    /// explicit conversion, potentially leaking sensitive metadata.
     pub fn from_status(status: StatusError) -> Self {
         ServerStatusError(status)
     }
@@ -267,6 +275,10 @@ impl ServerStatusError {
     }
 
     /// Converts the [`ServerStatusError`] to a [`StatusError`] for client responses.
+    ///
+    /// The [`From`] trait is intentionally not implemented to ensure a client
+    /// error cannot be accidentally propagated using the `?` operator without
+    /// explicit conversion, potentially leaking sensitive metadata.
     pub(crate) fn into_status(self) -> StatusError {
         self.0
     }

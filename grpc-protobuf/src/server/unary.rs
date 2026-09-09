@@ -92,7 +92,10 @@ where
         tx: &mut dyn DynSendStream,
         mut rx: Box<dyn DynRecvStream>,
     ) -> Trailers {
+        // TODO: Allocate both the request and response messages together in an
+        // arena.
         let mut req = <M::Request as Default>::default();
+        let mut resp = <M::Response as Default>::default();
 
         if rx
             .dyn_next(&mut ProtoRecvMessage::from_mut(&mut req))
@@ -105,7 +108,6 @@ where
             )));
         }
 
-        let mut resp = <M::Response as Default>::default();
         let status = self
             .method
             .call(req.as_view(), resp.as_mut())
