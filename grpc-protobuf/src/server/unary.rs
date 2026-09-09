@@ -69,11 +69,11 @@ pub trait UnaryMethod: Sync + 'static {
 }
 
 /// An adapter that wraps a [`UnaryMethod`] to handle incoming unary RPCs.
-pub struct UnaryAdapter<M: UnaryMethod> {
+pub struct UnaryAdapter<M> {
     method: M,
 }
 
-impl<M: UnaryMethod> UnaryAdapter<M> {
+impl<M> UnaryAdapter<M> {
     /// Creates a new [`UnaryAdapter`] wrapping the given `method`.
     pub fn new(method: M) -> Self {
         Self { method }

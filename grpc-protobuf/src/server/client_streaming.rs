@@ -66,11 +66,11 @@ pub trait ClientStreamingMethod: Sync + 'static {
 
 /// An adapter that wraps a [`ClientStreamingMethod`] to handle incoming
 /// client-streaming RPCs.
-pub struct ClientStreamingAdapter<M: ClientStreamingMethod> {
+pub struct ClientStreamingAdapter<M> {
     method: M,
 }
 
-impl<M: ClientStreamingMethod> ClientStreamingAdapter<M> {
+impl<M> ClientStreamingAdapter<M> {
     /// Creates a new [`ClientStreamingAdapter`] wrapping the given `method`.
     pub fn new(method: M) -> Self {
         Self { method }

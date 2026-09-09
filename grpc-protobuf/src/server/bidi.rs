@@ -61,11 +61,11 @@ pub trait BidiStreamingMethod: Sync + 'static {
 
 /// An adapter that wraps a [`BidiStreamingMethod`] to handle incoming
 /// bidirectional-streaming RPCs.
-pub struct BidiStreamingAdapter<M: BidiStreamingMethod> {
+pub struct BidiStreamingAdapter<M> {
     method: M,
 }
 
-impl<M: BidiStreamingMethod> BidiStreamingAdapter<M> {
+impl<M> BidiStreamingAdapter<M> {
     /// Creates a new [`BidiStreamingAdapter`] wrapping the given `method`.
     pub fn new(method: M) -> Self {
         Self { method }
