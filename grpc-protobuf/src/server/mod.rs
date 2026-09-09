@@ -99,8 +99,8 @@ where
         &mut self,
         req: &mut impl AsMut<MutProxied = M>,
     ) -> Option<Result<(), ()>> {
-        let mut res_view = ProtoRecvMessage::from_mut(req);
-        self.rx.dyn_next(&mut res_view).await
+        let mut req_view = ProtoRecvMessage::from_mut(req);
+        self.rx.dyn_next(&mut req_view).await
     }
 
     /// Receives the next request message from the stream.
