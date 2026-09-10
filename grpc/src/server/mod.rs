@@ -57,7 +57,11 @@ use crate::core::SendMessage;
 use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
 
+pub mod builder;
+pub mod descriptor;
 pub(crate) mod interceptor;
+pub(crate) mod router;
+pub mod service;
 
 /// Settings to configure RPCs sent using the [`Handle`] trait.
 ///
@@ -188,20 +192,22 @@ impl GracefulCoordinator {
 }
 
 impl Server {
-    /// Creates a new server with no handler.
-    pub fn new() -> Self {
+    /// Creates a [`ServerBuilder`](builder::ServerBuilder) with no interceptors.
+    pub fn builder() -> builder::ServerBuilder<interceptor::Identity> {
+        builder::ServerBuilder::new()
+    }
+
+    /// Creates a new server with the given handler and runtime.
+    pub(crate) fn new(handler: impl Handle + 'static, runtime: GrpcRuntime) -> Self {
         Self {
-            handler: None,
-            runtime: crate::rt::default_runtime(),
+            handler: Some(Arc::new(handler)),
+            runtime,
         }
     }
 
-    /// Sets the RPC handler for this server.
-    pub fn set_handler<H>(&mut self, h: H)
-    where
-        H: Handle + Send + Sync + 'static,
-    {
-        self.handler = Some(Arc::new(h))
+    /// Returns the runtime used by this server.
+    pub fn runtime(&self) -> &GrpcRuntime {
+        &self.runtime
     }
 
     /// Serves on the given listener until it stops producing connections.
@@ -271,7 +277,10 @@ impl Server {
 
 impl Default for Server {
     fn default() -> Self {
-        Self::new()
+        Self {
+            handler: None,
+            runtime: crate::rt::default_runtime(),
+        }
     }
 }
 
@@ -640,7 +649,6 @@ mod tests {
 
     use super::*;
     use crate::core::test_connection_info;
-
     /// A mock connection whose completion is controlled by a [`Notify`],
     /// and which records whether [`graceful_shutdown`] was called.
     struct MockConnection {
@@ -739,7 +747,7 @@ mod tests {
     #[tokio::test]
     async fn server_stops_on_shutdown_signal() {
         let listener = crate::inmemory::InMemoryListener::new();
-        let server = Server::new();
+        let server = Server::builder().build();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -765,7 +773,7 @@ mod tests {
     #[tokio::test]
     async fn server_stops_when_listener_closes() {
         let listener = crate::inmemory::InMemoryListener::new();
-        let server = Server::new();
+        let server = Server::builder().build();
 
         let listener_for_serve = listener.clone();
         let server_handle = tokio::spawn(async move {
@@ -809,7 +817,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_serve_future_force_closes_connection() {
         let listener = crate::inmemory::InMemoryListener::new();
-        let server = Server::new();
+        let server = Server::builder().build();
 
         // A never-resolving signal future (we won't signal gracefully, we will drop the serve future directly).
         let (_signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
@@ -969,7 +977,7 @@ mod tests {
                 let rx = BoxedRecvStream(Box::new(NopRecvStream));
                 let _ = handler
                     .dyn_handle(
-                        RequestHeaders::new("", test_connection_info()),
+                        RequestHeaders::new("/test.Draining/Method", test_connection_info()),
                         CallOptions::new(),
                         &mut tx,
                         rx,
@@ -983,12 +991,12 @@ mod tests {
     #[tokio::test]
     async fn listener_dropped_when_shutdown_signal_fires() {
         let (listener, dropped, _tx) = MockListener::new();
-        let server = Server::new();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server_handle = tokio::spawn(async move {
-            server
+            Server::builder()
+                .build()
                 .serve_with_shutdown(listener, async {
                     let _ = shutdown_rx.await;
                 })
@@ -1019,10 +1027,11 @@ mod tests {
         use crate::server::RequestHeaders;
         use crate::server::SendStream;
         use crate::server::Trailers;
+        use crate::server::descriptor::MethodDescriptor;
+        use crate::server::descriptor::ServiceDescriptor;
+        use crate::server::service::Service;
 
         let (listener, dropped, tx) = MockListener::new();
-
-        let mut server = Server::new();
 
         let handler_started = Arc::new(AtomicBool::new(false));
         let (unblock_tx, unblock_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1049,10 +1058,36 @@ mod tests {
             }
         }
 
-        server.set_handler(DrainingHandler {
-            started: handler_started.clone(),
-            unblock: unblock_rx,
-        });
+        struct DrainingService {
+            started: Arc<AtomicBool>,
+            unblock: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+        }
+
+        impl Service for DrainingService {
+            fn descriptor(&self) -> ServiceDescriptor {
+                ServiceDescriptor::new(
+                    "test.Draining",
+                    vec![MethodDescriptor::new("/test.Draining/Method")],
+                )
+            }
+
+            fn register_methods(self) -> Vec<(String, Arc<dyn DynHandle>)> {
+                vec![(
+                    "/test.Draining/Method".to_string(),
+                    Arc::new(DrainingHandler {
+                        started: self.started,
+                        unblock: self.unblock,
+                    }),
+                )]
+            }
+        }
+
+        let server = Server::builder()
+            .add_service(DrainingService {
+                started: handler_started.clone(),
+                unblock: unblock_rx,
+            })
+            .build();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
