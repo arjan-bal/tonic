@@ -27,10 +27,15 @@ use grpc::server::CallOptions;
 use grpc::server::DynHandle;
 use grpc::server::DynRecvStream;
 use grpc::server::DynSendStream;
+use grpc::server::Handle;
+use grpc::server::RecvStream;
 use grpc::server::RequestHeaders;
 use grpc::server::ResponseStreamItem;
 use grpc::server::SendOptions;
+use grpc::server::SendStream;
 use grpc::server::Trailers;
+use grpc::server::interceptor::Intercept;
+use grpc::server::stream_util::RequestValidator;
 use protobuf::AsMut;
 use protobuf::Message;
 use protobuf::MutProxied;
@@ -67,13 +72,15 @@ pub trait ClientStreamingMethod: Sync + 'static {
 /// An adapter that wraps a [`ClientStreamingMethod`] to handle incoming
 /// client-streaming RPCs.
 pub struct ClientStreamingAdapter<M> {
-    method: M,
+    handle: InnerHandler<M>,
 }
 
 impl<M> ClientStreamingAdapter<M> {
     /// Creates a new [`ClientStreamingAdapter`] wrapping the given `method`.
     pub fn new(method: M) -> Self {
-        Self { method }
+        Self {
+            handle: InnerHandler { method },
+        }
     }
 }
 
@@ -84,12 +91,37 @@ where
 {
     async fn dyn_handle(
         &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+        mut tx: &mut dyn DynSendStream,
+        rx: Box<dyn DynRecvStream + 'static>,
+    ) -> Trailers {
+        RequestValidator::new(false)
+            .intercept(headers, options, &mut tx, rx, &self.handle)
+            .make_send()
+            .await
+    }
+}
+
+struct InnerHandler<M> {
+    method: M,
+}
+
+impl<M> Handle for InnerHandler<M>
+where
+    M: ClientStreamingMethod,
+{
+    async fn handle(
+        &self,
         _headers: RequestHeaders,
         _options: CallOptions,
-        tx: &mut dyn DynSendStream,
-        rx: Box<dyn DynRecvStream>,
+        tx: &mut impl SendStream,
+        rx: impl RecvStream + 'static,
     ) -> Trailers {
-        let requests = GrpcStreamingRequest::new(rx);
+        // TODO: See if we can avoid the Box here. We could have InnerHandler
+        // implement DynHandle, however, intercepting a DynHandle would also
+        // result in a Box.
+        let requests = GrpcStreamingRequest::new(Box::new(rx));
         let mut resp = <M::Response as Default>::default();
         let status = self.method.call(requests, resp.as_mut()).make_send().await;
 
@@ -97,11 +129,90 @@ where
             let send = ProtoSendMessage::from_view(&resp);
             let mut options = SendOptions::default();
             options.final_msg = true;
-            let _ = tx
-                .dyn_send(ResponseStreamItem::Message(&send), options)
-                .await;
+            // Ignore the send result. If sending fails, the status would not be
+            // transmitted anyways..
+            let _ = tx.send(ResponseStreamItem::Message(&send), options).await;
         }
 
         trailers_from_status(status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    use grpc::core::Address;
+    use grpc::core::ConnectionInfo;
+    use grpc::core::RecvMessage;
+    use grpc::credentials::SecurityInfo;
+    use protobuf_well_known_types::Any;
+
+    use super::*;
+
+    struct TestClientStreamingMethod {
+        called: Arc<AtomicBool>,
+    }
+
+    impl ClientStreamingMethod for TestClientStreamingMethod {
+        type Request = Any;
+        type Response = Any;
+
+        async fn call(
+            &self,
+            mut requests: GrpcStreamingRequest<Self::Request>,
+            _response: <Self::Response as MutProxied>::Mut<'_>,
+        ) -> ServerStatus {
+            self.called.store(true, Ordering::SeqCst);
+            assert!(requests.recv().await.is_none());
+            Ok(())
+        }
+    }
+
+    struct MockSendStream;
+
+    impl SendStream for MockSendStream {
+        async fn send<'a>(
+            &mut self,
+            _item: ResponseStreamItem<'a>,
+            _options: SendOptions,
+        ) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    struct EmptyRecvStream;
+
+    impl RecvStream for EmptyRecvStream {
+        async fn next(&mut self, _msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn test_client_streaming_empty_stream_success() {
+        let called = Arc::new(AtomicBool::new(false));
+        let adapter = ClientStreamingAdapter::new(TestClientStreamingMethod {
+            called: called.clone(),
+        });
+
+        let connection_info = ConnectionInfo::new(
+            Address::default(),
+            Address::default(),
+            SecurityInfo::new(""),
+        );
+        let headers = RequestHeaders::new("/test.TestService/TestMethod", connection_info);
+
+        let mut tx = MockSendStream;
+        let rx: Box<dyn DynRecvStream> = Box::new(EmptyRecvStream);
+
+        let trailers = adapter
+            .dyn_handle(headers, CallOptions::default(), &mut tx, rx)
+            .await;
+
+        assert!(trailers.status().is_ok());
+        assert!(called.load(Ordering::SeqCst));
     }
 }

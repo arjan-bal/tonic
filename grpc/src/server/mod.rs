@@ -56,7 +56,7 @@ use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
 use crate::send_future::SendFuture;
 
-pub(crate) mod interceptor;
+pub mod interceptor;
 pub mod stream_util;
 
 /// Settings to configure RPCs sent using the [`Handle`] trait.

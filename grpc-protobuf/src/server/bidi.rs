@@ -27,10 +27,16 @@ use grpc::server::CallOptions;
 use grpc::server::DynHandle;
 use grpc::server::DynRecvStream;
 use grpc::server::DynSendStream;
+use grpc::server::Handle;
+use grpc::server::RecvStream;
 use grpc::server::RequestHeaders;
+use grpc::server::SendStream;
 use grpc::server::Trailers;
+use grpc::server::interceptor::Intercept;
+use grpc::server::stream_util::RequestValidator;
 use protobuf::Message;
 
+use crate::SendFuture;
 use crate::ServerStatus;
 use crate::server::GrpcStreamingRequest;
 use crate::server::GrpcStreamingResponse;
@@ -62,13 +68,15 @@ pub trait BidiStreamingMethod: Sync + 'static {
 /// An adapter that wraps a [`BidiStreamingMethod`] to handle incoming
 /// bidirectional-streaming RPCs.
 pub struct BidiStreamingAdapter<M> {
-    method: M,
+    handle: InnerHandler<M>,
 }
 
 impl<M> BidiStreamingAdapter<M> {
     /// Creates a new [`BidiStreamingAdapter`] wrapping the given `method`.
     pub fn new(method: M) -> Self {
-        Self { method }
+        Self {
+            handle: InnerHandler { method },
+        }
     }
 }
 
@@ -79,17 +87,123 @@ where
 {
     async fn dyn_handle(
         &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+        mut tx: &mut dyn DynSendStream,
+        rx: Box<dyn DynRecvStream + 'static>,
+    ) -> Trailers {
+        RequestValidator::new(false)
+            .intercept(headers, options, &mut tx, rx, &self.handle)
+            .make_send()
+            .await
+    }
+}
+
+struct InnerHandler<M> {
+    method: M,
+}
+
+impl<M> Handle for InnerHandler<M>
+where
+    M: BidiStreamingMethod,
+{
+    async fn handle(
+        &self,
         _headers: RequestHeaders,
         _options: CallOptions,
-        tx: &mut dyn DynSendStream,
-        rx: Box<dyn DynRecvStream>,
+        tx: &mut impl SendStream,
+        rx: impl RecvStream + 'static,
     ) -> Trailers {
         // The request stream owns `rx`; the response sink borrows `tx`. They
         // are independent, so a handler can freely interleave receives and
         // sends.
-        let requests = GrpcStreamingRequest::new(rx);
-        let responses = GrpcStreamingResponse::new(tx);
+        // TODO: See if we can avoid the Box here. We could have InnerHandler
+        // implement DynHandle, however, intercepting a DynHandle would also
+        // result in a Box.
+        let requests = GrpcStreamingRequest::new(Box::new(rx));
+        let responses = GrpcStreamingResponse::new(&mut *tx);
         let status = self.method.call(requests, responses).await;
         trailers_from_status(status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    use grpc::core::Address;
+    use grpc::core::ConnectionInfo;
+    use grpc::core::RecvMessage;
+    use grpc::credentials::SecurityInfo;
+    use grpc::server::ResponseStreamItem;
+    use grpc::server::SendOptions;
+    use protobuf_well_known_types::Any;
+
+    use super::*;
+
+    struct TestBidiStreamingMethod {
+        called: Arc<AtomicBool>,
+    }
+
+    impl BidiStreamingMethod for TestBidiStreamingMethod {
+        type Request = Any;
+        type Response = Any;
+
+        async fn call(
+            &self,
+            mut requests: GrpcStreamingRequest<Self::Request>,
+            _responses: GrpcStreamingResponse<'_, Self::Response>,
+        ) -> ServerStatus {
+            self.called.store(true, Ordering::SeqCst);
+            assert!(requests.recv().await.is_none());
+            Ok(())
+        }
+    }
+
+    struct MockSendStream;
+
+    impl SendStream for MockSendStream {
+        async fn send<'a>(
+            &mut self,
+            _item: ResponseStreamItem<'a>,
+            _options: SendOptions,
+        ) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    struct EmptyRecvStream;
+
+    impl RecvStream for EmptyRecvStream {
+        async fn next(&mut self, _msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bidi_streaming_empty_stream_success() {
+        let called = Arc::new(AtomicBool::new(false));
+        let adapter = BidiStreamingAdapter::new(TestBidiStreamingMethod {
+            called: called.clone(),
+        });
+
+        let connection_info = ConnectionInfo::new(
+            Address::default(),
+            Address::default(),
+            SecurityInfo::new(""),
+        );
+        let headers = RequestHeaders::new("/test.TestService/TestMethod", connection_info);
+
+        let mut tx = MockSendStream;
+        let rx: Box<dyn DynRecvStream> = Box::new(EmptyRecvStream);
+
+        let trailers = adapter
+            .dyn_handle(headers, CallOptions::default(), &mut tx, rx)
+            .await;
+
+        assert!(trailers.status().is_ok());
+        assert!(called.load(Ordering::SeqCst));
     }
 }
