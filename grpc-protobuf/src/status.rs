@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn test_status_debug() {
         let status = StatusError::new(StatusCodeError::Cancelled, "not ok");
-        let debug = format!("{:?}", status);
+        let debug = format!("{status:?}");
         assert!(debug.contains("Status"));
         assert!(debug.contains("Cancelled"));
         assert!(debug.contains("not ok"));

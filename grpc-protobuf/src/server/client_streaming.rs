@@ -118,9 +118,9 @@ where
         tx: &mut impl SendStream,
         rx: impl RecvStream + 'static,
     ) -> Trailers {
-        // TODO: See if we can avoid the Box here. We could have InnerHandler
-        // implement DynHandle, however, intercepting a DynHandle would also
-        // result in a Box.
+        // TODO: See if we can avoid the Box here. Because GrpcStreamingRequest
+        // requires an owned, type-erased stream, wrapping the incoming stream
+        // with an interceptor forces a second Box allocation.
         let requests = GrpcStreamingRequest::new(Box::new(rx));
         let mut resp = <M::Response as Default>::default();
         let status = self.method.call(requests, resp.as_mut()).make_send().await;

@@ -80,7 +80,7 @@ fn parse_rpc_status(buf: &[u8]) -> StatusOr<StatusError> {
     let rpc_status = google_rpc::Status::parse(buf).map_err(|e| {
         StatusError::new(
             StatusCodeError::Internal,
-            format!("Failed to parse grpc-status-details-bin: {}", e),
+            format!("Failed to parse grpc-status-details-bin: {e}"),
         )
     })?;
     let code_i32 = rpc_status.code();
@@ -153,7 +153,7 @@ fn encode_rpc_status(
     rpc_status.serialize().map_err(|e| {
         grpc::StatusError::new(
             grpc::StatusCodeError::Internal,
-            format!("Failed to serialize grpc-status-details-bin: {}", e),
+            format!("Failed to serialize grpc-status-details-bin: {e}"),
         )
     })
 }

@@ -141,6 +141,7 @@ where
     ///
     /// Note: success does *not* indicate successful receipt of the response by
     /// the client; it only indicates that the stream has not yet terminated.
+    #[allow(clippy::result_unit_err)]
     pub async fn send(&mut self, resp: &impl AsView<Proxied = M>) -> Result<(), ()> {
         self.tx
             .dyn_send(

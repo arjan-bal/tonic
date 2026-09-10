@@ -138,7 +138,11 @@ where
             )));
         }
 
-        let status = self.method.call(req.as_view(), resp.as_mut()).await;
+        let status = self
+            .method
+            .call(req.as_view(), resp.as_mut())
+            .make_send()
+            .await;
 
         if status.is_ok() {
             let send = ProtoSendMessage::from_view(&resp);

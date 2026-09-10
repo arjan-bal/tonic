@@ -117,9 +117,9 @@ where
         // The request stream owns `rx`; the response sink borrows `tx`. They
         // are independent, so a handler can freely interleave receives and
         // sends.
-        // TODO: See if we can avoid the Box here. We could have InnerHandler
-        // implement DynHandle, however, intercepting a DynHandle would also
-        // result in a Box.
+        // TODO: See if we can avoid the Box here. Because GrpcStreamingRequest
+        // requires an owned, type-erased stream, wrapping the incoming stream
+        // with an interceptor forces a second Box allocation.
         let requests = GrpcStreamingRequest::new(Box::new(rx));
         let responses = GrpcStreamingResponse::new(&mut *tx);
         let status = self.method.call(requests, responses).await;

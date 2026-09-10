@@ -37,16 +37,14 @@ use crate::server::SendStream;
 use crate::server::Trailers;
 use crate::server::interceptor::Intercept;
 
-/// An interceptor that wraps the incoming request [`RecvStream`] in a
-/// [`RecvStreamValidator`].
+/// Intercepts a server's [`Handle`] and performs protocol validation on it.
 #[derive(Debug)]
 pub struct RequestValidator {
     is_unary: bool,
 }
 
 impl RequestValidator {
-    /// Creates an instance of a `RequestValidator` that wraps incoming
-    /// [`RecvStream`]s in a [`RecvStreamValidator`].
+    /// Creates an instance of a `RequestValidator`.
     pub fn new(is_unary: bool) -> Self {
         RequestValidator { is_unary }
     }
@@ -79,7 +77,6 @@ enum RecvStreamState {
     Errored,
 }
 
-/// Wraps a server's [`RecvStream`] and performs protocol validation on it.
 struct RecvStreamValidator<R> {
     recv_stream: R,
     state: RecvStreamState,
