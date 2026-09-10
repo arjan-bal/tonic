@@ -57,6 +57,7 @@ use crate::rt::GrpcRuntime;
 use crate::send_future::SendFuture;
 
 pub(crate) mod interceptor;
+pub mod stream_util;
 
 /// Settings to configure RPCs sent using the [`Handle`] trait.
 ///
@@ -425,6 +426,9 @@ pub trait RecvStream {
     /// `None` and `Some(Err(()))` are terminal states.
     /// Calling this method again after reaching a terminal state is unspecified
     /// and should be avoided.
+    ///
+    /// The provided `msg` must not be modified if the stream has ended, i.e. `None`
+    /// is returned.
     ///
     /// # Cancel safety
     ///
