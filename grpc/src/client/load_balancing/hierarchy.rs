@@ -94,7 +94,7 @@ struct HierarchicalPath {
 }
 
 impl HierarchicalPath {
-    pub(crate) fn new(parts: Vec<String>) -> Self {
+    fn new(parts: Vec<String>) -> Self {
         Self {
             parts: ArcSlice::new(parts),
         }
