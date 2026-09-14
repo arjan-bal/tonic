@@ -37,7 +37,6 @@
 //!
 //! # Additional Types
 //!
-//! - **[`Call`]:** Represents an incoming RPC accepted by a [`Listener`].
 //! - **[`SendStream`] / [`RecvStream`]:** Represent the sending and receiving
 //!   sides of a server-side RPC.
 //! - **[`RequestHeaders`]:** Represents gRPC headers sent by the client to
@@ -49,14 +48,24 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tonic::async_trait;
+use tokio::sync::watch;
 
+use crate::async_trait;
+use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::metadata::MetadataMap;
 use crate::rt::GrpcRuntime;
+use crate::send_future::SendFuture;
 
+pub mod builder;
+pub mod descriptor;
 pub(crate) mod interceptor;
+pub(crate) mod router;
+pub mod service;
+
+use builder::ServerBuilder;
+use interceptor::Identity;
 
 /// Settings to configure RPCs sent using the [`Handle`] trait.
 ///
@@ -148,12 +157,12 @@ pub trait Transport: Send + 'static {
 /// Each connection is watched via `watch()`. When `shutdown()` is called,
 /// all watched connections receive a `graceful_shutdown()` signal.
 struct GracefulCoordinator {
-    tx: tokio::sync::watch::Sender<()>,
+    tx: watch::Sender<()>,
 }
 
 impl GracefulCoordinator {
     fn new() -> Self {
-        let (tx, _) = tokio::sync::watch::channel(());
+        let (tx, _) = watch::channel(());
         Self { tx }
     }
 
@@ -187,20 +196,22 @@ impl GracefulCoordinator {
 }
 
 impl Server {
-    /// Creates a new server with no handler.
-    pub fn new() -> Self {
+    /// Creates a new [`ServerBuilder`] with a no-op interceptor.
+    pub fn builder() -> ServerBuilder<Identity> {
+        ServerBuilder::new()
+    }
+
+    /// Creates a new server with the given handler and runtime.
+    pub(crate) fn new(handler: impl Handle + 'static, runtime: GrpcRuntime) -> Self {
         Self {
-            handler: None,
-            runtime: crate::rt::default_runtime(),
+            handler: Some(Arc::new(handler)),
+            runtime,
         }
     }
 
-    /// Sets the RPC handler for this server.
-    pub fn set_handler<H>(&mut self, h: H)
-    where
-        H: Handle + Send + Sync + 'static,
-    {
-        self.handler = Some(Arc::new(h))
+    /// Returns the runtime used by this server.
+    pub fn runtime(&self) -> &GrpcRuntime {
+        &self.runtime
     }
 
     /// Serves on the given listener until it stops producing connections.
@@ -270,7 +281,10 @@ impl Server {
 
 impl Default for Server {
     fn default() -> Self {
-        Self::new()
+        Self {
+            handler: None,
+            runtime: crate::rt::default_runtime(),
+        }
     }
 }
 
@@ -311,30 +325,11 @@ impl<T: Handle> DynHandle for T {
         mut tx: &mut dyn DynSendStream,
         rx: BoxedRecvStream,
     ) -> Trailers {
-        self.handle(headers, options, &mut tx, rx).await
+        self.handle(headers, options, &mut tx, rx).make_send().await
     }
 }
 
-// TODO: delete this type which is only needed pre-rust v1.92 due to a bug
-// handling lifetimes:
-//
-// error: implementation of `server::RecvStream` is not general enough
-//    --> grpc/src/server/mod.rs:108:5
-//     |
-// 108 |     async fn dyn_handle(
-//     |     ^^^^^ implementation of `server::RecvStream` is not general enough
-//     |
-//     = note: `Box<(dyn server::DynRecvStream + '0)>` must implement `server::RecvStream`, for any lifetime `'0`...
-//     = note: ...but `server::RecvStream` is actually implemented for the type `Box<(dyn server::DynRecvStream + 'static)>`
-#[doc(hidden)]
-pub struct BoxedRecvStream(pub Box<dyn DynRecvStream + 'static>);
-
-// Implement RecvStream for the wrapper instead of the Box directly
-impl RecvStream for BoxedRecvStream {
-    async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
-        self.0.dyn_next(msg).await
-    }
-}
+pub(crate) type BoxedRecvStream = Box<dyn DynRecvStream>;
 
 /// An item in a response stream from the server's view.
 ///
@@ -359,9 +354,7 @@ impl Handle for DynHandleWrapper {
         tx: &mut impl SendStream,
         rx: impl RecvStream + 'static,
     ) -> Trailers {
-        self.0
-            .dyn_handle(headers, options, tx, BoxedRecvStream(Box::new(rx)))
-            .await
+        self.0.dyn_handle(headers, options, tx, Box::new(rx)).await
     }
 }
 /// Represents the sending side of a server stream.  See `ResponseStream`
@@ -378,11 +371,7 @@ pub trait SendStream {
     /// This method is not intended to be cancellation safe.  If the returned
     /// future is not polled to completion, the behavior of any subsequent calls
     /// to the SendStream are undefined and data may be lost.
-    async fn send<'a>(
-        &mut self,
-        item: ResponseStreamItem<'a>,
-        options: SendOptions,
-    ) -> Result<(), ()>;
+    async fn send(&mut self, item: ResponseStreamItem<'_>, options: SendOptions) -> Result<(), ()>;
 }
 
 #[doc(hidden)]
@@ -406,22 +395,14 @@ impl<T: SendStream> DynSendStream for T {
     }
 }
 
-impl<'b> SendStream for &mut (dyn DynSendStream + 'b) {
-    async fn send<'a>(
-        &mut self,
-        item: ResponseStreamItem<'a>,
-        options: SendOptions,
-    ) -> Result<(), ()> {
+impl SendStream for &mut (dyn DynSendStream + '_) {
+    async fn send(&mut self, item: ResponseStreamItem<'_>, options: SendOptions) -> Result<(), ()> {
         (**self).dyn_send(item, options).await
     }
 }
 
-impl<'b> SendStream for Box<dyn DynSendStream + 'b> {
-    async fn send<'a>(
-        &mut self,
-        item: ResponseStreamItem<'a>,
-        options: SendOptions,
-    ) -> Result<(), ()> {
+impl SendStream for Box<dyn DynSendStream + '_> {
+    async fn send(&mut self, item: ResponseStreamItem<'_>, options: SendOptions) -> Result<(), ()> {
         (**self).dyn_send(item, options).await
     }
 }
@@ -447,6 +428,9 @@ pub trait RecvStream {
     /// Calling this method again after reaching a terminal state is unspecified
     /// and should be avoided.
     ///
+    /// The provided `msg` must not be modified if the stream has ended, i.e. `None`
+    /// is returned.
+    ///
     /// # Cancel safety
     ///
     /// This method is not intended to be cancellation safe.  If the returned
@@ -468,7 +452,7 @@ impl<T: RecvStream> DynRecvStream for T {
     }
 }
 
-impl<'a> RecvStream for Box<dyn DynRecvStream + 'a> {
+impl RecvStream for Box<dyn DynRecvStream + '_> {
     async fn next(&mut self, msg: &mut dyn RecvMessage) -> Option<Result<(), ()>> {
         (**self).dyn_next(msg).await
     }
@@ -508,18 +492,24 @@ impl ResponseHeaders {
 }
 
 /// Contains all information transmitted in the request headers of an RPC.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RequestHeaders {
     /// The full (e.g. "/Service/Method") method name specified for the call.
     method_name: String,
     /// The application-specified metadata for the call.
     metadata: MetadataMap,
+    /// Information about the client.
+    connection_info: ConnectionInfo,
 }
 
 impl RequestHeaders {
     /// Returns a default RequestHeaders instance.
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(method_name: impl Into<String>, connection_info: ConnectionInfo) -> Self {
+        Self {
+            method_name: method_name.into(),
+            connection_info,
+            metadata: MetadataMap::default(),
+        }
     }
 
     /// Replaces the method name of self with `method_name`.
@@ -547,6 +537,17 @@ impl RequestHeaders {
     /// Returns a mutable reference to the metadata in these headers.
     pub fn metadata_mut(&mut self) -> &mut MetadataMap {
         &mut self.metadata
+    }
+
+    /// Replaces the connection_info of self with `connection_info`.
+    pub fn with_connection_info(mut self, connection_info: ConnectionInfo) -> Self {
+        self.connection_info = connection_info;
+        self
+    }
+
+    /// Returns a reference to the connection_info in these headers.
+    pub fn connection_info(&self) -> &ConnectionInfo {
+        &self.connection_info
     }
 
     /// Returns the owned fields in the RequestHeaders.
@@ -621,7 +622,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-
+    use crate::core::test_connection_info;
     /// A mock connection whose completion is controlled by a [`Notify`],
     /// and which records whether [`graceful_shutdown`] was called.
     struct MockConnection {
@@ -720,7 +721,7 @@ mod tests {
     #[tokio::test]
     async fn server_stops_on_shutdown_signal() {
         let listener = crate::inmemory::InMemoryListener::new();
-        let server = Server::new();
+        let server = Server::builder().build();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -746,7 +747,7 @@ mod tests {
     #[tokio::test]
     async fn server_stops_when_listener_closes() {
         let listener = crate::inmemory::InMemoryListener::new();
-        let server = Server::new();
+        let server = Server::builder().build();
 
         let listener_for_serve = listener.clone();
         let server_handle = tokio::spawn(async move {
@@ -790,7 +791,7 @@ mod tests {
     #[tokio::test]
     async fn dropping_serve_future_force_closes_connection() {
         let listener = crate::inmemory::InMemoryListener::new();
-        let server = Server::new();
+        let server = Server::builder().build();
 
         // A never-resolving signal future (we won't signal gracefully, we will drop the serve future directly).
         let (_signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
@@ -899,9 +900,9 @@ mod tests {
     struct NopSendStream;
 
     impl SendStream for NopSendStream {
-        async fn send<'a>(
+        async fn send(
             &mut self,
-            _item: ResponseStreamItem<'a>,
+            _item: ResponseStreamItem<'_>,
             _options: SendOptions,
         ) -> Result<(), ()> {
             Ok(())
@@ -947,9 +948,14 @@ mod tests {
         ) -> Self::Connection {
             let inner = Box::pin(async move {
                 let mut tx = NopSendStream;
-                let rx = BoxedRecvStream(Box::new(NopRecvStream));
+                let rx = Box::new(NopRecvStream);
                 let _ = handler
-                    .dyn_handle(RequestHeaders::new(), CallOptions::new(), &mut tx, rx)
+                    .dyn_handle(
+                        RequestHeaders::new("/test.Draining/Method", test_connection_info()),
+                        CallOptions::new(),
+                        &mut tx,
+                        rx,
+                    )
                     .await;
             });
             MockServingConnection { inner }
@@ -959,12 +965,12 @@ mod tests {
     #[tokio::test]
     async fn listener_dropped_when_shutdown_signal_fires() {
         let (listener, dropped, _tx) = MockListener::new();
-        let server = Server::new();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
         let server_handle = tokio::spawn(async move {
-            server
+            Server::builder()
+                .build()
                 .serve_with_shutdown(listener, async {
                     let _ = shutdown_rx.await;
                 })
@@ -995,10 +1001,11 @@ mod tests {
         use crate::server::RequestHeaders;
         use crate::server::SendStream;
         use crate::server::Trailers;
+        use crate::server::descriptor::MethodDescriptor;
+        use crate::server::descriptor::ServiceDescriptor;
+        use crate::server::service::Service;
 
         let (listener, dropped, tx) = MockListener::new();
-
-        let mut server = Server::new();
 
         let handler_started = Arc::new(AtomicBool::new(false));
         let (unblock_tx, unblock_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1025,10 +1032,36 @@ mod tests {
             }
         }
 
-        server.set_handler(DrainingHandler {
-            started: handler_started.clone(),
-            unblock: unblock_rx,
-        });
+        struct DrainingService {
+            started: Arc<AtomicBool>,
+            unblock: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+        }
+
+        impl Service for DrainingService {
+            fn descriptor(&self) -> ServiceDescriptor {
+                ServiceDescriptor::new(
+                    "test.Draining",
+                    vec![MethodDescriptor::new("/test.Draining/Method")],
+                )
+            }
+
+            fn register_methods(self) -> Vec<(String, Arc<dyn DynHandle>)> {
+                vec![(
+                    "/test.Draining/Method".to_string(),
+                    Arc::new(DrainingHandler {
+                        started: self.started,
+                        unblock: self.unblock,
+                    }),
+                )]
+            }
+        }
+
+        let server = Server::builder()
+            .add_service(DrainingService {
+                started: handler_started.clone(),
+                unblock: unblock_rx,
+            })
+            .build();
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 

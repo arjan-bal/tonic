@@ -62,10 +62,10 @@ impl<I: InvokeOnce> Intercept<I> for AttachHeadersInterceptor {
         for kv in self.md.iter() {
             match kv {
                 crate::metadata::KeyAndValueRef::Ascii(key, value) => {
-                    incoming_meta.append(key, value.clone())
+                    incoming_meta.append(key, value.clone());
                 }
                 crate::metadata::KeyAndValueRef::Binary(key, value) => {
-                    incoming_meta.append_bin(key, value.clone())
+                    incoming_meta.append_bin(key, value.clone());
                 }
             }
         }
@@ -250,7 +250,7 @@ mod tests {
         // Send a Headers response on the call.
         let mut resp_md = MetadataMap::new();
         resp_md.insert("x-resp-header", "resp-value".parse().unwrap());
-        let mut headers = ResponseHeaders::default();
+        let mut headers = ResponseHeaders::new(crate::core::test_connection_info());
         *headers.metadata_mut() = resp_md;
         controller
             .send_resp(ResponseStreamItem::Headers(headers))

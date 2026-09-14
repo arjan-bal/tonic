@@ -394,6 +394,12 @@ static void GenerateClient(const Service &service, Printer &printer,
       R"rs(
       /// Generated client implementations.
       pub mod $client_mod$ {
+          #![allow(
+              unused_imports,
+              dead_code,
+              missing_docs,
+              clippy::wildcard_imports,
+          )]
           use grpc::client::*;
           use grpc_protobuf::*;
           use grpc_protobuf::client::*;

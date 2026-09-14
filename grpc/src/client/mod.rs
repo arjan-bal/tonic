@@ -51,8 +51,9 @@
 use std::fmt::Display;
 use std::time::Instant;
 
-use tonic::async_trait;
+use crate::async_trait;
 
+use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
 use crate::metadata::MetadataMap;
@@ -261,7 +262,7 @@ impl<T: SendStream> DynSendStream for T {
     }
 }
 
-impl<'a> SendStream for Box<dyn DynSendStream + 'a> {
+impl SendStream for Box<dyn DynSendStream + '_> {
     async fn send(&mut self, msg: &dyn SendMessage, options: SendOptions) -> Result<(), ()> {
         (**self).dyn_send(msg, options).await
     }
@@ -360,22 +361,26 @@ impl<T: RecvStream> DynRecvStream for T {
     }
 }
 
-impl<'a> RecvStream for Box<dyn DynRecvStream + 'a> {
+impl RecvStream for Box<dyn DynRecvStream + '_> {
     async fn recv(&mut self, msg: &mut dyn RecvMessage) -> ResponseStreamItem {
         (**self).dyn_recv(msg).await
     }
 }
 
 /// Contains all information transmitted in the response headers of an RPC.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ResponseHeaders {
     metadata: MetadataMap,
+    connection_info: ConnectionInfo,
 }
 
 impl ResponseHeaders {
     /// Returns a default ResponseHeaders instance.
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(connection_info: ConnectionInfo) -> Self {
+        Self {
+            metadata: MetadataMap::default(),
+            connection_info,
+        }
     }
 
     /// Replaces the metadata of self with `metadata`.
@@ -396,6 +401,17 @@ impl ResponseHeaders {
 
     pub(crate) fn into_metadata(self) -> MetadataMap {
         self.metadata
+    }
+
+    /// Replaces the connection of self with `connection_info`.
+    pub fn with_connection_info(mut self, connection_info: ConnectionInfo) -> Self {
+        self.connection_info = connection_info;
+        self
+    }
+
+    /// Returns a reference to the connection_info in these headers.
+    pub fn connection_info(&self) -> &ConnectionInfo {
+        &self.connection_info
     }
 }
 
@@ -454,6 +470,7 @@ impl RequestHeaders {
 pub struct Trailers {
     status: crate::Result<()>,
     metadata: MetadataMap,
+    connection_info: Option<ConnectionInfo>,
 }
 
 impl Trailers {
@@ -462,6 +479,7 @@ impl Trailers {
         Self {
             status,
             metadata: MetadataMap::default(),
+            connection_info: None,
         }
     }
 
@@ -495,6 +513,24 @@ impl Trailers {
     /// Returns the status in the [`Trailers`], consuming the entire status.
     pub fn into_status(self) -> crate::Result<()> {
         self.status
+    }
+
+    /// Replaces the connection info in self with `connection_info`.
+    pub fn with_connection_info(mut self, connection_info: Option<ConnectionInfo>) -> Self {
+        self.connection_info = connection_info;
+        self
+    }
+
+    /// Returns the connection info in the trailers, if present.  Connection
+    /// information will not be available in trailers in any the following
+    /// circumstances:
+    ///
+    /// 1. A ResponseHeaders was already present on the response stream.
+    ///
+    /// 2. The error was generated locally on the client before a connection was
+    ///    chosen for the RPC.
+    pub fn connection_info(&self) -> &Option<ConnectionInfo> {
+        &self.connection_info
     }
 
     pub(crate) fn into_parts(self) -> (crate::Result<()>, MetadataMap) {

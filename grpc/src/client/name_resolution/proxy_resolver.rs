@@ -36,7 +36,7 @@ use crate::client::name_resolution::ResolverOptions;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::client::name_resolution::Target;
 use crate::client::name_resolution::dns;
-use crate::client::service_config::ServiceConfig;
+use crate::client::service_config::ParseResult;
 use crate::client::transport::ProxyOptions;
 use crate::credentials::common::Authority;
 
@@ -216,7 +216,7 @@ struct InterceptingController<'a> {
     proxy_options: &'a Arc<ProxyOptions>,
 }
 
-impl<'a> ChannelController for InterceptingController<'a> {
+impl ChannelController for InterceptingController<'_> {
     fn update(&mut self, mut update: ResolverUpdate) -> Result<(), String> {
         if let Ok(endpoints) = &mut update.endpoints {
             for endpoint in endpoints {
@@ -228,7 +228,7 @@ impl<'a> ChannelController for InterceptingController<'a> {
         self.inner.update(update)
     }
 
-    fn parse_service_config(&self, config: &str) -> Result<ServiceConfig, String> {
+    fn parse_service_config(&self, config: &str) -> ParseResult {
         self.inner.parse_service_config(config)
     }
 }
@@ -282,7 +282,7 @@ mod tests {
         lookup_result: Result<Vec<IpAddr>, String>,
     }
 
-    #[tonic::async_trait]
+    #[crate::async_trait]
     impl rt::DnsResolver for FakeDns {
         async fn lookup_host_name(&self, _: &str) -> Result<Vec<IpAddr>, String> {
             self.lookup_result.clone()

@@ -22,7 +22,6 @@
  *
  */
 
-mod server_status;
 mod status_code;
 
 pub use status_code::StatusCodeError;
@@ -78,6 +77,18 @@ impl StatusError {
     }
 }
 
+impl std::fmt::Display for StatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.message.is_empty() {
+            write!(f, "{:?}", self.code)
+        } else {
+            write!(f, "{:?}: {}", self.code, self.message)
+        }
+    }
+}
+
+impl std::error::Error for StatusError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +107,14 @@ mod tests {
         assert!(debug.contains("Status"));
         assert!(debug.contains("Cancelled"));
         assert!(debug.contains("not ok"));
+    }
+
+    #[test]
+    fn test_status_display() {
+        let status = StatusError::new(StatusCodeError::NotFound, "not ok");
+        assert_eq!(format!("{status}"), "NotFound: not ok");
+
+        let status = StatusError::new(StatusCodeError::Cancelled, "");
+        assert_eq!(format!("{status}"), "Cancelled");
     }
 }
