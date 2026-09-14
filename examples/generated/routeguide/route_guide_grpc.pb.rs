@@ -1,5 +1,6 @@
 /// Generated client implementations.
 pub mod route_guide_client {
+    #![allow(unused_imports, dead_code, missing_docs, clippy::wildcard_imports)]
     use grpc::client::*;
     use grpc_protobuf::*;
     use grpc_protobuf::client::*;
@@ -240,14 +241,10 @@ pub mod route_guide_server {
             grpc::server::descriptor::ServiceDescriptor::new(
                 "routeguide.RouteGuide",
                 vec![
-                    grpc::server::descriptor::MethodDescriptor::new("/routeguide.RouteGuide/GetFeature",
-                    grpc::server::descriptor::MethodType::Unary),
-                    grpc::server::descriptor::MethodDescriptor::new("/routeguide.RouteGuide/ListFeatures",
-                    grpc::server::descriptor::MethodType::ServerStreaming),
-                    grpc::server::descriptor::MethodDescriptor::new("/routeguide.RouteGuide/RecordRoute",
-                    grpc::server::descriptor::MethodType::ClientStreaming),
-                    grpc::server::descriptor::MethodDescriptor::new("/routeguide.RouteGuide/RouteChat",
-                    grpc::server::descriptor::MethodType::BidiStreaming),
+                    grpc::server::descriptor::MethodDescriptor::new("/routeguide.RouteGuide/GetFeature"),
+                    grpc::server::descriptor::MethodDescriptor::new("/routeguide.RouteGuide/ListFeatures"),
+                    grpc::server::descriptor::MethodDescriptor::new("/routeguide.RouteGuide/RecordRoute"),
+                    grpc::server::descriptor::MethodDescriptor::new("/routeguide.RouteGuide/RouteChat"),
                 ],
             )
         }

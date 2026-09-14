@@ -620,23 +620,9 @@ static void GenerateServiceImpl(Printer &printer, const Service &service,
     printer.Emit(
         {
             {"path", FormatMethodPath(service, method)},
-            {"method_type",
-             [&]() {
-               if (!method.IsClientStreaming() && !method.IsServerStreaming()) {
-                 printer.Emit("Unary");
-               } else if (!method.IsClientStreaming() &&
-                          method.IsServerStreaming()) {
-                 printer.Emit("ServerStreaming");
-               } else if (method.IsClientStreaming() &&
-                          !method.IsServerStreaming()) {
-                 printer.Emit("ClientStreaming");
-               } else {
-                 printer.Emit("BidiStreaming");
-               }
-             }},
         },
         R"rs(
-    grpc::server::descriptor::MethodDescriptor::new("$path$", grpc::server::descriptor::MethodType::$method_type$),
+    grpc::server::descriptor::MethodDescriptor::new("$path$"),
     )rs");
   }
 
