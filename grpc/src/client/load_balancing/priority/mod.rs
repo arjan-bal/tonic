@@ -820,7 +820,7 @@ impl PriorityPolicy {
     /// failover timer has expired, transitioning them to
     /// [`ChildState::ConnectingExpired`].
     fn handle_connectivity_timer(&mut self) {
-        for (_, child_data) in self.child_data.iter_mut() {
+        for child_data in self.child_data.values_mut() {
             if let ChildState::Connecting(connecting_state, lb_state) = &child_data.state
                 && Instant::now() >= connecting_state.deadline
             {
