@@ -103,7 +103,6 @@
 //!   https://github.com/grpc/proposal/blob/master/A115-remove-priority-lb-child-policy-cache.md
 
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::fmt;
 use std::mem;
 use std::sync::Arc;
@@ -137,31 +136,9 @@ mod child;
 pub static POLICY_NAME: &str = "priority_experimental";
 
 /// Failover timeout for a child attempting to connect (10 seconds).
-///
-/// Per [gRFC A56 (Section Child Connectivity State Tracking)], each child has a
-/// 10-second failover timer that starts when it begins attempting to connect.
-/// While this timer is active, the priority selection algorithm waits for
-/// this child to connect before failing over to lower priorities.
-///
-/// [gRFC A56 (Section Child Connectivity State Tracking)]:
-///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#child-connectivity-state-tracking
 const CONNECTING_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Retention timeout for deactivated lower-priority children (15 minutes).
-///
-/// Per [gRFC A56 (Section Child Lifetime Management)], when switching to a
-/// higher-priority child, active lower-priority children are deactivated and
-/// retained for up to 15 minutes to prevent connection churn if the higher
-/// priority flaps.
-///
-/// Note: Under [gRFC A115], this timeout applies only to failover
-/// deactivations (Case 1); children removed from the configuration (Case 2)
-/// are dropped immediately.
-///
-/// [gRFC A56 (Section Child Lifetime Management)]:
-///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#child-lifetime-management
-/// [gRFC A115]:
-///   https://github.com/grpc/proposal/blob/master/A115-remove-priority-lb-child-policy-cache.md
 const DEACTIVATION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Registers the `priority_experimental` LB policy builder in the global LB
@@ -219,20 +196,27 @@ impl PriorityConfig {
         }
         Ok(())
     }
+
+    /// Returns the configured children ordered from the highest priority to
+    /// the lowest.
+    fn ordered_children(&self) -> impl Iterator<Item = (&String, &PriorityChildConfig)> {
+        self.priorities
+            .iter()
+            .filter_map(|name| self.children.get(name).map(|config| (name, config)))
+    }
 }
 
 /// Internal tracking data and state for a configured priority child.
 #[derive(Debug)]
 struct ChildData {
+    /// The name identifying this child in the LB config and in
+    /// [`ChildManager`].
+    name: String,
     /// The current lifecycle and connectivity state of the child policy.
     state: ChildState,
-    /// The active dynamic LB configuration for this child.
+    /// The current LB configuration for this child.
     child_config: PriorityChildConfig,
     /// The latest name resolver update received for this child.
-    ///
-    /// Preserved so that if this child is deactivated and later reactivated,
-    /// or if it was uninitialized, it can be instantiated with the most
-    /// recent endpoints and service configuration.
     latest_update: ResolverUpdate,
 }
 
@@ -374,8 +358,7 @@ impl LbPolicyBuilder for Builder {
         let rt = options.runtime;
         PriorityPolicy {
             child_mgr: ChildManager::new(rt.clone(), options.work_scheduler.clone()),
-            child_data: HashMap::default(),
-            priorities: Vec::default(),
+            children: Vec::default(),
             published_lb_state: None,
             rt,
             work_scheduler: options.work_scheduler,
@@ -399,10 +382,9 @@ impl LbPolicyBuilder for Builder {
 #[derive(Debug)]
 struct PriorityPolicy {
     child_mgr: ChildManager<String, ChildBuilder>,
-    child_data: HashMap<String, ChildData>,
-    /// Current priority hierarchy: list of child names sorted from highest
-    /// priority (0) to lowest.
-    priorities: Vec<String>,
+    /// Current priority hierarchy: the configured children, ordered from the
+    /// highest priority (index 0) to the lowest.
+    children: Vec<ChildData>,
     /// The most recent LB state published to the channel controller.
     ///
     /// Used to debounce redundant picker updates when internal priority or
@@ -424,18 +406,19 @@ impl LbPolicy for PriorityPolicy {
         let Some(config) = config else {
             return Err("priority balancer received update with missing LB config".to_owned());
         };
-        self.priorities = config.priorities.clone();
         let mut sharded_endpoints = update.endpoints.map(endpoint_filtering::group_by_path);
 
-        // Remove children no longer present in any priority, see gRFC A115.
-        self.child_data
-            .retain(|k, _| config.children.contains_key(k));
+        // Index the existing children by name so they can be moved into the
+        // new priority order.  Children that are no longer configured are left
+        // behind in this map and dropped, see gRFC A115.
+        let mut old_children: HashMap<String, ChildData> = mem::take(&mut self.children)
+            .into_iter()
+            .map(|child_data| (child_data.name.clone(), child_data))
+            .collect();
 
-        let mut updates_to_emit = Vec::new();
-
-        for (k, child_cfg) in &config.children {
+        for (name, child_cfg) in config.ordered_children() {
             let endpoints = match &mut sharded_endpoints {
-                Ok(grouped) => Ok(grouped.remove(k).unwrap_or_default()),
+                Ok(grouped) => Ok(grouped.remove(name).unwrap_or_default()),
                 Err(status) => Err(status.clone()),
             };
 
@@ -446,40 +429,36 @@ impl LbPolicy for PriorityPolicy {
                 resolution_note: update.resolution_note.clone(),
             };
 
-            match self.child_data.entry(k.clone()) {
-                Entry::Occupied(mut entry) => {
-                    let data = entry.get_mut();
-                    data.child_config = child_cfg.clone();
-                    data.latest_update = resolver_update.clone();
-
-                    if !matches!(data.state, ChildState::Uninitialized) {
-                        // Stash key and resolver_update to assemble
-                        // ChildUpdates in a second pass.
-                        updates_to_emit.push((k.clone(), resolver_update));
-                    }
+            let child_data = match old_children.remove(name) {
+                Some(mut child_data) => {
+                    child_data.child_config = child_cfg.clone();
+                    child_data.latest_update = resolver_update;
+                    child_data
                 }
-                Entry::Vacant(entry) => {
-                    entry.insert(ChildData {
-                        state: ChildState::Uninitialized,
-                        child_config: child_cfg.clone(),
-                        latest_update: resolver_update,
-                    });
-                }
-            }
+                None => ChildData {
+                    name: name.clone(),
+                    state: ChildState::Uninitialized,
+                    child_config: child_cfg.clone(),
+                    latest_update: resolver_update,
+                },
+            };
+            self.children.push(child_data);
         }
 
-        // Build child_updates with immutable references from self.child_data.
-        let child_updates = updates_to_emit
-            .into_iter()
-            .map(|(child_id, resolver_update)| {
-                let data = self.child_data.get(&child_id).expect(
-                    "expected child_data entry to exist for child queued during resolver_update",
-                );
-                ChildUpdate {
-                    child_identifier: child_id,
-                    child_policy_builder: ChildBuilder {},
-                    child_update: Some((resolver_update, Some(&data.child_config))),
-                }
+        // Only children that have already been created are sent to the
+        // ChildManager; the remaining ones are created lazily by
+        // choose_priority.
+        let child_updates = self
+            .children
+            .iter()
+            .filter(|child_data| !matches!(child_data.state, ChildState::Uninitialized))
+            .map(|child_data| ChildUpdate {
+                child_identifier: child_data.name.clone(),
+                child_policy_builder: ChildBuilder {},
+                child_update: Some((
+                    child_data.latest_update.clone(),
+                    Some(&child_data.child_config),
+                )),
             });
 
         // Update children in ChildManager. As specified in gRFC A56
@@ -535,15 +514,24 @@ impl PriorityPolicy {
 
     /// Synchronizes the local [`ChildState`] of each child with the latest
     /// state reported by [`ChildManager`].
+    ///
+    /// Children that have not been created in [`ChildManager`] yet, i.e. those
+    /// in [`ChildState::Uninitialized`], are left untouched.
     fn update_child_data(&mut self) {
-        for child in self.child_mgr.children() {
-            let child_data = self.child_data.get_mut(&child.identifier).expect(
-                "expected child_data entry to exist for active child reported by ChildManager",
-            );
+        let latest_states: HashMap<&str, &LbState> = self
+            .child_mgr
+            .children()
+            .map(|child| (child.identifier.as_str(), &child.state))
+            .collect();
+
+        for child_data in &mut self.children {
+            let Some(lb_state) = latest_states.get(child_data.name.as_str()) else {
+                continue;
+            };
             // Take ownership of the current state and replace it with a
             // temporary Uninitialized value.
             let old_state = mem::replace(&mut child_data.state, ChildState::Uninitialized);
-            let lb_state = child.state.clone();
+            let lb_state = (*lb_state).clone();
             child_data.state = match old_state {
                 ChildState::Deactivated(timer, _) => {
                     // While deactivated, retain the 15-minute deactivation
@@ -599,7 +587,7 @@ impl PriorityPolicy {
     fn choose_priority(&mut self, channel_controller: &mut dyn ChannelController) {
         // If priority list is empty, report TRANSIENT_FAILURE with
         // FailingPicker.
-        if self.priorities.is_empty() {
+        if self.children.is_empty() {
             self.update_picker(
                 channel_controller,
                 LbState {
@@ -615,11 +603,8 @@ impl PriorityPolicy {
         // Iterate through priorities in decreasing priority order (0..N-1),
         // searching for a child in READY/IDLE or whose 10s failover timer is
         // still pending.
-        for idx in 0..self.priorities.len() {
-            let child_id = self.priorities[idx].clone();
-            let child_data = self.child_data.get_mut(&child_id).expect(
-                "expected child_data entry to exist for priority during choose_priority pass 1",
-            );
+        for idx in 0..self.children.len() {
+            let child_data = &mut self.children[idx];
 
             // Reactivate child if previously deactivated.
             if let ChildState::Deactivated(_, lb_state) = &child_data.state {
@@ -644,7 +629,7 @@ impl PriorityPolicy {
 
             // Lazily create and initialize the child if uninitialized.
             if matches!(child_data.state, ChildState::Uninitialized) {
-                let latest_update = {
+                let (child_id, latest_update) = {
                     child_data.state = ChildState::Connecting(
                         Timer::new(
                             CONNECTING_TIMEOUT,
@@ -653,10 +638,10 @@ impl PriorityPolicy {
                         ),
                         LbState::initial(),
                     );
-                    child_data.latest_update.clone()
+                    (child_data.name.clone(), child_data.latest_update.clone())
                 };
                 if self
-                    .update_child(child_id.clone(), latest_update, channel_controller)
+                    .update_child(child_id, latest_update, channel_controller)
                     .is_err()
                 {
                     channel_controller.request_resolution();
@@ -664,10 +649,7 @@ impl PriorityPolicy {
                 self.update_child_data();
             }
 
-            let child_data = self.child_data.get(&child_id).expect(
-                "expected child_data entry to exist for priority during choose_priority pass 1",
-            );
-            match &child_data.state {
+            match &self.children[idx].state {
                 ChildState::Uninitialized => {
                     unreachable!("uninitialized child was initialized prior to state evaluation")
                 }
@@ -695,12 +677,8 @@ impl PriorityPolicy {
         // We did not find a priority in READY or IDLE or whose failover timer
         // was pending, so check for one in CONNECTING (whose failover timer has
         // expired).
-        for idx in 0..self.priorities.len() {
-            let child_id = &self.priorities[idx];
-            let child_data = self.child_data.get(child_id).expect(
-                "expected child_data entry to exist for priority during choose_priority pass 2",
-            );
-            if matches!(child_data.state, ChildState::ConnectingExpired(_)) {
+        for idx in 0..self.children.len() {
+            if matches!(self.children[idx].state, ChildState::ConnectingExpired(_)) {
                 self.set_current_priority(channel_controller, idx, false);
                 return;
             }
@@ -708,7 +686,7 @@ impl PriorityPolicy {
 
         // We didn't find a child in CONNECTING, so delegate to the last child
         // (reporting its TRANSIENT_FAILURE state and failing picker).
-        self.set_current_priority(channel_controller, self.priorities.len() - 1, false);
+        self.set_current_priority(channel_controller, self.children.len() - 1, false);
     }
 
     /// Activates the selected priority tier and updates the channel picker.
@@ -720,11 +698,7 @@ impl PriorityPolicy {
     ) {
         // Deactivate lower priorities if needed.
         if deactivate_lower_priorities {
-            for child_id in self.priorities.iter().skip(index + 1) {
-                let child_data = self
-                    .child_data
-                    .get_mut(child_id)
-                    .unwrap_or_else(|| panic!("missing child data for {child_id}"));
+            for child_data in self.children.iter_mut().skip(index + 1) {
                 let old_state = mem::replace(&mut child_data.state, ChildState::Uninitialized);
                 child_data.state = match old_state {
                     ChildState::Uninitialized => ChildState::Uninitialized,
@@ -747,11 +721,7 @@ impl PriorityPolicy {
         }
 
         // Use this child's picker.
-        let child_name = &self.priorities[index];
-        let child_data = self.child_data.get(child_name).expect(
-            "expected child_data entry to exist for selected priority in set_current_priority",
-        );
-        let lb_state = child_data
+        let lb_state = self.children[index]
             .state
             .lb_state()
             .expect("cannot set priority to uninitialized child; child must be initialized first")
@@ -780,22 +750,22 @@ impl PriorityPolicy {
     ) -> Result<(), String> {
         let mut resolver_update = Some(resolver_update);
         let child_updates = self
-            .child_data
+            .children
             .iter()
-            .filter(|(_, cd)| !matches!(cd.state, ChildState::Uninitialized))
-            .map(|(id, data)| {
-                let update = if &child_id == id {
+            .filter(|child_data| !matches!(child_data.state, ChildState::Uninitialized))
+            .map(|child_data| {
+                let update = if child_id == child_data.name {
                     // .take() moves the owned value out without cloning.
-                    // Since id is the key of a HashMap, there's at most one
-                    // element that matches.
+                    // Child names are unique, so there's at most one element
+                    // that matches.
                     resolver_update
                         .take()
-                        .map(|ru| (ru, Some(&data.child_config)))
+                        .map(|ru| (ru, Some(&child_data.child_config)))
                 } else {
                     None
                 };
                 ChildUpdate {
-                    child_identifier: id.clone(),
+                    child_identifier: child_data.name.clone(),
                     child_policy_builder: ChildBuilder {},
                     child_update: update,
                 }
@@ -808,7 +778,7 @@ impl PriorityPolicy {
     /// failover timer has expired, transitioning them to
     /// [`ChildState::ConnectingExpired`].
     fn handle_connectivity_timer(&mut self) {
-        for child_data in self.child_data.values_mut() {
+        for child_data in &mut self.children {
             if let ChildState::Connecting(connecting_state, lb_state) = &child_data.state
                 && Instant::now() >= connecting_state.deadline
             {
@@ -821,12 +791,12 @@ impl PriorityPolicy {
     ///
     /// Expired children revert to [`ChildState::Uninitialized`] and are removed
     /// from [`ChildManager`] to tear down their subchannels. They are NOT
-    /// removed from `self.child_data` so they can be lazily re-created if
+    /// removed from `self.children` so they can be lazily re-created if
     /// higher priorities fail later (see [gRFC A56 (Section Child Lifetime
     /// Management)]).
     fn handle_deactivation_timer(&mut self) {
         let mut any_expired = false;
-        for child_data in self.child_data.values_mut() {
+        for child_data in &mut self.children {
             if let ChildState::Deactivated(timer, _) = &child_data.state
                 && Instant::now() >= timer.deadline
             {
@@ -839,12 +809,23 @@ impl PriorityPolicy {
             return;
         }
         let iter = self
-            .child_data
+            .children
             .iter()
-            .filter(|(_, cd)| !matches!(cd.state, ChildState::Uninitialized))
-            .map(|(id, data)| (id.clone(), ChildBuilder {}));
+            .filter(|child_data| !matches!(child_data.state, ChildState::Uninitialized))
+            .map(|child_data| (child_data.name.clone(), ChildBuilder {}));
 
         self.child_mgr.retain_children(iter);
+    }
+}
+
+#[cfg(test)]
+impl PriorityPolicy {
+    /// Returns the data tracked for the child with the given name, if it is
+    /// currently configured.
+    fn child(&self, name: &str) -> Option<&ChildData> {
+        self.children
+            .iter()
+            .find(|child_data| child_data.name == name)
     }
 }
 

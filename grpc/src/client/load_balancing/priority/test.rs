@@ -483,7 +483,7 @@ async fn switch_priority_failover_and_failback() {
     // child-0 is selected again.
     // child-1 is deactivated with a 15-minute timer.
     assert!(matches!(
-        env.policy.child_data.get("child-1").unwrap().state,
+        env.policy.child("child-1").unwrap().state,
         ChildState::Deactivated(_, _)
     ));
 }
@@ -534,7 +534,7 @@ async fn init_timeout_failover() {
 
     assert!(
         matches!(
-            env.policy.child_data.get("child-0").unwrap().state,
+            env.policy.child("child-0").unwrap().state,
             ChildState::Connecting(_, _)
         ),
         "child-0 should still be in Connecting state after 5 seconds"
@@ -549,7 +549,7 @@ async fn init_timeout_failover() {
 
     // child-0 should now be ConnectingExpired.
     assert!(matches!(
-        env.policy.child_data.get("child-0").unwrap().state,
+        env.policy.child("child-0").unwrap().state,
         ChildState::ConnectingExpired(_)
     ));
 
@@ -611,7 +611,7 @@ async fn connecting_to_connecting_does_not_restart_timer() {
     // The timer should have expired based on original start time
     // (11s > 10s).
     assert!(matches!(
-        env.policy.child_data.get("child-0").unwrap().state,
+        env.policy.child("child-0").unwrap().state,
         ChildState::ConnectingExpired(_)
     ));
 }
@@ -669,7 +669,7 @@ async fn transient_failure_to_connecting_enters_connecting_expired() {
 
     // Per gRFC A56, child-0 enters ConnectingExpired (no new 10s timer).
     assert!(matches!(
-        env.policy.child_data.get("child-0").unwrap().state,
+        env.policy.child("child-0").unwrap().state,
         ChildState::ConnectingExpired(_)
     ));
 
@@ -727,7 +727,7 @@ async fn deactivation_and_reactivation() {
 
     // child-1 is deactivated with a 15-minute timer.
     assert!(matches!(
-        env.policy.child_data.get("child-1").unwrap().state,
+        env.policy.child("child-1").unwrap().state,
         ChildState::Deactivated(_, _)
     ));
 
@@ -735,7 +735,7 @@ async fn deactivation_and_reactivation() {
     // deactivation.
     move_subchannel_to_state(&mut env, &sc1, SubchannelState::connecting());
     assert!(matches!(
-        env.policy.child_data.get("child-1").unwrap().state,
+        env.policy.child("child-1").unwrap().state,
         ChildState::Deactivated(_, _)
     ));
     // Advance time past 15 minutes (901 seconds).
@@ -744,10 +744,10 @@ async fn deactivation_and_reactivation() {
     let data = recv_schedule_work(&env.rx_events);
     env.policy.work(data, &mut env.tcc);
 
-    // child-1 should now be Uninitialized in child_data, and pruned from
+    // child-1 should now be Uninitialized in the child list, and pruned from
     // child_mgr.
     assert!(matches!(
-        env.policy.child_data.get("child-1").unwrap().state,
+        env.policy.child("child-1").unwrap().state,
         ChildState::Uninitialized
     ));
     assert_eq!(env.policy.child_mgr.children().count(), 1);
@@ -841,7 +841,7 @@ async fn ignore_reresolution_requests_configuration() {
 }
 
 /// Verifies that removing a child from the configuration immediately deletes
-/// it from child_data and child_mgr.
+/// it from the child list and child_mgr.
 #[tokio::test]
 async fn remove_child_from_config_deletes_immediately() {
     let _stub_handle0 = new_stub("stub_rc_0");
@@ -874,8 +874,8 @@ async fn remove_child_from_config_deletes_immediately() {
         .resolver_update(update, Some(&cfg), &mut env.tcc)
         .unwrap();
 
-    assert!(env.policy.child_data.contains_key("child-0"));
-    assert!(env.policy.child_data.contains_key("child-1"));
+    assert!(env.policy.child("child-0").is_some());
+    assert!(env.policy.child("child-1").is_some());
 
     // Remove child-1 from configuration.
     let js2 = r#"{
@@ -900,9 +900,15 @@ async fn remove_child_from_config_deletes_immediately() {
         .unwrap();
 
     // child-1 must be removed immediately (gRFC A115).
-    assert!(env.policy.child_data.contains_key("child-0"));
-    assert!(!env.policy.child_data.contains_key("child-1"));
-    assert_eq!(env.policy.priorities, vec!["child-0"]);
+    assert!(env.policy.child("child-0").is_some());
+    assert!(env.policy.child("child-1").is_none());
+    let priorities: Vec<&str> = env
+        .policy
+        .children
+        .iter()
+        .map(|child_data| child_data.name.as_str())
+        .collect();
+    assert_eq!(priorities, vec!["child-0"]);
 }
 
 /// Verifies that PriorityPolicy::work drops its own PriorityTimerWork (without
