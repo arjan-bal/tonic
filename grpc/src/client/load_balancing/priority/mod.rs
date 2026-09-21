@@ -35,71 +35,15 @@
 //! state). If higher-priority children are unavailable, fail, or take too long
 //! to connect, the policy fails over to lower-priority children.
 //!
-//! While originally developed to support xDS priority failover across
-//! localities or aggregate clusters (see [gRFC A27] and [gRFC A37]), this
-//! policy contains no xDS-specific logic and can be used generically in any
-//! hierarchical load balancing context.
+//! Each endpoint in a [`ResolverUpdate`] delivered to the priority LB must be
+//! annotated with a hierarchical path attribute
+//! (see [gRFC A56: Hierarchical Addresses]), otherwise, it will be ignored.
 //!
-//! # Hierarchical Addresses
-//!
-//! Endpoints received in a [`ResolverUpdate`] are delivered as a flat list.
-//! When nested load balancers are arranged hierarchically, each endpoint
-//! address is annotated with a hierarchical path attribute (see [gRFC A56:
-//! Hierarchical Addresses]).
-//!
-//! [`PriorityPolicy`] groups endpoint addresses by matching the first element
-//! in each address's path against the child names, strips that element, and
-//! routes the sub-list of addresses down to the corresponding child policy.
-//!
-//! # Child Lifetime Management & Lazy Creation
-//!
-//! To avoid unnecessary resource consumption and connection churn:
-//! - Lazy creation: Child policies are not instantiated upfront for every
-//!   configured priority. Instead, each child is created on-demand only when
-//!   the priority selection algorithm needs to attempt using that priority tier
-//!   (see [gRFC A56 (Section Child Lifetime Management)]).
-//! - Failback & Deactivation: When a higher-priority child becomes `READY` or
-//!   `IDLE`, previously active lower-priority children are not immediately
-//!   destroyed. Doing so would cause costly connection re-establishment if
-//!   priorities flap. Instead, lower-priority children enter
-//!   [`ChildState::Deactivated`] and run a 15-minute timer. If the
-//!   higher-priority child fails within 15 minutes, the lower-priority child is
-//!   reactivated instantly. If the timer expires without reactivation, the
-//!   child is cleaned up.
-//! - Unconfigured Child Removal: Per [gRFC A115], children omitted from a
-//!   configuration update are immediately destroyed and removed from the child
-//!   manager, completely bypassing the retention cache.
-//!
-//! # Connectivity State Tracking & Failover Timer
-//!
-//! Each child has an associated 10-second failover timer started when the child
-//! begins attempting to connect (see
-//! [gRFC A56 (Section Child Connectivity State Tracking)]):
-//! - While this timer is running, the priority selection algorithm waits on
-//!   this child before falling over to lower priorities.
-//! - The timer is cancelled if the child reports `READY`, `IDLE`, or
-//!   `TRANSIENT_FAILURE`.
-//! - If the timer fires and the child is still `CONNECTING`, the algorithm
-//!   proceeds to evaluate lower-priority children while the higher-priority
-//!   child continues attempting connection in the background.
-//!
-//! [gRFC A27]:
-//!   https://github.com/grpc/proposal/blob/master/A27-xds-global-load-balancing.md
-//! [gRFC A37]:
-//!   https://github.com/grpc/proposal/blob/master/A37-xds-aggregate-and-logical-dns-clusters.md
 //! [gRFC A56: `priority_experimental` LB policy]:
 //!   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md
-//! [gRFC A56 (Section Child Lifetime Management)]:
-//!   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#child-lifetime-management
-//! [gRFC A56 (Section Child Connectivity State Tracking)]:
-//!   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#child-connectivity-state-tracking
-//! [gRFC A56 (Section Algorithm for Choosing a Priority)]:
-//!   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#algorithm-for-choosing-a-priority
 //! [gRFC A56: Hierarchical Addresses]:
 //!   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#hierarchical-addresses
 //! [gRFC A115: disable Priority LB policy child policy retention cache]:
-//!   https://github.com/grpc/proposal/blob/master/A115-remove-priority-lb-child-policy-cache.md
-//! [gRFC A115]:
 //!   https://github.com/grpc/proposal/blob/master/A115-remove-priority-lb-child-policy-cache.md
 
 use std::collections::HashMap;
