@@ -127,8 +127,6 @@ use crate::client::load_balancing::child_manager::ChildUpdate;
 use crate::client::load_balancing::endpoint_filtering;
 use crate::client::load_balancing::priority::child::ChildBuilder;
 use crate::client::load_balancing::priority::child::ChildConfig;
-use crate::client::load_balancing::subchannel::Subchannel;
-use crate::client::load_balancing::subchannel::SubchannelState;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
@@ -489,17 +487,6 @@ impl LbPolicy for PriorityPolicy {
         let res = self.child_mgr.update(child_updates, channel_controller);
         self.reconcile(channel_controller);
         res
-    }
-
-    fn subchannel_update(
-        &mut self,
-        subchannel: std::sync::Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        self.child_mgr
-            .subchannel_update(subchannel, state, channel_controller);
-        self.reconcile(channel_controller);
     }
 
     fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {

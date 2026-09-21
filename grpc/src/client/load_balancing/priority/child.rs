@@ -54,6 +54,7 @@ use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::ParsedJsonLbConfig;
 use crate::client::load_balancing::WorkData;
+use crate::client::load_balancing::WorkScheduler;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchLbConfig;
 use crate::client::load_balancing::graceful_switch::GracefulSwitchPolicy;
 use crate::client::load_balancing::subchannel::Subchannel;
@@ -207,18 +208,6 @@ impl LbPolicy for ChildPolicy {
             .resolver_update(update, Some(&gs_cfg), &mut wrapped_controller)
     }
 
-    fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        let mut wrapped_controller =
-            WrappedController::new(channel_controller, self.ignore_reresolution_requests);
-        self.graceful_switch
-            .subchannel_update(subchannel, state, &mut wrapped_controller);
-    }
-
     fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
         let mut wrapped_controller =
             WrappedController::new(channel_controller, self.ignore_reresolution_requests);
@@ -252,8 +241,13 @@ impl<'a> WrappedController<'a> {
 }
 
 impl ChannelController for WrappedController<'_> {
-    fn new_subchannel(&mut self, address: &Address) -> (Arc<dyn Subchannel>, SubchannelState) {
-        self.channel_controller.new_subchannel(address)
+    fn new_subchannel(
+        &mut self,
+        address: &Address,
+        work_scheduer: Arc<dyn WorkScheduler>,
+    ) -> (Arc<dyn Subchannel>, SubchannelState) {
+        self.channel_controller
+            .new_subchannel(address, work_scheduer)
     }
 
     fn update_picker(&mut self, update: LbState) {
@@ -273,7 +267,7 @@ mod test {
     use std::sync::mpsc;
 
     use super::*;
-    use crate::client::ConnectivityState;
+    use crate::client::load_balancing::test_utils;
     use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEvent;
     use crate::client::load_balancing::test_utils::TestWorkScheduler;
@@ -359,14 +353,19 @@ mod test {
 
         // Fail the single subchannel. Since all addresses in pick_first fail,
         // it enters TRANSIENT_FAILURE and requests re-resolution.
-        child_lb.subchannel_update(
-            subchannel,
-            &SubchannelState {
-                connectivity_state: ConnectivityState::TransientFailure,
-                last_connection_error: Some("connection refused".to_string()),
-            },
-            &mut tcc,
+        test_utils::schedule_subchannel_update(
+            &subchannel,
+            SubchannelState::transient_failure("connection refused"),
         );
+        let mut work = Vec::new();
+        while let Ok(event) = rx_events.try_recv() {
+            if let TestEvent::ScheduleWork(data) = event {
+                work.push(data);
+            }
+        }
+        for data in work {
+            child_lb.work(data, &mut tcc);
+        }
 
         // Check whether RequestResolution was received by the channel.
         let mut requested_resolution = false;

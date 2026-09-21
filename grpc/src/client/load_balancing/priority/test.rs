@@ -39,6 +39,7 @@ use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::endpoint_filtering;
 use crate::client::load_balancing::pick_first::PickFirstConfig;
+use crate::client::load_balancing::subchannel::SubchannelUpdate;
 use crate::client::load_balancing::test_utils;
 use crate::client::load_balancing::test_utils::StubPolicyFuncs;
 use crate::client::load_balancing::test_utils::TestChannelController;
@@ -165,6 +166,31 @@ fn recv_schedule_work(rx: &mpsc::Receiver<TestEvent>) -> Option<WorkData> {
     }
 }
 
+/// Returns the state of the last `UpdatePicker` event currently queued, if
+/// any. Consumes all pending events.
+fn last_picker_update(rx: &mpsc::Receiver<TestEvent>) -> Option<LbState> {
+    rx.try_iter()
+        .filter_map(|e| match e {
+            TestEvent::UpdatePicker(state) => Some(state),
+            _ => None,
+        })
+        .last()
+}
+
+/// Simulates a state change of `subchannel` and delivers the resulting work
+/// item to the policy, exactly as the channel would.
+///
+/// Note that any events queued before the update are discarded.
+fn move_subchannel_to_state(
+    env: &mut TestEnv,
+    subchannel: &Arc<dyn Subchannel>,
+    state: SubchannelState,
+) {
+    test_utils::schedule_subchannel_update(subchannel, state);
+    let data = recv_schedule_work(&env.rx_events);
+    env.policy.work(data, &mut env.tcc);
+}
+
 /// Advances virtual time by `duration` on the paused Tokio runtime.
 ///
 /// Yields execution before advancing so that any newly spawned background timer
@@ -236,7 +262,7 @@ fn new_stub(policy_name: &'static str) -> ControllableStubHandle {
     let funcs = StubPolicyFuncs {
         resolver_update: Some(Arc::new({
             let handle = handle_clone.clone();
-            move |_data, update, _cfg, controller| {
+            move |data, update, _cfg, controller| {
                 let addr = update
                     .endpoints
                     .as_ref()
@@ -245,20 +271,27 @@ fn new_stub(policy_name: &'static str) -> ControllableStubHandle {
                     .and_then(|e| e.addresses.first())
                     .cloned()
                     .unwrap_or_default();
-                let (subchannel, _) = controller.new_subchannel(&addr);
+                let (subchannel, _) =
+                    controller.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone());
                 handle.set_subchannel(Some(subchannel));
                 Ok(())
             }
         })),
-        subchannel_update: Some(Arc::new({
+        // Subchannel state changes are delivered as SubchannelUpdate work
+        // items.
+        work: Some(Arc::new({
             let handle = handle_clone;
-            move |_data, _subchannel, state, controller| {
-                if state.connectivity_state == ConnectivityState::TransientFailure {
+            move |_data, work_data, controller| {
+                let update = work_data
+                    .expect("expected work data")
+                    .downcast::<SubchannelUpdate>()
+                    .expect("expected SubchannelUpdate");
+                if update.state.connectivity_state == ConnectivityState::TransientFailure {
                     handle.set_resolution_requested(true);
                     controller.request_resolution();
                 }
                 controller.update_picker(LbState {
-                    connectivity_state: state.connectivity_state,
+                    connectivity_state: update.state.connectivity_state,
                     picker: Arc::new(QueuingPicker {}),
                 });
             }
@@ -353,8 +386,7 @@ async fn high_priority_ready_and_add_remove_lower() {
     );
 
     // Make child-0 Ready.
-    env.policy
-        .subchannel_update(sc0.clone(), &SubchannelState::ready(), &mut env.tcc);
+    move_subchannel_to_state(&mut env, &sc0, SubchannelState::ready());
 
     let last_picker = env
         .rx_events
@@ -438,14 +470,13 @@ async fn switch_priority_failover_and_failback() {
     let sc0 = stub_handle0
         .subchannel()
         .expect("child-0 subchannel created");
-    env.policy
-        .subchannel_update(sc0.clone(), &SubchannelState::ready(), &mut env.tcc);
+    move_subchannel_to_state(&mut env, &sc0, SubchannelState::ready());
 
     // Turn down child-0 with TransientFailure.
-    env.policy.subchannel_update(
-        sc0.clone(),
-        &SubchannelState::transient_failure("connection refused"),
-        &mut env.tcc,
+    move_subchannel_to_state(
+        &mut env,
+        &sc0,
+        SubchannelState::transient_failure("connection refused"),
     );
 
     // Failover: child-1 is lazily created and starts connecting.
@@ -454,8 +485,7 @@ async fn switch_priority_failover_and_failback() {
         .expect("child-1 should be created on failover");
 
     // Make child-1 Ready.
-    env.policy
-        .subchannel_update(sc1.clone(), &SubchannelState::ready(), &mut env.tcc);
+    move_subchannel_to_state(&mut env, &sc1, SubchannelState::ready());
 
     let last_picker = env
         .rx_events
@@ -469,8 +499,7 @@ async fn switch_priority_failover_and_failback() {
     assert_eq!(last_picker.connectivity_state, ConnectivityState::Ready);
 
     // Failback: child-0 recovers to Ready.
-    env.policy
-        .subchannel_update(sc0.clone(), &SubchannelState::ready(), &mut env.tcc);
+    move_subchannel_to_state(&mut env, &sc0, SubchannelState::ready());
 
     // child-0 is selected again.
     // child-1 is deactivated with a 15-minute timer.
@@ -591,8 +620,7 @@ async fn connecting_to_connecting_does_not_restart_timer() {
     advance_time(Duration::from_secs(5)).await;
 
     // Send another Connecting update for child-0.
-    env.policy
-        .subchannel_update(sc0.clone(), &SubchannelState::connecting(), &mut env.tcc);
+    move_subchannel_to_state(&mut env, &sc0, SubchannelState::connecting());
 
     // Advance time by 6 seconds (total 11s from start, but only 6s from
     // 2nd update).
@@ -647,20 +675,18 @@ async fn transient_failure_to_connecting_enters_connecting_expired() {
     let sc0 = stub_handle0.subchannel().unwrap();
 
     // child-0 goes to TransientFailure.
-    env.policy.subchannel_update(
-        sc0.clone(),
-        &SubchannelState::transient_failure("fail"),
-        &mut env.tcc,
-    );
+    move_subchannel_to_state(&mut env, &sc0, SubchannelState::transient_failure("fail"));
 
     // child-1 is initialized and goes Ready.
     let sc1 = stub_handle1.subchannel().unwrap();
-    env.policy
-        .subchannel_update(sc1.clone(), &SubchannelState::ready(), &mut env.tcc);
+    move_subchannel_to_state(&mut env, &sc1, SubchannelState::ready());
+
+    // child-1 is chosen as the active child.
+    let last_picker = last_picker_update(&env.rx_events).expect("expected picker update");
+    assert_eq!(last_picker.connectivity_state, ConnectivityState::Ready);
 
     // Now child-0 attempts to connect again (TransientFailure -> Connecting).
-    env.policy
-        .subchannel_update(sc0.clone(), &SubchannelState::connecting(), &mut env.tcc);
+    move_subchannel_to_state(&mut env, &sc0, SubchannelState::connecting());
 
     // Per gRFC A56, child-0 enters ConnectingExpired (no new 10s timer).
     assert!(matches!(
@@ -668,17 +694,11 @@ async fn transient_failure_to_connecting_enters_connecting_expired() {
         ChildState::ConnectingExpired(_)
     ));
 
-    // And child-1 (which is Ready) remains the chosen active child!
-    let last_picker = env
-        .rx_events
-        .try_iter()
-        .filter_map(|e| match e {
-            TestEvent::UpdatePicker(s) => Some(s),
-            _ => None,
-        })
-        .last()
-        .unwrap();
-    assert_eq!(last_picker.connectivity_state, ConnectivityState::Ready);
+    // And child-1 (which is Ready) remains the chosen active child, so any
+    // picker published after child-0 started connecting still reports Ready.
+    if let Some(picker) = last_picker_update(&env.rx_events) {
+        assert_eq!(picker.connectivity_state, ConnectivityState::Ready);
+    }
 }
 
 /// Verifies the 15-minute deactivation retention timer, background update
@@ -719,18 +739,12 @@ async fn deactivation_and_reactivation() {
     let sc0 = stub_handle0.subchannel().unwrap();
 
     // child-0 fails -> failover to child-1.
-    env.policy.subchannel_update(
-        sc0.clone(),
-        &SubchannelState::transient_failure("fail"),
-        &mut env.tcc,
-    );
+    move_subchannel_to_state(&mut env, &sc0, SubchannelState::transient_failure("fail"));
     let sc1 = stub_handle1.subchannel().unwrap();
-    env.policy
-        .subchannel_update(sc1.clone(), &SubchannelState::ready(), &mut env.tcc);
+    move_subchannel_to_state(&mut env, &sc1, SubchannelState::ready());
 
     // child-0 recovers -> failback to child-0.
-    env.policy
-        .subchannel_update(sc0.clone(), &SubchannelState::ready(), &mut env.tcc);
+    move_subchannel_to_state(&mut env, &sc0, SubchannelState::ready());
 
     // child-1 is deactivated with a 15-minute timer.
     assert!(matches!(
@@ -740,8 +754,7 @@ async fn deactivation_and_reactivation() {
 
     // While deactivated, background updates to child-1 do NOT cancel
     // deactivation.
-    env.policy
-        .subchannel_update(sc1.clone(), &SubchannelState::connecting(), &mut env.tcc);
+    move_subchannel_to_state(&mut env, &sc1, SubchannelState::connecting());
     assert!(matches!(
         env.policy.child_data.get("child-1").unwrap().state,
         ChildState::Deactivated(_, _)
@@ -762,10 +775,10 @@ async fn deactivation_and_reactivation() {
 
     // Now child-0 fails again. child-1 should be reactivated.
     stub_handle1.set_subchannel(None);
-    env.policy.subchannel_update(
-        sc0.clone(),
-        &SubchannelState::transient_failure("fail again"),
-        &mut env.tcc,
+    move_subchannel_to_state(
+        &mut env,
+        &sc0,
+        SubchannelState::transient_failure("fail again"),
     );
 
     assert!(
@@ -814,11 +827,7 @@ async fn ignore_reresolution_requests_configuration() {
 
     // child-0 enters TransientFailure (our stub calls
     // request_resolution()).
-    env.policy.subchannel_update(
-        sc0.clone(),
-        &SubchannelState::transient_failure("fail"),
-        &mut env.tcc,
-    );
+    move_subchannel_to_state(&mut env, &sc0, SubchannelState::transient_failure("fail"));
     assert!(stub_handle0.resolution_requested());
 
     // Since child-0 has ignoreReresolutionRequests = true, tcc did NOT
@@ -837,11 +846,7 @@ async fn ignore_reresolution_requests_configuration() {
 
     // child-1 enters TransientFailure (our stub calls
     // request_resolution()).
-    env.policy.subchannel_update(
-        sc1.clone(),
-        &SubchannelState::transient_failure("fail"),
-        &mut env.tcc,
-    );
+    move_subchannel_to_state(&mut env, &sc1, SubchannelState::transient_failure("fail"));
     assert!(stub_handle1.resolution_requested());
 
     // Since child-1 has ignoreReresolutionRequests = false, tcc DOES
@@ -939,7 +944,7 @@ async fn work_item_filtering_drops_timer_work_and_forwards_child_work() {
                 .and_then(|e| e.addresses.first())
                 .cloned()
                 .unwrap_or_default();
-            controller.new_subchannel(&addr);
+            controller.new_subchannel(&addr, data.lb_policy_options.work_scheduler.clone());
             // Schedule work from the child policy!
             data.lb_policy_options.work_scheduler.schedule_work(None);
             Ok(())
@@ -1031,8 +1036,7 @@ async fn picker_updates_are_debounced_for_inactive_child_events() {
     let sc0 = stub_handle0.subchannel().unwrap();
 
     // Transition child-0 to Ready.
-    env.policy
-        .subchannel_update(sc0.clone(), &SubchannelState::ready(), &mut env.tcc);
+    move_subchannel_to_state(&mut env, &sc0, SubchannelState::ready());
 
     // Drain events; verify child-0 published Ready.
     let mut saw_ready = false;
