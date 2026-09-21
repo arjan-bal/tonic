@@ -57,7 +57,7 @@
 //! - Lazy creation: Child policies are not instantiated upfront for every
 //!   configured priority. Instead, each child is created on-demand only when
 //!   the priority selection algorithm needs to attempt using that priority tier
-//!   (see [gRFC A56 §Child Lifetime Management]).
+//!   (see [gRFC A56 (Section Child Lifetime Management)]).
 //! - Failback & Deactivation: When a higher-priority child becomes `READY` or
 //!   `IDLE`, previously active lower-priority children are not immediately
 //!   destroyed. Doing so would cause costly connection re-establishment if
@@ -73,8 +73,8 @@
 //! # Connectivity State Tracking & Failover Timer
 //!
 //! Each child has an associated 10-second failover timer started when the child
-//! begins attempting to connect (see [gRFC A56 §Child Connectivity State
-//! Tracking]):
+//! begins attempting to connect (see
+//! [gRFC A56 (Section Child Connectivity State Tracking)]):
 //! - While this timer is running, the priority selection algorithm waits on
 //!   this child before falling over to lower priorities.
 //! - The timer is cancelled if the child reports `READY`, `IDLE`, or
@@ -89,11 +89,11 @@
 //!   https://github.com/grpc/proposal/blob/master/A37-xds-aggregate-and-logical-dns-clusters.md
 //! [gRFC A56: `priority_experimental` LB policy]:
 //!   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md
-//! [gRFC A56 §Child Lifetime Management]:
+//! [gRFC A56 (Section Child Lifetime Management)]:
 //!   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#child-lifetime-management
-//! [gRFC A56 §Child Connectivity State Tracking]:
+//! [gRFC A56 (Section Child Connectivity State Tracking)]:
 //!   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#child-connectivity-state-tracking
-//! [gRFC A56 §Algorithm for Choosing a Priority]:
+//! [gRFC A56 (Section Algorithm for Choosing a Priority)]:
 //!   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#algorithm-for-choosing-a-priority
 //! [gRFC A56: Hierarchical Addresses]:
 //!   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#hierarchical-addresses
@@ -126,7 +126,7 @@ use crate::client::load_balancing::child_manager::ChildManager;
 use crate::client::load_balancing::child_manager::ChildUpdate;
 use crate::client::load_balancing::endpoint_filtering;
 use crate::client::load_balancing::priority::child::ChildBuilder;
-use crate::client::load_balancing::priority::child::ChildConfig;
+use crate::client::load_balancing::priority::child::PriorityChildConfig;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::rt::BoxedTaskHandle;
 use crate::rt::GrpcRuntime;
@@ -138,18 +138,18 @@ pub static POLICY_NAME: &str = "priority_experimental";
 
 /// Failover timeout for a child attempting to connect (10 seconds).
 ///
-/// Per [gRFC A56 §Child Connectivity State Tracking], each child has a
+/// Per [gRFC A56 (Section Child Connectivity State Tracking)], each child has a
 /// 10-second failover timer that starts when it begins attempting to connect.
 /// While this timer is active, the priority selection algorithm waits for
 /// this child to connect before failing over to lower priorities.
 ///
-/// [gRFC A56 §Child Connectivity State Tracking]:
+/// [gRFC A56 (Section Child Connectivity State Tracking)]:
 ///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#child-connectivity-state-tracking
 const CONNECTING_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Retention timeout for deactivated lower-priority children (15 minutes).
 ///
-/// Per [gRFC A56 §Child Lifetime Management], when switching to a
+/// Per [gRFC A56 (Section Child Lifetime Management)], when switching to a
 /// higher-priority child, active lower-priority children are deactivated and
 /// retained for up to 15 minutes to prevent connection churn if the higher
 /// priority flaps.
@@ -158,7 +158,7 @@ const CONNECTING_TIMEOUT: Duration = Duration::from_secs(10);
 /// deactivations (Case 1); children removed from the configuration (Case 2)
 /// are dropped immediately.
 ///
-/// [gRFC A56 §Child Lifetime Management]:
+/// [gRFC A56 (Section Child Lifetime Management)]:
 ///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#child-lifetime-management
 /// [gRFC A115]:
 ///   https://github.com/grpc/proposal/blob/master/A115-remove-priority-lb-child-policy-cache.md
@@ -173,7 +173,7 @@ pub fn reg() {
 /// Parsed configuration for the `priority_experimental` load balancing policy.
 ///
 /// Corresponds to `PriorityLoadBalancingPolicyConfig` defined in
-/// [gRFC A56 §LB Policy Configuration]:
+/// [gRFC A56 (Section LB Policy Configuration)]:
 ///
 /// ```proto
 /// message PriorityLoadBalancingPolicyConfig {
@@ -182,7 +182,7 @@ pub fn reg() {
 /// }
 /// ```
 ///
-/// [gRFC A56 §LB Policy Configuration]:
+/// [gRFC A56 (Section LB Policy Configuration)]:
 ///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#lb-policy-configuration
 #[derive(Debug, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -196,7 +196,7 @@ struct PriorityConfig {
     /// Names correspond to entries in [`priorities`]. Decoupling names from
     /// priority positions allows existing children to be moved between
     /// priorities without recreating the child policy and its subchannels.
-    children: HashMap<String, ChildConfig>,
+    children: HashMap<String, PriorityChildConfig>,
 }
 
 impl PriorityConfig {
@@ -227,7 +227,7 @@ struct ChildData {
     /// The current lifecycle and connectivity state of the child policy.
     state: ChildState,
     /// The active dynamic LB configuration for this child.
-    child_config: ChildConfig,
+    child_config: PriorityChildConfig,
     /// The latest name resolver update received for this child.
     ///
     /// Preserved so that if this child is deactivated and later reactivated,
@@ -289,9 +289,9 @@ impl Timer {
 /// Lifecycle and connectivity states of a child policy under
 /// `priority_experimental`.
 ///
-/// [gRFC A56 §Child Lifetime Management]:
+/// [gRFC A56 (Section Child Lifetime Management)]:
 ///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#child-lifetime-management
-/// [gRFC A56 §Child Connectivity State Tracking]:
+/// [gRFC A56 (Section Child Connectivity State Tracking)]:
 ///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#child-connectivity-state-tracking
 #[derive(Debug)]
 enum ChildState {
@@ -300,7 +300,7 @@ enum ChildState {
     ///
     /// It will be lazily created and initialized with
     /// [`ChildData::latest_update`] when evaluated during priority selection
-    /// (see [gRFC A56 §Child Lifetime Management]).
+    /// (see [gRFC A56 (Section Child Lifetime Management)]).
     Uninitialized,
 
     /// The child is actively attempting to connect, with a 10-second failover
@@ -308,7 +308,7 @@ enum ChildState {
     ///
     /// While this timer is active, priority selection will wait for this child
     /// before evaluating lower priorities (see
-    /// [gRFC A56 §Child Connectivity State Tracking]).
+    /// [gRFC A56 (Section Child Connectivity State Tracking)]).
     Connecting(Timer, LbState),
 
     /// The child is in `CONNECTING` state, but its 10-second failover timer has
@@ -316,7 +316,7 @@ enum ChildState {
     ///
     /// The child continues attempting connection in the background, but
     /// priority selection may now proceed to check lower priorities (see
-    /// [gRFC A56 §Child Connectivity State Tracking]).
+    /// [gRFC A56 (Section Child Connectivity State Tracking)]).
     ConnectingExpired(LbState),
 
     /// The child reported `TRANSIENT_FAILURE`.
@@ -337,7 +337,8 @@ enum ChildState {
     /// A 15-minute deactivation timer is running ([`DEACTIVATION_TIMEOUT`]).
     /// If higher priorities fail before this timer expires, the child will be
     /// reactivated immediately without connection churn. If the timer expires,
-    /// the child is destroyed (see [gRFC A56 §Child Lifetime Management]).
+    /// the child is destroyed (see
+    /// [gRFC A56 (Section Child Lifetime Management)]).
     ///
     /// Per [gRFC A115], only children still configured in `PriorityConfig`
     /// enter this state; unconfigured children are removed immediately.
@@ -482,8 +483,8 @@ impl LbPolicy for PriorityPolicy {
             });
 
         // Update children in ChildManager. As specified in gRFC A56
-        // §Configuration Updates, priority re-evaluation is deferred until
-        // all child updates have been applied.
+        // (Section Configuration Updates), priority re-evaluation is deferred
+        // until all child updates have been applied.
         let res = self.child_mgr.update(child_updates, channel_controller);
         self.reconcile(channel_controller);
         res
@@ -546,8 +547,8 @@ impl PriorityPolicy {
             child_data.state = match old_state {
                 ChildState::Deactivated(timer, _) => {
                     // While deactivated, retain the 15-minute deactivation
-                    // timer and record the updated LbState (see gRFC A56 §Child
-                    // Lifetime Management).
+                    // timer and record the updated LbState (see gRFC A56
+                    // (Section Child Lifetime Management)).
                     ChildState::Deactivated(timer, lb_state)
                 }
                 ChildState::Uninitialized => {
@@ -593,7 +594,7 @@ impl PriorityPolicy {
     /// route traffic.
     ///
     /// Implements the idempotent selection algorithm defined in
-    /// [gRFC A56 §Algorithm for Choosing a Priority]:
+    /// [gRFC A56 (Section Algorithm for Choosing a Priority)]:
     ///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#algorithm-for-choosing-a-priority
     fn choose_priority(&mut self, channel_controller: &mut dyn ChannelController) {
         // If priority list is empty, report TRANSIENT_FAILURE with
@@ -821,8 +822,8 @@ impl PriorityPolicy {
     /// Expired children revert to [`ChildState::Uninitialized`] and are removed
     /// from [`ChildManager`] to tear down their subchannels. They are NOT
     /// removed from `self.child_data` so they can be lazily re-created if
-    /// higher priorities fail later (see [gRFC A56 §Child Lifetime
-    /// Management]).
+    /// higher priorities fail later (see [gRFC A56 (Section Child Lifetime
+    /// Management)]).
     fn handle_deactivation_timer(&mut self) {
         let mut any_expired = false;
         for child_data in self.child_data.values_mut() {

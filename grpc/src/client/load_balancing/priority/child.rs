@@ -34,9 +34,9 @@
 //!
 //! It also implements re-resolution filtering as specified in [gRFC A37] and
 //! [gRFC A56]: if `ignore_reresolution_requests` is set to `true` in
-//! [`ChildConfig`], re-resolution requests triggered by this child (e.g., when
-//! it enters `TRANSIENT_FAILURE`) are intercepted and suppressed via
-//! [`WrappedController`], preventing redundant name resolution churn.
+//! [`PriorityChildConfig`], re-resolution requests triggered by this child
+//! (e.g., when it enters `TRANSIENT_FAILURE`) are intercepted and suppressed
+//! via [`WrappedController`], preventing redundant name resolution churn.
 //!
 //! [gRFC A37]:
 //!   https://github.com/grpc/proposal/blob/master/A37-xds-aggregate-and-logical-dns-clusters.md
@@ -69,7 +69,7 @@ use crate::core::Address;
 ///
 /// Corresponds to the protobuf message
 /// `PriorityLoadBalancingPolicyConfig.Child` defined in
-/// [gRFC A56 §LB Policy Configuration]:
+/// [gRFC A56 (Section LB Policy Configuration)]:
 ///
 /// ```proto
 /// message Child {
@@ -78,11 +78,16 @@ use crate::core::Address;
 /// }
 /// ```
 ///
-/// [gRFC A56 §LB Policy Configuration]:
+/// [gRFC A56 (Section LB Policy Configuration)]:
 ///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#lb-policy-configuration
 #[derive(Debug, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ChildConfig {
+pub(super) struct PriorityChildConfig {
+    /// The child load balancing policy configuration, specifying the policy
+    /// to instantiate (e.g., `round_robin`, `pick_first`, `weighted_target`)
+    /// and its policy-specific configuration.
+    config: ChildPolicyConfig,
+
     /// If `true`, re-resolution requests from this child policy will be ignored
     /// and not forwarded to the channel controller.
     ///
@@ -95,12 +100,7 @@ pub(super) struct ChildConfig {
     /// [gRFC A56]:
     ///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md
     #[serde(default)]
-    pub(super) ignore_reresolution_requests: bool,
-
-    /// The child load balancing policy configuration, specifying the policy
-    /// to instantiate (e.g., `round_robin`, `pick_first`, `weighted_target`)
-    /// and its policy-specific configuration.
-    pub(super) config: ChildLbConfig,
+    ignore_reresolution_requests: bool,
 }
 
 /// Parsed load balancing policy configuration for a child balancer.
@@ -109,12 +109,12 @@ pub(super) struct ChildConfig {
 /// load balancing policy is present (i.e. `as_ref()` is `Some`), failing
 /// deserialization otherwise.
 #[derive(Debug, Clone)]
-pub(super) struct ChildLbConfig {
-    pub(super) builder: Arc<DynLbPolicyBuilder>,
-    pub(super) config: Option<DynLbConfig>,
+struct ChildPolicyConfig {
+    builder: Arc<DynLbPolicyBuilder>,
+    lb_config: Option<DynLbConfig>,
 }
 
-impl<'de> serde::Deserialize<'de> for ChildLbConfig {
+impl<'de> serde::Deserialize<'de> for ChildPolicyConfig {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -124,7 +124,10 @@ impl<'de> serde::Deserialize<'de> for ChildLbConfig {
             serde::de::Error::custom("child load balancing policy config must not be empty")
         })?;
         let LbInnerConfig { builder, config } = inner.clone();
-        Ok(Self { builder, config })
+        Ok(Self {
+            builder,
+            lb_config: config,
+        })
     }
 }
 
@@ -132,7 +135,7 @@ impl<'de> serde::Deserialize<'de> for ChildLbConfig {
 ///
 /// Produces wrapped LB policy instances that wrap a [`GracefulSwitchPolicy`]
 /// and filter re-resolution requests if
-/// [`ChildConfig::ignore_reresolution_requests`] is set to `true`.
+/// [`PriorityChildConfig::ignore_reresolution_requests`] is set to `true`.
 ///
 /// This builder is used internally by the priority policy to instantiate
 /// children managed by [`ChildManager`], and is not registered in
@@ -174,9 +177,9 @@ impl LbPolicyBuilder for ChildBuilder {
 /// It delegates load balancing duties to an inner [`GracefulSwitchPolicy`]
 /// while intercepting control operations from the child to the channel
 /// controller. Specifically, if `ignore_reresolution_requests` is enabled in
-/// the active [`ChildConfig`], re-resolution requests from the child are
-/// filtered out to prevent unnecessary DNS/resolver queries during priority
-/// failovers.
+/// the active [`PriorityChildConfig`], re-resolution requests from the child
+/// are filtered out to prevent unnecessary DNS/resolver queries during
+/// priority failovers.
 #[derive(Debug)]
 pub(super) struct ChildPolicy {
     graceful_switch: GracefulSwitchPolicy,
@@ -184,7 +187,7 @@ pub(super) struct ChildPolicy {
 }
 
 impl LbPolicy for ChildPolicy {
-    type LbConfig = ChildConfig;
+    type LbConfig = PriorityChildConfig;
 
     fn resolver_update(
         &mut self,
@@ -192,17 +195,17 @@ impl LbPolicy for ChildPolicy {
         config: Option<&Self::LbConfig>,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
-        let Some(config) = config else {
+        let Some(priority_child_cfg) = config else {
             return Err(
                 "priority child balancer received update with missing LB config".to_owned(),
             );
         };
-        self.ignore_reresolution_requests = config.ignore_reresolution_requests;
+        self.ignore_reresolution_requests = priority_child_cfg.ignore_reresolution_requests;
         let mut wrapped_controller =
             WrappedController::new(channel_controller, self.ignore_reresolution_requests);
         let gs_cfg = GracefulSwitchLbConfig::new(
-            config.config.builder.clone(),
-            config.config.config.clone(),
+            priority_child_cfg.config.builder.clone(),
+            priority_child_cfg.config.lb_config.clone(),
         );
         self.graceful_switch
             .resolver_update(update, Some(&gs_cfg), &mut wrapped_controller)
@@ -267,6 +270,7 @@ mod test {
     use std::sync::mpsc;
 
     use super::*;
+    use crate::client::load_balancing::pick_first::PickFirstConfig;
     use crate::client::load_balancing::test_utils;
     use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEvent;
@@ -277,14 +281,14 @@ mod test {
     #[test]
     fn test_child_lb_config_empty_fails() {
         let json = r#"[]"#;
-        let res: Result<ChildLbConfig, _> = serde_json::from_str(json);
+        let res: Result<ChildPolicyConfig, _> = serde_json::from_str(json);
         assert!(res.is_err());
     }
 
     #[test]
     fn test_child_lb_config_unsupported_fails() {
         let json = r#"[{"unsupported_policy": {}}]"#;
-        let res: Result<ChildLbConfig, _> = serde_json::from_str(json);
+        let res: Result<ChildPolicyConfig, _> = serde_json::from_str(json);
         assert!(res.is_err());
     }
 
@@ -294,14 +298,61 @@ mod test {
             "config": [],
             "ignoreReresolutionRequests": false
         }"#;
-        let res: Result<ChildConfig, _> = serde_json::from_str(json);
+        let res: Result<PriorityChildConfig, _> = serde_json::from_str(json);
         assert!(res.is_err());
     }
 
-    /// Runs an end-to-end test using a [`ChildPolicy`] wrapping a `pick_first`
-    /// child. Sends a resolver update with a single endpoint, triggers a
-    /// failure on the created subchannel, and checks whether
-    /// `RequestResolution` was forwarded to the channel controller.
+    /// Verifies that a child config without `ignoreReresolutionRequests`
+    /// defaults the flag to `false`, and that a child policy without its own
+    /// configuration parses into a builder with no config.
+    #[test]
+    fn test_child_config_defaults() {
+        let json = r#"{"config": [{"round_robin": {}}]}"#;
+        let cfg: PriorityChildConfig = serde_json::from_str(json).unwrap();
+
+        assert!(!cfg.ignore_reresolution_requests);
+        assert_eq!(cfg.config.builder.name(), "round_robin");
+        assert!(cfg.config.lb_config.is_none());
+    }
+
+    /// Verifies that `ignoreReresolutionRequests` and the policy-specific
+    /// configuration of the child policy are parsed.
+    #[test]
+    fn test_child_config_with_policy_config() {
+        let json = r#"{
+            "config": [{"pick_first": {"shuffleAddressList": true}}],
+            "ignoreReresolutionRequests": true
+        }"#;
+        let cfg: PriorityChildConfig = serde_json::from_str(json).unwrap();
+
+        assert!(cfg.ignore_reresolution_requests);
+        assert_eq!(cfg.config.builder.name(), "pick_first");
+        let pf_cfg = cfg
+            .config
+            .lb_config
+            .as_ref()
+            .expect("expected pick_first config")
+            .downcast_ref::<PickFirstConfig>()
+            .expect("expected a PickFirstConfig");
+        assert!(pf_cfg.shuffle_address_list);
+    }
+
+    /// Verifies that the first supported policy in the list is selected, as
+    /// specified in gRFC A24 (Section Service Config Changes).
+    #[test]
+    fn test_child_config_picks_first_supported_policy() {
+        let json = r#"{
+            "config": [{"unsupported_policy": {}}, {"round_robin": {}}]
+        }"#;
+        let cfg: PriorityChildConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(cfg.config.builder.name(), "round_robin");
+    }
+
+    /// Runs a test using a [`ChildPolicy`] wrapping a `pick_first` child. Sends
+    /// a resolver update with a single endpoint, triggers a failure on the
+    /// created subchannel, and checks whether `RequestResolution` was forwarded
+    /// to the channel controller.
     fn test_pick_first_child_resolution_request(ignore: bool) -> bool {
         let (tx_events, rx_events) = mpsc::channel();
         let mut tcc = TestChannelController {
@@ -321,7 +372,7 @@ mod test {
               "ignoreReresolutionRequests": {ignore}
             }}"#
         );
-        let cfg: ChildConfig = serde_json::from_str(&json).unwrap();
+        let cfg: PriorityChildConfig = serde_json::from_str(&json).unwrap();
 
         let endpoint = Endpoint {
             addresses: vec![Address {

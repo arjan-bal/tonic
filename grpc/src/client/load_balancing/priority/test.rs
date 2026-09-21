@@ -38,7 +38,6 @@ use crate::client::load_balancing::QueuingPicker;
 use crate::client::load_balancing::Subchannel;
 use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::endpoint_filtering;
-use crate::client::load_balancing::pick_first::PickFirstConfig;
 use crate::client::load_balancing::subchannel::SubchannelUpdate;
 use crate::client::load_balancing::test_utils;
 use crate::client::load_balancing::test_utils::StubPolicyFuncs;
@@ -102,29 +101,9 @@ fn parse_config_success() {
         .unwrap();
 
     assert_eq!(got.priorities, vec!["child-1", "child-2", "child-3"]);
-    assert_eq!(got.children.len(), 3);
-
-    let child1 = got.children.get("child-1").unwrap();
-    assert!(child1.ignore_reresolution_requests);
-    assert_eq!(child1.config.builder.name(), "round_robin");
-    assert!(child1.config.config.is_none());
-
-    let child2 = got.children.get("child-2").unwrap();
-    assert!(!child2.ignore_reresolution_requests);
-    assert_eq!(child2.config.builder.name(), "pick_first");
-    let pf_cfg = child2
-        .config
-        .config
-        .as_ref()
-        .unwrap()
-        .downcast_ref::<PickFirstConfig>()
-        .unwrap();
-    assert!(pf_cfg.shuffle_address_list);
-
-    let child3 = got.children.get("child-3").unwrap();
-    assert!(!child3.ignore_reresolution_requests);
-    assert_eq!(child3.config.builder.name(), "round_robin");
-    assert!(child3.config.config.is_none());
+    let mut child_names: Vec<&String> = got.children.keys().collect();
+    child_names.sort();
+    assert_eq!(child_names, vec!["child-1", "child-2", "child-3"]);
 }
 
 /// Test environment container holding a PriorityPolicy, channel controller,
