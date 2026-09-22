@@ -57,7 +57,6 @@ gzip = ["dep:flate2"]
 
 [dependencies]
 base64 = "0.22"
-bumpalo = { version = "3.20.3", features = ["boxed"], default-features = false }
 bytes = "1.10.1"
 flate2 = { version = "1.0", optional = true, default-features = false, features = [
     "zlib-rs",
