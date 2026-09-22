@@ -52,7 +52,7 @@ use std::fmt::Display;
 use std::time::Instant;
 
 use crate::async_trait;
-
+use crate::call_attributes::CallAttributes;
 use crate::core::ConnectionInfo;
 use crate::core::RecvMessage;
 use crate::core::SendMessage;
@@ -120,6 +120,7 @@ impl Display for ConnectivityState {
 pub struct CallOptions {
     /// The deadline for the call.  If unset, the call may run indefinitely.
     deadline: Option<Instant>,
+    attributes: CallAttributes,
 }
 
 impl CallOptions {
