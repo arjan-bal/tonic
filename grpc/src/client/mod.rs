@@ -139,6 +139,11 @@ impl CallOptions {
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
+
+    /// Returns a mutable reference to the attributes of the call.
+    pub(crate) fn attributes_mut(&mut self) -> &mut CallAttributes {
+        &mut self.attributes
+    }
 }
 
 /// A trait which may be implemented by types to perform RPCs (Remote Procedure
