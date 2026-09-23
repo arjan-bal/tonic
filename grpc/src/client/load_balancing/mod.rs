@@ -80,9 +80,7 @@ pub trait LbPolicyBuilder: Send + Sync + Debug + 'static {
     fn parse_config(
         &self,
         _config: &ParsedJsonLbConfig,
-    ) -> Result<Option<<Self::LbPolicy as LbPolicy>::LbConfig>, String> {
-        Ok(None)
-    }
+    ) -> Result<<Self::LbPolicy as LbPolicy>::LbConfig, String>;
 }
 
 /// An LB policy instance.
@@ -98,7 +96,7 @@ pub trait LbPolicy: Send + Sync + Debug + 'static {
     fn resolver_update(
         &mut self,
         update: ResolverUpdate,
-        config: Option<&Self::LbConfig>,
+        config: &Self::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String>;
 
@@ -472,7 +470,7 @@ impl<T: LbPolicy + ?Sized> LbPolicy for Box<T> {
     fn resolver_update(
         &mut self,
         update: ResolverUpdate,
-        config: Option<&Self::LbConfig>,
+        config: &Self::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
         (**self).resolver_update(update, config, channel_controller)
@@ -501,7 +499,7 @@ impl<B: LbPolicyBuilder + ?Sized> LbPolicyBuilder for Arc<B> {
     fn parse_config(
         &self,
         config: &ParsedJsonLbConfig,
-    ) -> Result<Option<<B::LbPolicy as LbPolicy>::LbConfig>, String> {
+    ) -> Result<<B::LbPolicy as LbPolicy>::LbConfig, String> {
         (**self).parse_config(config)
     }
 }

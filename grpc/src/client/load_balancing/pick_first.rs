@@ -61,13 +61,13 @@ pub static POLICY_NAME: &str = "pick_first";
 type ShufflerFn = dyn Fn(&mut [Endpoint]) + Send + Sync + 'static;
 
 #[derive(Debug, serde::Deserialize, Clone, Default)]
-pub struct PickFirstConfig {
+pub(crate) struct PickFirstConfig {
     #[serde(default, rename = "shuffleAddressList")]
-    pub shuffle_address_list: bool,
+    shuffle_address_list: bool,
 }
 
 #[derive(Debug)]
-pub struct PickFirstBuilder {}
+pub(crate) struct PickFirstBuilder {}
 
 impl LbPolicyBuilder for PickFirstBuilder {
     type LbPolicy = PickFirstPolicy;
@@ -92,9 +92,9 @@ impl LbPolicyBuilder for PickFirstBuilder {
         POLICY_NAME
     }
 
-    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<Option<PickFirstConfig>, String> {
+    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<PickFirstConfig, String> {
         let config: PickFirstConfig = config.convert_to().map_err(|e| e.to_string())?;
-        Ok(Some(config))
+        Ok(config)
     }
 }
 
@@ -102,7 +102,7 @@ pub(crate) fn reg() {
     super::GLOBAL_LB_REGISTRY.add_builder(PickFirstBuilder {});
 }
 
-pub struct PickFirstPolicy {
+pub(crate) struct PickFirstPolicy {
     work_scheduler: Arc<dyn WorkScheduler>,
     runtime: GrpcRuntime,
     connectivity_state: ConnectivityState,
@@ -401,11 +401,11 @@ impl PickFirstPolicy {
     fn compile_address(
         &mut self,
         mut endpoints: Vec<Endpoint>,
-        config: Option<&PickFirstConfig>,
+        config: &PickFirstConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Vec<Address> {
         // Shuffle endpoints if enabled.
-        if config.is_some_and(|c| c.shuffle_address_list) {
+        if config.shuffle_address_list {
             (self.shuffler)(&mut endpoints);
         }
 
@@ -542,7 +542,7 @@ impl LbPolicy for PickFirstPolicy {
     fn resolver_update(
         &mut self,
         update: ResolverUpdate,
-        config: Option<&Self::LbConfig>,
+        config: &Self::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
         self.timer = None;
@@ -884,7 +884,7 @@ mod test {
                     endpoints: Ok(endpoints),
                     ..Default::default()
                 },
-                None,
+                &PickFirstConfig::default(),
                 controller.as_mut(),
             )
             .unwrap();
@@ -1020,7 +1020,7 @@ mod test {
                     endpoints: Ok(endpoints_new),
                     ..Default::default()
                 },
-                None,
+                &PickFirstConfig::default(),
                 controller.as_mut(),
             )
             .unwrap();
@@ -1120,7 +1120,7 @@ mod test {
                     endpoints: Ok(endpoints),
                     ..Default::default()
                 },
-                Some(&config),
+                &config,
                 controller.as_mut(),
             )
             .unwrap();
@@ -1191,7 +1191,7 @@ mod test {
                     endpoints: Ok(endpoints),
                     ..Default::default()
                 },
-                None,
+                &PickFirstConfig::default(),
                 controller.as_mut(),
             )
             .unwrap();
@@ -1231,7 +1231,7 @@ mod test {
                 endpoints: Ok(vec![]),
                 ..Default::default()
             },
-            None,
+            &PickFirstConfig::default(),
             controller.as_mut(),
         );
 
@@ -1482,7 +1482,7 @@ mod test {
                     endpoints: Ok(endpoints_updated),
                     ..Default::default()
                 },
-                None,
+                &PickFirstConfig::default(),
                 controller.as_mut(),
             )
             .unwrap();
@@ -1520,7 +1520,7 @@ mod test {
                     endpoints: Err(resolver_error.clone()),
                     ..Default::default()
                 },
-                None,
+                &PickFirstConfig::default(),
                 controller.as_mut(),
             )
             .unwrap();

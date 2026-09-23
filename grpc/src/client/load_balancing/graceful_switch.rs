@@ -40,12 +40,12 @@ use crate::rt::GrpcRuntime;
 #[derive(Debug, Clone)]
 pub struct GracefulSwitchLbConfig {
     child_builder: Arc<DynLbPolicyBuilder>,
-    child_config: Option<DynLbConfig>,
+    child_config: DynLbConfig,
 }
 
 impl GracefulSwitchLbConfig {
     /// Creates a new [`GracefulSwitchLbConfig`].
-    pub fn new(child_builder: Arc<DynLbPolicyBuilder>, child_config: Option<DynLbConfig>) -> Self {
+    pub fn new(child_builder: Arc<DynLbPolicyBuilder>, child_config: DynLbConfig) -> Self {
         Self {
             child_builder,
             child_config,
@@ -73,11 +73,9 @@ impl LbPolicy for GracefulSwitchPolicy {
     fn resolver_update(
         &mut self,
         update: ResolverUpdate,
-        config: Option<&Self::LbConfig>,
+        config: &Self::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
-        let config = config.ok_or("graceful switch received no config")?;
-
         if self.active_child_builder.is_none() {
             // When there are no children yet, the current update immediately
             // becomes the active child.
@@ -91,7 +89,7 @@ impl LbPolicy for GracefulSwitchPolicy {
         children.push(ChildUpdate {
             child_policy_builder: config.child_builder.clone(),
             child_identifier: (),
-            child_update: Some((update, config.child_config.as_ref())),
+            child_update: Some((update, &config.child_config)),
         });
 
         // Include the active child if it does not match the updated child so
@@ -244,7 +242,7 @@ mod test {
 
     fn stub_lb_config(name: &str) -> GracefulSwitchLbConfig {
         let builder = GLOBAL_LB_REGISTRY.get_policy(name).unwrap();
-        GracefulSwitchLbConfig::new(builder, None)
+        GracefulSwitchLbConfig::new(builder, Arc::new(()))
     }
 
     struct TestSubchannelList {
@@ -484,7 +482,7 @@ mod test {
             ..Default::default()
         };
         graceful_switch
-            .resolver_update(update.clone(), Some(&parsed_config), &mut *tcc)
+            .resolver_update(update.clone(), &parsed_config, &mut *tcc)
             .unwrap();
 
         let subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
@@ -528,7 +526,7 @@ mod test {
         };
 
         graceful_switch
-            .resolver_update(update.clone(), Some(&parsed_config), &mut *tcc)
+            .resolver_update(update.clone(), &parsed_config, &mut *tcc)
             .unwrap();
 
         // Subchannel creation and ready
@@ -551,7 +549,7 @@ mod test {
         let new_parsed_config =
             stub_lb_config("stub-gracefulswitch_switching_to_resolver_update-two");
         graceful_switch
-            .resolver_update(update.clone(), Some(&new_parsed_config), &mut *tcc)
+            .resolver_update(update.clone(), &new_parsed_config, &mut *tcc)
             .unwrap();
 
         // Simulate subchannel creation and ready for pending
@@ -591,7 +589,7 @@ mod test {
             ..Default::default()
         };
         graceful_switch
-            .resolver_update(update.clone(), Some(&parsed_config), &mut *tcc)
+            .resolver_update(update.clone(), &parsed_config, &mut *tcc)
             .unwrap();
         let subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
         move_subchannel_to_state(
@@ -608,7 +606,7 @@ mod test {
 
         let parsed_config2 = stub_lb_config("stub-gracefulswitch_two_policies_same_type-one");
         graceful_switch
-            .resolver_update(update.clone(), Some(&parsed_config2), &mut *tcc)
+            .resolver_update(update.clone(), &parsed_config2, &mut *tcc)
             .unwrap();
         let subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
         assert_eq!(&*subchannel.address().address, "127.0.0.1:1234");
@@ -645,7 +643,7 @@ mod test {
 
         // Switch to first one (current)
         graceful_switch
-            .resolver_update(update.clone(), Some(&parsed_config), &mut *tcc)
+            .resolver_update(update.clone(), &parsed_config, &mut *tcc)
             .unwrap();
 
         let current_subchannels = verify_subchannel_creation_from_policy(&mut rx_events);
@@ -658,7 +656,7 @@ mod test {
         let new_parsed_config =
             stub_lb_config("stub-gracefulswitch_current_not_ready_pending_update-two");
         graceful_switch
-            .resolver_update(second_update.clone(), Some(&new_parsed_config), &mut *tcc)
+            .resolver_update(second_update.clone(), &new_parsed_config, &mut *tcc)
             .unwrap();
 
         let second_subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
@@ -702,7 +700,7 @@ mod test {
 
         // Switch to first one (current)
         graceful_switch
-            .resolver_update(update.clone(), Some(&parsed_config), &mut *tcc)
+            .resolver_update(update.clone(), &parsed_config, &mut *tcc)
             .unwrap();
 
         let current_subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
@@ -723,7 +721,7 @@ mod test {
         };
         let new_parsed_config = stub_lb_config("stub-gracefulswitch_current_leaving_ready-two");
         graceful_switch
-            .resolver_update(new_update.clone(), Some(&new_parsed_config), &mut *tcc)
+            .resolver_update(new_update.clone(), &new_parsed_config, &mut *tcc)
             .unwrap();
 
         let pending_subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
@@ -773,7 +771,7 @@ mod test {
 
         // Switch to first one (current)
         graceful_switch
-            .resolver_update(update.clone(), Some(&parsed_config), &mut *tcc)
+            .resolver_update(update.clone(), &parsed_config, &mut *tcc)
             .unwrap();
 
         let current_subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
@@ -795,7 +793,7 @@ mod test {
         let new_parsed_config = stub_lb_config("stub-gracefulswitch_current_leaving_ready-two");
 
         graceful_switch
-            .resolver_update(new_update.clone(), Some(&new_parsed_config), &mut *tcc)
+            .resolver_update(new_update.clone(), &new_parsed_config, &mut *tcc)
             .unwrap();
 
         let pending_subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
@@ -850,7 +848,7 @@ mod test {
             ..Default::default()
         };
         graceful_switch
-            .resolver_update(update.clone(), Some(&parsed_config), &mut *tcc)
+            .resolver_update(update.clone(), &parsed_config, &mut *tcc)
             .unwrap();
 
         let current_subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
@@ -874,7 +872,7 @@ mod test {
             "stub-gracefulswitch_subchannels_removed_after_current_child_swapped-two",
         );
         graceful_switch
-            .resolver_update(second_update.clone(), Some(&new_parsed_config), &mut *tcc)
+            .resolver_update(second_update.clone(), &new_parsed_config, &mut *tcc)
             .unwrap();
         let pending_subchannel = verify_subchannel_creation_from_policy(&mut rx_events);
         println!("moving subchannel to idle");
