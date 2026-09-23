@@ -22,6 +22,34 @@
  *
  */
 
+//! A mutable key/value store scoped to a single call.
+//!
+//! This module provides the [`CallAttributes`] type, which carries arbitrary
+//! per-call data along an RPC.
+//!
+//! Values are keyed by their type, so each type can appear at most once. This
+//! lets a component define a private newtype as its key and be sure no other
+//! component will collide with it.
+//!
+//! # Comparison with [`Attributes`](crate::attributes::Attributes)
+//!
+//! [`Attributes`](crate::attributes::Attributes) is a persistent, immutable
+//! map shared between components: adding to it produces a new map.
+//! [`CallAttributes`] instead it is mutated in place.
+//!
+//! # Examples
+//!
+//! ```rust
+//! use grpc::call_attributes::CallAttributes;
+//!
+//! #[derive(Clone, Debug, PartialEq)]
+//! struct UserId(usize);
+//!
+//! let mut attrs = CallAttributes::new();
+//! attrs.add(UserId(42));
+//! assert_eq!(attrs.get::<UserId>(), Some(&UserId(42)));
+//! ```
+
 use std::any::Any;
 use std::any::TypeId;
 
@@ -149,7 +177,34 @@ impl CallAttributes {
     /// value's destructor is executed immediately.
     ///
     /// Runs in O(n), since it scans for an existing entry of type `T`.
-    pub fn insert<T: 'static + Send + Clone>(&mut self, val: T) {
+    ///
+    /// # Examples
+    ///
+    /// Basic usage
+    ///
+    /// ```
+    /// # use grpc::call_attributes::CallAttributes;
+    /// #[derive(Clone, Debug, PartialEq)]
+    /// struct UserId(usize);
+    ///
+    /// #[derive(Clone, Debug, PartialEq)]
+    /// struct TraceId(&'static str);
+    ///
+    /// let mut attrs = CallAttributes::new();
+    ///
+    /// // Values are keyed by their type, so unrelated types coexist.
+    /// attrs.add(UserId(42));
+    /// attrs.add(TraceId("abc"));
+    ///
+    /// assert_eq!(attrs.get::<UserId>(), Some(&UserId(42)));
+    /// assert_eq!(attrs.get::<TraceId>(), Some(&TraceId("abc")));
+    ///
+    /// // Adding a second value of the same type replaces the first one.
+    /// attrs.add(UserId(7));
+    ///
+    /// assert_eq!(attrs.get::<UserId>(), Some(&UserId(7)));
+    /// ```
+    pub fn add<T: 'static + Send + Clone>(&mut self, val: T) {
         let type_id = TypeId::of::<T>();
         for entry in &mut self.items {
             if entry.type_id == type_id {
@@ -166,6 +221,28 @@ impl CallAttributes {
     }
 
     /// Retrieves an immutable reference to the value of type `T`, if present.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage
+    ///
+    /// ```
+    /// # use grpc::call_attributes::CallAttributes;
+    /// #[derive(Clone, Debug, PartialEq)]
+    /// struct UserId(usize);
+    ///
+    /// #[derive(Clone, Debug, PartialEq)]
+    /// struct RetryCount(usize);
+    ///
+    /// let mut attrs = CallAttributes::new();
+    /// attrs.add(UserId(42));
+    ///
+    /// assert_eq!(attrs.get::<UserId>(), Some(&UserId(42)));
+    ///
+    /// // Entries are looked up by type; a type that was never added is
+    /// // absent, even though it wraps the same inner type as `UserId`.
+    /// assert_eq!(attrs.get::<RetryCount>(), None);
+    /// ```
     pub fn get<T: 'static>(&self) -> Option<&T> {
         let type_id = TypeId::of::<T>();
         for entry in &self.items {
@@ -249,8 +326,8 @@ mod tests {
     fn insert_and_get() {
         let mut attrs = CallAttributes::new();
 
-        attrs.insert(UserId(42));
-        attrs.insert(TraceId("trace-1"));
+        attrs.add(UserId(42));
+        attrs.add(TraceId("trace-1"));
 
         assert_eq!(attrs.get::<UserId>(), Some(&UserId(42)));
         assert_eq!(attrs.get::<TraceId>(), Some(&TraceId("trace-1")));
@@ -261,18 +338,18 @@ mod tests {
     fn overwrite_value() {
         let mut attrs = CallAttributes::new();
 
-        attrs.insert(UserId(1));
+        attrs.add(UserId(1));
         assert_eq!(attrs.get::<UserId>(), Some(&UserId(1)));
 
         // Overwrite existing TypeId
-        attrs.insert(UserId(2));
+        attrs.add(UserId(2));
         assert_eq!(attrs.get::<UserId>(), Some(&UserId(2)));
     }
 
     #[test]
     fn get_mut() {
         let mut attrs = CallAttributes::new();
-        attrs.insert(UserId(10));
+        attrs.add(UserId(10));
 
         if let Some(uid) = attrs.get_mut::<UserId>() {
             uid.0 = 20;
@@ -284,7 +361,7 @@ mod tests {
     #[test]
     fn get_mut_absent_type() {
         let mut attrs = CallAttributes::new();
-        attrs.insert(UserId(1));
+        attrs.add(UserId(1));
         assert!(attrs.get_mut::<TraceId>().is_none());
     }
 
@@ -295,11 +372,11 @@ mod tests {
         // that has been moved.
         let mut attrs = CallAttributes::new();
 
-        attrs.insert(10u32);
-        attrs.insert(20u64);
-        attrs.insert("third".to_string());
-        attrs.insert(true);
-        attrs.insert(1.5f64);
+        attrs.add(10u32);
+        attrs.add(20u64);
+        attrs.add("third".to_string());
+        attrs.add(true);
+        attrs.add(1.5f64);
 
         assert_eq!(attrs.get::<u32>(), Some(&10));
         assert_eq!(attrs.get::<u64>(), Some(&20));
@@ -319,9 +396,9 @@ mod tests {
     fn clear_runs_destructors_and_empties() {
         let drops = DropCount::new();
         let mut attrs = CallAttributes::new();
-        attrs.insert(drops.tracked());
-        attrs.insert(UserId(1));
-        attrs.insert(TraceId("t"));
+        attrs.add(drops.tracked());
+        attrs.add(UserId(1));
+        attrs.add(TraceId("t"));
 
         attrs.clear();
 
@@ -330,7 +407,7 @@ mod tests {
         assert_eq!(attrs.get::<TraceId>(), None);
 
         // The collection stays usable after `clear`.
-        attrs.insert(UserId(2));
+        attrs.add(UserId(2));
         assert_eq!(attrs.get::<UserId>(), Some(&UserId(2)));
     }
 
@@ -339,13 +416,13 @@ mod tests {
         // The overwritten entry is neither the first nor the last, so this
         // covers the mid-scan match rather than a boundary.
         let mut attrs = CallAttributes::new();
-        attrs.insert(1u32);
-        attrs.insert(2u64);
-        attrs.insert(3i8);
-        attrs.insert(4i16);
-        attrs.insert(5i64);
+        attrs.add(1u32);
+        attrs.add(2u64);
+        attrs.add(3i8);
+        attrs.add(4i16);
+        attrs.add(5i64);
 
-        attrs.insert(100u64);
+        attrs.add(100u64);
 
         assert_eq!(attrs.get::<u64>(), Some(&100));
         assert_eq!(attrs.get::<u32>(), Some(&1));
@@ -358,10 +435,10 @@ mod tests {
         // rather than appending, otherwise the map grows without bound and
         // `get` starts returning a stale value.
         let mut attrs = CallAttributes::new();
-        attrs.insert(0u64);
+        attrs.add(0u64);
 
         for i in 1..1000u64 {
-            attrs.insert(i);
+            attrs.add(i);
         }
 
         assert_eq!(attrs.get::<u64>(), Some(&999));
@@ -371,9 +448,9 @@ mod tests {
     #[test]
     fn clone_is_deep_and_independent() {
         let mut attrs = CallAttributes::new();
-        attrs.insert(UserId(1));
-        attrs.insert(TraceId("t"));
-        attrs.insert("s".to_string());
+        attrs.add(UserId(1));
+        attrs.add(TraceId("t"));
+        attrs.add("s".to_string());
 
         let mut cloned = attrs.clone();
         assert_eq!(cloned.get::<UserId>(), Some(&UserId(1)));
@@ -386,12 +463,12 @@ mod tests {
             cloned.get::<String>().unwrap() as *const String
         );
 
-        cloned.insert(UserId(2));
+        cloned.add(UserId(2));
         assert_eq!(attrs.get::<UserId>(), Some(&UserId(1)));
         assert_eq!(cloned.get::<UserId>(), Some(&UserId(2)));
 
         // Clone stays usable and keeps deduplicating.
-        cloned.insert(UserId(3));
+        cloned.add(UserId(3));
         assert_eq!(cloned.get::<UserId>(), Some(&UserId(3)));
     }
 
@@ -409,8 +486,8 @@ mod tests {
 
         let drops = DropCount::new();
         let mut attrs = CallAttributes::new();
-        attrs.insert(drops.tracked());
-        attrs.insert(Boom);
+        attrs.add(drops.tracked());
+        attrs.add(Boom);
 
         // Entries are cloned in insertion order, so the partial clone owns one
         // live value when `Boom` panics.

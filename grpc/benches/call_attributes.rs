@@ -118,7 +118,7 @@ impl TypeMap for CallAttributes {
 
     #[inline(always)]
     fn put<T: Attr>(&mut self, val: T) {
-        self.insert(val);
+        self.add(val);
     }
 
     #[inline(always)]
