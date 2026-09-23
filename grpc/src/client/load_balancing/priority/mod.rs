@@ -313,10 +313,10 @@ impl LbPolicyBuilder for Builder {
         POLICY_NAME
     }
 
-    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<Option<PriorityConfig>, String> {
+    fn parse_config(&self, config: &ParsedJsonLbConfig) -> Result<PriorityConfig, String> {
         let cfg: PriorityConfig = config.convert_to().map_err(|e| e.to_string())?;
         cfg.validate()?;
-        Ok(Some(cfg))
+        Ok(cfg)
     }
 }
 
@@ -344,12 +344,9 @@ impl LbPolicy for PriorityPolicy {
     fn resolver_update(
         &mut self,
         update: ResolverUpdate,
-        config: Option<&Self::LbConfig>,
+        config: &Self::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
-        let Some(config) = config else {
-            return Err("priority balancer received update with missing LB config".to_owned());
-        };
         let mut sharded_endpoints = update.endpoints.map(endpoint_filtering::group_by_path);
 
         // Index the existing children by name so they can be moved into the
@@ -399,10 +396,7 @@ impl LbPolicy for PriorityPolicy {
             .map(|child_data| ChildUpdate {
                 child_identifier: child_data.name.clone(),
                 child_policy_builder: ChildBuilder {},
-                child_update: Some((
-                    child_data.latest_update.clone(),
-                    Some(&child_data.child_config),
-                )),
+                child_update: Some((child_data.latest_update.clone(), &child_data.child_config)),
             });
 
         // Update children in ChildManager. As specified in gRFC A56
@@ -704,7 +698,7 @@ impl PriorityPolicy {
                     // that matches.
                     resolver_update
                         .take()
-                        .map(|ru| (ru, Some(&child_data.child_config)))
+                        .map(|ru| (ru, &child_data.child_config))
                 } else {
                     None
                 };

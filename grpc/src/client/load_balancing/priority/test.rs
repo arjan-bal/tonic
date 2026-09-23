@@ -97,7 +97,6 @@ fn parse_config_success() {
     let builder = Builder {};
     let got = ParsedJsonLbConfig::new(js)
         .and_then(|cfg| builder.parse_config(&cfg))
-        .unwrap()
         .unwrap();
 
     assert_eq!(got.priorities, vec!["child-1", "child-2", "child-3"]);
@@ -293,7 +292,6 @@ async fn empty_priorities_reports_transient_failure() {
     let cfg = env
         .builder
         .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
-        .unwrap()
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -302,7 +300,7 @@ async fn empty_priorities_reports_transient_failure() {
         resolution_note: None,
     };
     env.policy
-        .resolver_update(update, Some(&cfg), &mut env.tcc)
+        .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
     let picker_event = env
@@ -340,7 +338,6 @@ async fn high_priority_ready_and_add_remove_lower() {
     let cfg = env
         .builder
         .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
-        .unwrap()
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -352,7 +349,7 @@ async fn high_priority_ready_and_add_remove_lower() {
         resolution_note: None,
     };
     env.policy
-        .resolver_update(update, Some(&cfg), &mut env.tcc)
+        .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
     // child-0 should be lazily instantiated and connecting.
@@ -390,7 +387,6 @@ async fn high_priority_ready_and_add_remove_lower() {
     let cfg2 = env
         .builder
         .parse_config(&ParsedJsonLbConfig::new(js2).unwrap())
-        .unwrap()
         .unwrap();
     let update2 = ResolverUpdate {
         attributes: Default::default(),
@@ -403,7 +399,7 @@ async fn high_priority_ready_and_add_remove_lower() {
         resolution_note: None,
     };
     env.policy
-        .resolver_update(update2, Some(&cfg2), &mut env.tcc)
+        .resolver_update(update2, &cfg2, &mut env.tcc)
         .unwrap();
 
     // child-0 is still Ready; child-1 and child-2 should still not be
@@ -431,7 +427,6 @@ async fn switch_priority_failover_and_failback() {
     let cfg = env
         .builder
         .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
-        .unwrap()
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -443,7 +438,7 @@ async fn switch_priority_failover_and_failback() {
         resolution_note: None,
     };
     env.policy
-        .resolver_update(update, Some(&cfg), &mut env.tcc)
+        .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
     let sc0 = stub_handle0
@@ -507,7 +502,6 @@ async fn init_timeout_failover() {
     let cfg = env
         .builder
         .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
-        .unwrap()
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -519,7 +513,7 @@ async fn init_timeout_failover() {
         resolution_note: None,
     };
     env.policy
-        .resolver_update(update, Some(&cfg), &mut env.tcc)
+        .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
     // child-0 is connecting.
@@ -579,7 +573,6 @@ async fn connecting_to_connecting_does_not_restart_timer() {
     let cfg = env
         .builder
         .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
-        .unwrap()
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -591,7 +584,7 @@ async fn connecting_to_connecting_does_not_restart_timer() {
         resolution_note: None,
     };
     env.policy
-        .resolver_update(update, Some(&cfg), &mut env.tcc)
+        .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
     let sc0 = stub_handle0.subchannel().unwrap();
 
@@ -636,7 +629,6 @@ async fn transient_failure_to_connecting_enters_connecting_expired() {
     let cfg = env
         .builder
         .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
-        .unwrap()
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -648,7 +640,7 @@ async fn transient_failure_to_connecting_enters_connecting_expired() {
         resolution_note: None,
     };
     env.policy
-        .resolver_update(update, Some(&cfg), &mut env.tcc)
+        .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
     let sc0 = stub_handle0.subchannel().unwrap();
@@ -700,7 +692,6 @@ async fn deactivation_and_reactivation() {
     let cfg = env
         .builder
         .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
-        .unwrap()
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -712,7 +703,7 @@ async fn deactivation_and_reactivation() {
         resolution_note: None,
     };
     env.policy
-        .resolver_update(update, Some(&cfg), &mut env.tcc)
+        .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
     let sc0 = stub_handle0.subchannel().unwrap();
@@ -787,7 +778,6 @@ async fn ignore_reresolution_requests_configuration() {
     let cfg = env
         .builder
         .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
-        .unwrap()
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -799,7 +789,7 @@ async fn ignore_reresolution_requests_configuration() {
         resolution_note: None,
     };
     env.policy
-        .resolver_update(update, Some(&cfg), &mut env.tcc)
+        .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
     let sc0 = stub_handle0.subchannel().unwrap();
@@ -859,7 +849,6 @@ async fn remove_child_from_config_deletes_immediately() {
     let cfg = env
         .builder
         .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
-        .unwrap()
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -871,7 +860,7 @@ async fn remove_child_from_config_deletes_immediately() {
         resolution_note: None,
     };
     env.policy
-        .resolver_update(update, Some(&cfg), &mut env.tcc)
+        .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
     assert!(env.policy.child("child-0").is_some());
@@ -887,7 +876,6 @@ async fn remove_child_from_config_deletes_immediately() {
     let cfg2 = env
         .builder
         .parse_config(&ParsedJsonLbConfig::new(js2).unwrap())
-        .unwrap()
         .unwrap();
     let update2 = ResolverUpdate {
         attributes: Default::default(),
@@ -896,7 +884,7 @@ async fn remove_child_from_config_deletes_immediately() {
         resolution_note: None,
     };
     env.policy
-        .resolver_update(update2, Some(&cfg2), &mut env.tcc)
+        .resolver_update(update2, &cfg2, &mut env.tcc)
         .unwrap();
 
     // child-1 must be removed immediately (gRFC A115).
@@ -952,7 +940,6 @@ async fn work_item_filtering_drops_timer_work_and_forwards_child_work() {
     let cfg = env
         .builder
         .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
-        .unwrap()
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -961,7 +948,7 @@ async fn work_item_filtering_drops_timer_work_and_forwards_child_work() {
         resolution_note: None,
     };
     env.policy
-        .resolver_update(update, Some(&cfg), &mut env.tcc)
+        .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
     // Deliver a PriorityTimerWork item: it should be consumed by PriorityPolicy
@@ -1003,7 +990,6 @@ async fn picker_updates_are_debounced_for_inactive_child_events() {
     let cfg = env
         .builder
         .parse_config(&ParsedJsonLbConfig::new(js).unwrap())
-        .unwrap()
         .unwrap();
     let update = ResolverUpdate {
         attributes: Default::default(),
@@ -1015,7 +1001,7 @@ async fn picker_updates_are_debounced_for_inactive_child_events() {
         resolution_note: None,
     };
     env.policy
-        .resolver_update(update, Some(&cfg), &mut env.tcc)
+        .resolver_update(update, &cfg, &mut env.tcc)
         .unwrap();
 
     let sc0 = stub_handle0.subchannel().unwrap();

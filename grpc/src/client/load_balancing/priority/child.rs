@@ -111,7 +111,7 @@ pub(super) struct PriorityChildConfig {
 #[derive(Debug, Clone)]
 struct ChildPolicyConfig {
     builder: Arc<DynLbPolicyBuilder>,
-    lb_config: Option<DynLbConfig>,
+    lb_config: DynLbConfig,
 }
 
 impl<'de> serde::Deserialize<'de> for ChildPolicyConfig {
@@ -167,8 +167,8 @@ impl LbPolicyBuilder for ChildBuilder {
     fn parse_config(
         &self,
         _config: &ParsedJsonLbConfig,
-    ) -> Result<Option<<Self::LbPolicy as LbPolicy>::LbConfig>, String> {
-        Ok(None)
+    ) -> Result<<Self::LbPolicy as LbPolicy>::LbConfig, String> {
+        unreachable!("config should be parsed through the priority_experimental builder")
     }
 }
 
@@ -192,14 +192,9 @@ impl LbPolicy for ChildPolicy {
     fn resolver_update(
         &mut self,
         update: ResolverUpdate,
-        config: Option<&Self::LbConfig>,
+        priority_child_cfg: &Self::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
-        let Some(priority_child_cfg) = config else {
-            return Err(
-                "priority child balancer received update with missing LB config".to_owned(),
-            );
-        };
         self.ignore_reresolution_requests = priority_child_cfg.ignore_reresolution_requests;
         let mut wrapped_controller =
             WrappedController::new(channel_controller, self.ignore_reresolution_requests);
@@ -208,7 +203,7 @@ impl LbPolicy for ChildPolicy {
             priority_child_cfg.config.lb_config.clone(),
         );
         self.graceful_switch
-            .resolver_update(update, Some(&gs_cfg), &mut wrapped_controller)
+            .resolver_update(update, &gs_cfg, &mut wrapped_controller)
     }
 
     fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
@@ -312,7 +307,6 @@ mod test {
 
         assert!(!cfg.ignore_reresolution_requests);
         assert_eq!(cfg.config.builder.name(), "round_robin");
-        assert!(cfg.config.lb_config.is_none());
     }
 
     /// Verifies that `ignoreReresolutionRequests` and the policy-specific
@@ -331,10 +325,8 @@ mod test {
             .config
             .lb_config
             .as_ref()
-            .expect("expected pick_first config")
             .downcast_ref::<PickFirstConfig>()
             .expect("expected a PickFirstConfig");
-        assert!(pf_cfg.shuffle_address_list);
     }
 
     /// Verifies that the first supported policy in the list is selected, as
@@ -386,9 +378,7 @@ mod test {
             ..Default::default()
         };
 
-        child_lb
-            .resolver_update(update, Some(&cfg), &mut tcc)
-            .unwrap();
+        child_lb.resolver_update(update, &cfg, &mut tcc).unwrap();
 
         let mut subchannel = None;
         while let Ok(event) = rx_events.try_recv() {
