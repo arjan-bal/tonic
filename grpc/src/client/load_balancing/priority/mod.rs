@@ -420,6 +420,8 @@ impl LbPolicy for PriorityPolicy {
     }
 
     fn exit_idle(&mut self, channel_controller: &mut dyn ChannelController) {
+        // TODO: Similar to C++, only call exit_idle on the currently selected
+        // child once the child_manager supports it.
         self.child_mgr.exit_idle(channel_controller);
         self.reconcile(channel_controller);
     }
