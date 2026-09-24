@@ -38,6 +38,9 @@
 //!
 //! let attrs = Attributes::new().add(MyConfig(42));
 //! assert_eq!(attrs.get::<MyConfig>(), Some(&MyConfig(42)));
+//!
+//! let attrs = attrs.remove::<MyConfig>();
+//! assert_eq!(attrs.get::<MyConfig>(), None);
 //! ```
 
 use std::any::Any;
@@ -124,6 +127,42 @@ impl Attributes {
             current = node.next.as_deref();
         }
         None
+    }
+
+    /// Removes the value of type T, if present.
+    /// Returns a new Attributes object without the value.
+    ///
+    /// The returned object holds no reference to the removed value, so it is
+    /// dropped once no other `Attributes` instance references it.
+    ///
+    /// This operation is O(n) in both time and space.
+    pub fn remove<T: 'static>(&self) -> Self {
+        // Nodes older than the oldest `T` are shared as-is; newer nodes are
+        // rebuilt (reusing their value `Arc`s) with every `T` left out.
+        let mut original_nodes = Vec::new();
+        let mut current = self.head.as_ref();
+        while let Some(node) = current {
+            original_nodes.push(node);
+            current = node.next.as_ref();
+        }
+        let Some(oldest) = original_nodes
+            .iter()
+            .rposition(|n| n.value.any_ref().is::<T>())
+        else {
+            return self.clone();
+        };
+        let tail = original_nodes[oldest].next.clone();
+        let head = original_nodes[..oldest]
+            .iter()
+            .rev()
+            .filter(|n| !n.value.any_ref().is::<T>())
+            .fold(tail, |next, original| {
+                Some(Arc::new(Node {
+                    value: original.value.clone(),
+                    next,
+                }))
+            });
+        Attributes { head }
     }
 
     /// Returns an iterator over the live values, newest first.
@@ -327,5 +366,108 @@ mod tests {
     fn test_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Attributes>();
+    }
+
+    /// Returns the `n`th node (0 = head) of the raw chain.
+    fn nth_node(attrs: &Attributes, n: usize) -> &Arc<Node> {
+        let mut node = attrs.head.as_ref().unwrap();
+        for _ in 0..n {
+            node = node.next.as_ref().unwrap();
+        }
+        node
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Tracker(Arc<()>);
+
+    #[test]
+    fn test_remove() {
+        let attrs = Attributes::new()
+            .add(1i32)
+            .add("s".to_string())
+            .remove::<i32>();
+        assert_eq!(attrs.get::<i32>(), None);
+        assert_eq!(attrs.get::<String>(), Some(&"s".to_string()));
+    }
+
+    #[test]
+    fn test_remove_missing() {
+        let a1 = Attributes::new().add(1i32);
+        let a2 = a1.remove::<bool>();
+        assert_eq!(a1, a2);
+        assert!(Arc::ptr_eq(nth_node(&a1, 0), nth_node(&a2, 0)));
+        assert!(Attributes::new().remove::<bool>().head.is_none());
+    }
+
+    #[test]
+    fn test_remove_persistence() {
+        let a1 = Attributes::new().add(1i32).add(2u32);
+        let a2 = a1.remove::<i32>();
+        assert_eq!(a1.get::<i32>(), Some(&1));
+        assert_eq!(a1.get::<u32>(), Some(&2));
+        assert_eq!(a2.get::<i32>(), None);
+        assert_eq!(a2.get::<u32>(), Some(&2));
+    }
+
+    #[test]
+    fn test_remove_preserves_order() {
+        let attrs = Attributes::new()
+            .add(1u8)
+            .add(2i32)
+            .add(3u32)
+            .add(4u64)
+            .remove::<i32>();
+        assert_eq!(
+            type_ids(&attrs),
+            vec![TypeId::of::<u64>(), TypeId::of::<u32>(), TypeId::of::<u8>()]
+        );
+    }
+
+    #[test]
+    fn test_remove_shares_tail() {
+        let a1 = Attributes::new().add(1u8).add(2i32).add(3u32).add(4u64);
+        let a2 = a1.remove::<i32>();
+        // u64 and u32 nodes are rebuilt; the u8 node is shared.
+        assert!(!Arc::ptr_eq(nth_node(&a1, 0), nth_node(&a2, 0)));
+        assert!(Arc::ptr_eq(nth_node(&a1, 3), nth_node(&a2, 2)));
+        assert!(nth_node(&a2, 2).next.is_none());
+        // Rebuilt nodes reuse the value `Arc`s.
+        assert!(Arc::ptr_eq(
+            &nth_node(&a1, 0).value,
+            &nth_node(&a2, 0).value
+        ));
+    }
+
+    #[test]
+    fn test_remove_head_shares_rest() {
+        let a1 = Attributes::new().add(1u8).add(2i32);
+        let a2 = a1.remove::<i32>();
+        assert!(Arc::ptr_eq(nth_node(&a1, 1), nth_node(&a2, 0)));
+    }
+
+    #[test]
+    fn test_remove_drops_value() {
+        let probe = Arc::new(());
+        let a1 = Attributes::new().add(Tracker(probe.clone())).add(1u8);
+        let a2 = a1.remove::<Tracker>();
+        assert_eq!(Arc::strong_count(&probe), 2);
+        drop(a1);
+        assert_eq!(Arc::strong_count(&probe), 1);
+        assert_eq!(a2.get::<u8>(), Some(&1));
+    }
+
+    #[test]
+    fn test_remove_shadowed() {
+        let probe = Arc::new(());
+        let a1 = Attributes::new()
+            .add(Tracker(probe.clone()))
+            .add(1u8)
+            .add(Tracker(probe.clone()));
+        let a2 = a1.remove::<Tracker>();
+        assert_eq!(Arc::strong_count(&probe), 3);
+        drop(a1);
+        assert_eq!(Arc::strong_count(&probe), 1);
+        assert_eq!(a2.get::<Tracker>(), None);
+        assert_eq!(a2.get::<u8>(), Some(&1));
     }
 }
