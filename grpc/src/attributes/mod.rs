@@ -42,11 +42,9 @@
 
 use std::any::Any;
 use std::any::TypeId;
+use std::collections::BTreeSet;
 use std::fmt::Debug;
-
-use crate::attributes::linked_list::LinkedList;
-
-mod linked_list;
+use std::sync::Arc;
 
 /// Ensures only types that support comparison can be inserted into the
 /// Attributes struct. This allows the use of value-based equality rather than
@@ -70,18 +68,14 @@ impl<T: Any + Send + Sync + Eq + Debug> AttributeTrait for T {
     }
 }
 
-#[derive(Debug)]
-struct AttributeValue {
-    inner: Box<dyn AttributeTrait>,
+/// A node in the persistent list backing [`Attributes`].
+///
+/// Each node points to the next (older) node, allowing structural sharing
+/// between `Attributes` instances.
+struct Node {
+    value: Arc<dyn AttributeTrait>,
+    next: Option<Arc<Node>>,
 }
-
-impl PartialEq for AttributeValue {
-    fn eq(&self, other: &Self) -> bool {
-        self.inner.dyn_eq(other.inner.as_ref())
-    }
-}
-
-impl Eq for AttributeValue {}
 
 /// A collection of attributes indexed by their type.
 ///
@@ -97,9 +91,9 @@ impl Eq for AttributeValue {}
 ///
 /// This collection is intended to store a small number of values (few hundreds)
 /// and is optimized for memory usage. It is **not** optimized for query speed.
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default)]
 pub struct Attributes {
-    elements: LinkedList<TypeId, AttributeValue>,
+    head: Option<Arc<Node>>,
 }
 
 impl Attributes {
@@ -112,36 +106,64 @@ impl Attributes {
     /// Returns a new Attributes object with the value added.
     /// If a value of the same type already exists, it is replaced.
     pub fn add<T: Send + Sync + Eq + Debug + 'static>(&self, value: T) -> Self {
-        let id = TypeId::of::<T>();
         Attributes {
-            elements: self.elements.add(
-                id,
-                AttributeValue {
-                    inner: Box::new(value),
-                },
-            ),
+            head: Some(Arc::new(Node {
+                value: Arc::new(value),
+                next: self.head.clone(),
+            })),
         }
     }
 
     /// Gets a reference to a value of type T.
     pub fn get<T: 'static>(&self) -> Option<&T> {
-        let id = TypeId::of::<T>();
-        self.elements
-            .get(&id)
-            .and_then(|v| v.inner.any_ref().downcast_ref())
+        let mut current = self.head.as_deref();
+        while let Some(node) = current {
+            if let Some(v) = node.value.any_ref().downcast_ref::<T>() {
+                return Some(v);
+            }
+            current = node.next.as_deref();
+        }
+        None
+    }
+
+    /// Returns an iterator over the live values, newest first.
+    ///
+    /// Each type is yielded at most once; values shadowed by a more recent
+    /// `add` of the same type are skipped.
+    fn iter(&self) -> impl Iterator<Item = &Arc<dyn AttributeTrait>> {
+        let mut current = self.head.as_deref();
+        let mut seen = BTreeSet::new();
+        std::iter::from_fn(move || {
+            while let Some(node) = current {
+                current = node.next.as_deref();
+                if seen.insert(node.value.any_ref().type_id()) {
+                    return Some(&node.value);
+                }
+            }
+            None
+        })
+    }
+}
+
+impl Debug for Attributes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
     }
 }
 
 impl PartialEq for Attributes {
     fn eq(&self, other: &Self) -> bool {
-        let mut v1: Vec<_> = self.elements.iter().collect();
-        let mut v2: Vec<_> = other.elements.iter().collect();
-        if v1.len() != v2.len() {
-            return false;
+        fn collect(a: &Attributes) -> Vec<(TypeId, &Arc<dyn AttributeTrait>)> {
+            let mut v: Vec<_> = a.iter().map(|v| (v.any_ref().type_id(), v)).collect();
+            v.sort_by_key(|(id, _)| *id);
+            v
         }
-        v1.sort_by_key(|x| x.0);
-        v2.sort_by_key(|x| x.0);
-        v1 == v2
+        let (v1, v2) = (collect(self), collect(other));
+        v1.len() == v2.len()
+            && v1
+                .iter()
+                .zip(&v2)
+                .all(|((id1, a), (id2, b))| id1 == id2 && a.dyn_eq(b.as_ref()))
     }
 }
 
@@ -236,5 +258,74 @@ mod tests {
 
         // original should be unchanged
         assert_eq!(attrs.get::<Priority>(), Some(&p));
+    }
+
+    fn type_ids(attrs: &Attributes) -> Vec<TypeId> {
+        attrs.iter().map(|v| v.any_ref().type_id()).collect()
+    }
+
+    #[test]
+    fn test_iter_order() {
+        let attrs = Attributes::new().add(1i32).add(2u32).add(3u64);
+        assert_eq!(
+            type_ids(&attrs),
+            vec![
+                TypeId::of::<u64>(),
+                TypeId::of::<u32>(),
+                TypeId::of::<i32>()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_iter_shadowing() {
+        let attrs = Attributes::new().add(1i32).add(2i32);
+        let values: Vec<_> = attrs
+            .iter()
+            .map(|v| *v.any_ref().downcast_ref::<i32>().unwrap())
+            .collect();
+        assert_eq!(values, vec![2]);
+    }
+
+    #[test]
+    fn test_eq_ignores_shadowed() {
+        assert_eq!(
+            Attributes::new().add(1i32).add(2i32),
+            Attributes::new().add(2i32)
+        );
+    }
+
+    #[test]
+    fn test_eq_order_independent() {
+        assert_eq!(
+            Attributes::new().add(1i32).add(2u32),
+            Attributes::new().add(2u32).add(1i32)
+        );
+        assert_ne!(
+            Attributes::new().add(1i32).add(2u32),
+            Attributes::new().add(2u32).add(3i32)
+        );
+    }
+
+    #[test]
+    fn test_structural_sharing() {
+        let a1 = Attributes::new().add(1i32);
+        let a2 = a1.add(2u32);
+        let a1_head = a1.head.as_ref().unwrap();
+        let a2_next = a2.head.as_ref().unwrap().next.as_ref().unwrap();
+        assert!(Arc::ptr_eq(a1_head, a2_next));
+    }
+
+    #[test]
+    fn test_debug_live_values() {
+        let attrs = Attributes::new().add(1i32).add(42i32).add("hi".to_string());
+        assert_eq!(format!("{attrs:?}"), r#"["hi", 42]"#);
+        assert_eq!(format!("{:?}", Attributes::new()), "[]");
+    }
+
+    #[test]
+    fn test_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Attributes>();
     }
 }
