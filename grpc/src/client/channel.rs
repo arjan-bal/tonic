@@ -265,7 +265,11 @@ impl PersistentChannel {
     /// channel iff none exists.
     fn get_state(&self, connect: bool) -> ConnectivityState {
         if connect {
-            return self.get_active_channel().lb_watcher.cur().connectivity_state;
+            return self
+                .get_active_channel()
+                .lb_watcher
+                .cur()
+                .connectivity_state;
         }
         match &*self.active_channel.load() {
             Some(ac) => ac.lb_watcher.cur().connectivity_state,
