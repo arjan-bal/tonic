@@ -51,6 +51,7 @@
 //! ```
 
 use std::any::Any;
+use std::any::TypeId;
 
 /// A single type-erased attribute value.
 type ErasedAttr = Box<dyn CloneableAny>;
@@ -69,33 +70,59 @@ impl<T: Any + Send + Clone> CloneableAny for T {
     }
 }
 
-/// One stored attribute.
-///
-/// Lookups find the matching entry by asking each value for its concrete
-/// type through the vtable, so every entry a scan walks past costs one
-/// virtual call.
-struct Entry {
-    value: ErasedAttr,
+impl dyn CloneableAny {
+    /// Reinterprets this value as its concrete type `T`.
+    ///
+    /// Going through `&dyn Any` instead would cost two virtual calls on every
+    /// hit: one to upcast, and one for `Any::type_id` inside the standard
+    /// `downcast_ref`. Callers here have already established the type from
+    /// [`Entry::type_id`], so both are pure overhead.
+    ///
+    /// # Safety
+    ///
+    /// The concrete type behind `self` must be exactly `T`.
+    #[inline]
+    unsafe fn downcast_ref_unchecked<T: Any>(&self) -> &T {
+        debug_assert_eq!(Any::type_id(self), TypeId::of::<T>());
+        unsafe { &*(self as *const dyn CloneableAny as *const T) }
+    }
+
+    /// Mutable counterpart of
+    /// [`downcast_ref_unchecked`](Self::downcast_ref_unchecked).
+    ///
+    /// # Safety
+    ///
+    /// The concrete type behind `self` must be exactly `T`.
+    #[inline]
+    unsafe fn downcast_mut_unchecked<T: Any>(&mut self) -> &mut T {
+        debug_assert_eq!(Any::type_id(self), TypeId::of::<T>());
+        unsafe { &mut *(self as *mut dyn CloneableAny as *mut T) }
+    }
 }
 
-impl Entry {
-    /// Views the stored value as `&dyn Any`, for a checked downcast.
-    #[inline]
-    fn as_any(&self) -> &dyn Any {
-        // Trait upcasting coercion from `dyn CloneableAny` to its supertrait.
-        &*self.value
-    }
-
-    /// Mutable counterpart of [`as_any`](Self::as_any).
-    #[inline]
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        &mut *self.value
-    }
+/// One stored attribute: the erased value plus the [`TypeId`] of its concrete
+/// type.
+///
+/// Caching the `TypeId` alongside the value is what keeps lookups cheap. A
+/// scan can then compare plain 128-bit integers and only pay for a virtual
+/// function call on the entry it actually matches, rather than on every entry
+/// it walks past.
+struct Entry {
+    /// `TypeId` of the concrete type stored in `value`.
+    ///
+    /// # Invariant
+    ///
+    /// Always equals the `TypeId` of the concrete type inside `value`. Every
+    /// site that writes `value` writes this field from the same `T`, which is
+    /// what lets [`CallAttributes::get`] treat a match here as authoritative.
+    type_id: TypeId,
+    value: ErasedAttr,
 }
 
 impl Clone for Entry {
     fn clone(&self) -> Self {
         Self {
+            type_id: self.type_id,
             value: self.value.clone_boxed(),
         }
     }
@@ -178,15 +205,17 @@ impl CallAttributes {
     /// assert_eq!(attrs.get::<UserId>(), Some(&UserId(7)));
     /// ```
     pub fn add<T: 'static + Send + Clone>(&mut self, val: T) {
+        let type_id = TypeId::of::<T>();
         for entry in &mut self.items {
-            if entry.as_any().is::<T>() {
+            if entry.type_id == type_id {
                 // Assigning drops the old box, running the previous value's
-                // destructor.
+                // destructor. `type_id` already matches, so it stays correct.
                 entry.value = Box::new(val);
                 return;
             }
         }
         self.items.push(Entry {
+            type_id,
             value: Box::new(val),
         });
     }
@@ -215,16 +244,27 @@ impl CallAttributes {
     /// assert_eq!(attrs.get::<RetryCount>(), None);
     /// ```
     pub fn get<T: 'static>(&self) -> Option<&T> {
-        self.items
-            .iter()
-            .find_map(|entry| entry.as_any().downcast_ref::<T>())
+        let type_id = TypeId::of::<T>();
+        for entry in &self.items {
+            if entry.type_id == type_id {
+                // SAFETY: `Entry::type_id`'s invariant says this entry's value
+                // has concrete type `T`, which the comparison just confirmed.
+                return Some(unsafe { entry.value.downcast_ref_unchecked::<T>() });
+            }
+        }
+        None
     }
 
     /// Retrieves a mutable reference to the value of type `T`, if present.
     pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
-        self.items
-            .iter_mut()
-            .find_map(|entry| entry.as_any_mut().downcast_mut::<T>())
+        let type_id = TypeId::of::<T>();
+        for entry in &mut self.items {
+            if entry.type_id == type_id {
+                // SAFETY: see `get`.
+                return Some(unsafe { entry.value.downcast_mut_unchecked::<T>() });
+            }
+        }
+        None
     }
 
     /// Clears all stored attributes, executing their destructors.
