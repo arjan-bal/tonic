@@ -50,40 +50,47 @@
 //! assert_eq!(attrs.get::<UserId>(), Some(&UserId(42)));
 //! ```
 
-use std::any::Any;
 use std::any::TypeId;
 
 /// A single type-erased attribute value.
 type ErasedAttr = Box<dyn CloneableAny>;
 
 /// Type-erasure trait for stored attributes, used in place of
-/// [`Any`] so that the concrete type's [`Clone`] impl stays reachable
-/// through the trait object's vtable.
-trait CloneableAny: Any + Send {
+/// [`Any`](std::any::Any) so that the concrete type's [`Clone`] impl stays
+/// reachable through the trait object's vtable.
+trait CloneableAny: Send + 'static {
     /// Clones `self` into a new box, preserving the concrete type.
     fn clone_boxed(&self) -> ErasedAttr;
+
+    /// Returns the [`TypeId`] of the concrete type behind the trait object.
+    fn type_id(&self) -> TypeId;
 }
 
-impl<T: Any + Send + Clone> CloneableAny for T {
+impl<T: Send + Clone + 'static> CloneableAny for T {
     fn clone_boxed(&self) -> ErasedAttr {
         Box::new(self.clone())
+    }
+
+    fn type_id(&self) -> TypeId {
+        TypeId::of::<T>()
     }
 }
 
 impl dyn CloneableAny {
     /// Reinterprets this value as its concrete type `T`.
     ///
-    /// Going through `&dyn Any` instead would cost two virtual calls on every
-    /// hit: one to upcast, and one for `Any::type_id` inside the standard
-    /// `downcast_ref`. Callers here have already established the type from
-    /// [`Entry::type_id`], so both are pure overhead.
+    /// A checked downcast would cost a virtual
+    /// [`concrete_type_id`](CloneableAny::concrete_type_id) call on every hit.
+    /// Callers here have already established the type from
+    /// [`Entry::type_id`], so that call is pure overhead and is only made in
+    /// debug builds.
     ///
     /// # Safety
     ///
     /// The concrete type behind `self` must be exactly `T`.
     #[inline]
-    unsafe fn downcast_ref_unchecked<T: Any>(&self) -> &T {
-        debug_assert_eq!(Any::type_id(self), TypeId::of::<T>());
+    unsafe fn downcast_ref_unchecked<T: 'static>(&self) -> &T {
+        debug_assert_eq!(self.type_id(), TypeId::of::<T>());
         unsafe { &*(self as *const dyn CloneableAny as *const T) }
     }
 
@@ -94,8 +101,8 @@ impl dyn CloneableAny {
     ///
     /// The concrete type behind `self` must be exactly `T`.
     #[inline]
-    unsafe fn downcast_mut_unchecked<T: Any>(&mut self) -> &mut T {
-        debug_assert_eq!(Any::type_id(self), TypeId::of::<T>());
+    unsafe fn downcast_mut_unchecked<T: 'static>(&mut self) -> &mut T {
+        debug_assert_eq!(self.type_id(), TypeId::of::<T>());
         unsafe { &mut *(self as *mut dyn CloneableAny as *mut T) }
     }
 }
