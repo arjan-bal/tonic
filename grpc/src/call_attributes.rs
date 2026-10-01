@@ -51,7 +51,6 @@
 //! ```
 
 use std::any::Any;
-use std::any::TypeId;
 
 /// A single type-erased attribute value.
 type ErasedAttr = Box<dyn CloneableAny>;
@@ -70,39 +69,16 @@ impl<T: Any + Send + Clone> CloneableAny for T {
     }
 }
 
-/// One stored attribute: the erased value plus the [`TypeId`] of its concrete
-/// type.
+/// One stored attribute.
 ///
-/// Caching the `TypeId` alongside the value is what keeps lookups cheap. A
-/// scan compares plain 128-bit integers and only pays for a virtual call (the
-/// checked downcast) on the entry it actually matches, rather than on every
-/// entry it walks past.
+/// Lookups find the matching entry by asking each value for its concrete
+/// type through the vtable, so every entry a scan walks past costs one
+/// virtual call.
 struct Entry {
-    /// `TypeId` of the concrete type stored in `value`.
-    ///
-    /// # Invariant
-    ///
-    /// Always equals the `TypeId` of the concrete type inside `value`.
-    /// [`Entry::new`] sets both from the same `T`, and `Clone` copies the
-    /// `TypeId` alongside a clone of the same concrete value.
-    ///
-    /// This is a correctness invariant, not a safety one: lookups still use a
-    /// checked downcast, so if it were ever broken a lookup would miss rather
-    /// than invoke undefined behavior.
-    type_id: TypeId,
     value: ErasedAttr,
 }
 
 impl Entry {
-    /// Wraps `val`, caching its `TypeId`.
-    #[inline]
-    fn new<T: 'static + Send + Clone>(val: T) -> Self {
-        Self {
-            type_id: TypeId::of::<T>(),
-            value: Box::new(val),
-        }
-    }
-
     /// Views the stored value as `&dyn Any`, for a checked downcast.
     #[inline]
     fn as_any(&self) -> &dyn Any {
@@ -120,7 +96,6 @@ impl Entry {
 impl Clone for Entry {
     fn clone(&self) -> Self {
         Self {
-            type_id: self.type_id,
             value: self.value.clone_boxed(),
         }
     }
@@ -203,16 +178,17 @@ impl CallAttributes {
     /// assert_eq!(attrs.get::<UserId>(), Some(&UserId(7)));
     /// ```
     pub fn add<T: 'static + Send + Clone>(&mut self, val: T) {
-        let type_id = TypeId::of::<T>();
         for entry in &mut self.items {
-            if entry.type_id == type_id {
-                // Assigning drops the old entry, running the previous value's
+            if entry.as_any().is::<T>() {
+                // Assigning drops the old box, running the previous value's
                 // destructor.
-                *entry = Entry::new(val);
+                entry.value = Box::new(val);
                 return;
             }
         }
-        self.items.push(Entry::new(val));
+        self.items.push(Entry {
+            value: Box::new(val),
+        });
     }
 
     /// Retrieves an immutable reference to the value of type `T`, if present.
@@ -239,22 +215,16 @@ impl CallAttributes {
     /// assert_eq!(attrs.get::<RetryCount>(), None);
     /// ```
     pub fn get<T: 'static>(&self) -> Option<&T> {
-        let type_id = TypeId::of::<T>();
         self.items
             .iter()
-            .find(|entry| entry.type_id == type_id)?
-            .as_any()
-            .downcast_ref::<T>()
+            .find_map(|entry| entry.as_any().downcast_ref::<T>())
     }
 
     /// Retrieves a mutable reference to the value of type `T`, if present.
     pub fn get_mut<T: 'static>(&mut self) -> Option<&mut T> {
-        let type_id = TypeId::of::<T>();
         self.items
             .iter_mut()
-            .find(|entry| entry.type_id == type_id)?
-            .as_any_mut()
-            .downcast_mut::<T>()
+            .find_map(|entry| entry.as_any_mut().downcast_mut::<T>())
     }
 
     /// Clears all stored attributes, executing their destructors.
