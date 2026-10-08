@@ -265,16 +265,12 @@ impl PersistentChannel {
     /// channel iff none exists.
     fn get_state(&self, connect: bool) -> ConnectivityState {
         if connect {
-            return self
-                .get_active_channel()
-                .lb_watcher
-                .cur()
-                .connectivity_state;
+            return self.get_active_channel().connectivity_state();
         }
-        match &*self.active_channel.load() {
-            Some(ac) => ac.lb_watcher.cur().connectivity_state,
-            None => ConnectivityState::Idle,
-        }
+        self.active_channel
+            .load()
+            .as_ref()
+            .map_or(ConnectivityState::Idle, |ac| ac.connectivity_state())
     }
 
     /// Gets the underlying active channel. If there is no current connection,
@@ -354,6 +350,10 @@ impl ActiveChannel {
             abort_handle,
             lb_watcher,
         })
+    }
+
+    fn connectivity_state(&self) -> ConnectivityState {
+        self.lbwatcher.cur().connectivity_state
     }
 }
 
