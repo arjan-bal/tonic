@@ -252,7 +252,7 @@ mod tests {
         // Call pick on the picker.
         let res = lb_state.picker.pick(PickOptions::new(
             &new_request_headers(),
-            &mut CallAttributes::new(),
+            &CallAttributes::new(),
         ));
 
         // PickResult should be Queue.
@@ -286,7 +286,7 @@ mod tests {
         for _ in 0..10 {
             let res = lb_state.picker.pick(PickOptions::new(
                 &new_request_headers(),
-                &mut CallAttributes::new(),
+                &CallAttributes::new(),
             ));
             assert!(matches!(res, PickResult::Queue));
         }

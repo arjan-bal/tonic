@@ -140,9 +140,9 @@ impl CallOptions {
         self.deadline
     }
 
-    /// Returns a mutable reference to the attributes of the call.
-    pub(crate) fn attributes_mut(&mut self) -> &mut CallAttributes {
-        &mut self.attributes
+    /// Returns a reference to the attributes of the call.
+    pub(crate) fn attributes(&self) -> &CallAttributes {
+        &self.attributes
     }
 }
 

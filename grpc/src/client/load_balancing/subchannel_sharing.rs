@@ -764,7 +764,7 @@ mod tests {
         let req = new_request_headers();
         let result = state
             .picker
-            .pick(PickOptions::new(&req, &mut CallAttributes::new()));
+            .pick(PickOptions::new(&req, &CallAttributes::new()));
         let PickResult::Pick(pick) = result else {
             panic!("expected Pick")
         };

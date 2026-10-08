@@ -365,21 +365,18 @@ pub trait Picker: Send + Sync + Debug {
 
 /// The data provided to a [`Picker`] when picking a connection for a request.
 #[non_exhaustive]
+#[derive(Clone, Copy)]
 pub struct PickOptions<'a> {
     /// The headers of the request.
     pub request_headers: &'a RequestHeaders,
     /// The attributes of the call.  Pickers may read attributes set by earlier
-    /// stages (e.g. the config selector), and may add or modify attributes for
-    /// use by later stages of the RPC.
-    pub call_attributes: &'a mut CallAttributes,
+    /// stages (e.g. the config selector), but cannot modify them.
+    pub call_attributes: &'a CallAttributes,
 }
 
 impl<'a> PickOptions<'a> {
     /// Creates a new `PickOptions`.
-    pub fn new(
-        request_headers: &'a RequestHeaders,
-        call_attributes: &'a mut CallAttributes,
-    ) -> Self {
+    pub fn new(request_headers: &'a RequestHeaders, call_attributes: &'a CallAttributes) -> Self {
         Self {
             request_headers,
             call_attributes,

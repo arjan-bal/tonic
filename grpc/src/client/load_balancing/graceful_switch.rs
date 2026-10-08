@@ -369,7 +369,7 @@ mod test {
 
             let pick = update
                 .picker
-                .pick(PickOptions::new(&req, &mut CallAttributes::new()));
+                .pick(PickOptions::new(&req, &CallAttributes::new()));
             let PickResult::Pick(pick) = pick else {
                 panic!("unexpected pick result: {:?}", pick);
             };

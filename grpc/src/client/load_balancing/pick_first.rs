@@ -862,7 +862,7 @@ mod test {
         assert_eq!(state.connectivity_state, ConnectivityState::Ready);
         let res = state.picker.pick(PickOptions::new(
             &RequestHeaders::default(),
-            &mut CallAttributes::new(),
+            &CallAttributes::new(),
         ));
         match res {
             PickResult::Pick(pick) => {
@@ -1253,7 +1253,7 @@ mod test {
         assert_eq!(state.connectivity_state, ConnectivityState::Ready);
         let res = state.picker.pick(PickOptions::new(
             &RequestHeaders::default(),
-            &mut CallAttributes::new(),
+            &CallAttributes::new(),
         ));
         match res {
             PickResult::Pick(pick) => {
@@ -1474,7 +1474,7 @@ mod test {
         assert_eq!(state.connectivity_state, ConnectivityState::Ready);
         let res = state.picker.pick(PickOptions::new(
             &RequestHeaders::default(),
-            &mut CallAttributes::new(),
+            &CallAttributes::new(),
         ));
         let sc1 = match res {
             PickResult::Pick(pick) => {
@@ -1504,7 +1504,7 @@ mod test {
         // 4. Simulate an RPC (pick) happening.
         let pick_result = idle_picker.pick(PickOptions::new(
             &RequestHeaders::default(),
-            &mut CallAttributes::new(),
+            &CallAttributes::new(),
         ));
         assert!(matches!(pick_result, PickResult::Queue));
 
