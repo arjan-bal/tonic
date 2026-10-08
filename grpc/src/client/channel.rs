@@ -32,7 +32,6 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use arc_swap::ArcSwapOption;
-use arc_swap::Guard;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -353,7 +352,7 @@ impl ActiveChannel {
     }
 
     fn connectivity_state(&self) -> ConnectivityState {
-        self.lbwatcher.cur().connectivity_state
+        self.lb_watcher.snapshot().value().connectivity_state
     }
 }
 
@@ -366,13 +365,11 @@ impl Invoke for Arc<ActiveChannel> {
         headers: RequestHeaders,
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
-        // Fast path: pick with the latest picker without locking. The guard
-        // returned by cur() is dropped at the end of this statement.
-        let mut result = self.lb_watcher.cur().picker.pick(&headers);
-        // Slow path: created only if the pick is queued.
-        let mut lb_states = None;
         loop {
-            match result {
+            // Fast path: snapshot the latest LB state without locking and pick
+            // with its picker.
+            let snapshot = self.lb_watcher.snapshot();
+            match snapshot.value().picker.pick(&headers) {
                 PickResult::Pick(pr) => {
                     if let Some(sc) = pr.subchannel.downcast_ref::<InternalSubchannel>() {
                         return sc.dyn_invoke(headers, options).await;
@@ -390,15 +387,14 @@ impl Invoke for Arc<ActiveChannel> {
                     todo!("dropped pick: {:?}", status);
                 }
             }
-            // Queued: wait for the next picker and retry the RPC with it.
-            let lb_states = lb_states.get_or_insert_with(|| self.lb_watcher.iter());
-            let Some(state) = lb_states.next().await else {
+            // Queued: wait for this snapshot to be superseded, then retry the
+            // RPC with the newest state.
+            if snapshot.expired().await.is_err() {
                 return FailingRecvStream::new_stream_pair(
                     StatusError::new(StatusCodeError::Internal, "channel has been closed"),
                     None,
                 );
-            };
-            result = state.picker.pick(&headers);
+            }
         }
     }
 }
@@ -538,53 +534,93 @@ pub(super) enum WorkQueueItem {
 
 pub(crate) struct Todo;
 
-// Enables multiple receivers to view data output from a single producer.
-// Producer calls update.  Consumers call cur() for a lock-free read of the
-// latest value, or iter() and call next() until they find a good value or
-// encounter None.
+// Enables multiple consumers to observe values published by a single producer.
+//
+// The producer calls update(). Consumers call snapshot() to take a lock-free
+// copy of the latest value; if that value is not usable they await
+// Snapshot::expired(), which resolves once the snapshot has been superseded,
+// and then call snapshot() again for the newer value. Because every published
+// value has its own expiry signal, a consumer waiting on a snapshot is never
+// woken for the value it already holds.
 pub(crate) struct Watcher<T> {
-    // Latest value, for lock-free reads via cur().
-    cur: ArcSwap<T>,
-    // Used by iter() to wait for new values.
-    tx: watch::Sender<T>,
-    rx: watch::Receiver<T>,
+    // Latest generation together with the sender that expires it.
+    current: ArcSwap<OwnedGeneration<T>>,
 }
 
-impl<T: Clone> Watcher<T> {
+impl<T> Watcher<T> {
     fn new(initial: T) -> Self {
-        let cur = ArcSwap::from_pointee(initial.clone());
-        let (tx, rx) = watch::channel(initial);
-        Self { cur, tx, rx }
+        let current = ArcSwap::from_pointee(OwnedGeneration::new(initial));
+        Self { current }
     }
 
-    pub(crate) fn iter(&self) -> WatcherIter<T> {
-        let mut rx = self.rx.clone();
-        rx.mark_changed();
-        WatcherIter { rx }
+    /// Returns a snapshot of the latest value.
+    pub(crate) fn snapshot(&self) -> Snapshot<T> {
+        Snapshot {
+            generation: self.current.load().generation.clone(),
+        }
     }
 
-    /// Returns the latest value without locking. The returned guard should be
-    /// short-lived and must not be held across an `.await`.
-    pub(crate) fn cur(&self) -> Guard<Arc<T>> {
-        self.cur.load()
-    }
-
+    /// Publishes a new value and wakes every [`Snapshot`] taken against the
+    /// previous one.
     fn update(&self, item: T) {
-        // Publish for cur() before waking iter() consumers.
-        self.cur.store(Arc::new(item.clone()));
-        self.tx.send(item).unwrap();
+        let previous = self.current.swap(Arc::new(OwnedGeneration::new(item)));
+        // Publish the new value before expiring the old one so that woken
+        // waiters calling snapshot() always observe the newer state.
+        previous.expired_tx.send_replace(true);
     }
 }
 
-pub(crate) struct WatcherIter<T> {
-    rx: watch::Receiver<T>,
+// A generation together with the sender used to expire it. Only the `Watcher`
+// holds one, for its current generation.
+//
+// The sender is deliberately kept out of [`Generation`], which outstanding
+// [`Snapshot`]s hold on to, so that it is owned by the `Watcher` alone.
+// Dropping the [`Watcher`] therefore closes the channel, which
+// [`Snapshot::expired`] reports as an error.
+struct OwnedGeneration<T> {
+    generation: Arc<Generation<T>>,
+    // Flipped to `true` by `Watcher::update` when this generation is replaced.
+    expired_tx: watch::Sender<bool>,
 }
 
-impl<T: Clone> WatcherIter<T> {
-    /// Returns the next unseen value
-    pub(crate) async fn next(&mut self) -> Option<T> {
-        self.rx.changed().await.ok()?;
-        Some(self.rx.borrow_and_update().clone())
+impl<T> OwnedGeneration<T> {
+    fn new(value: T) -> Self {
+        let (expired_tx, expired_rx) = watch::channel(false);
+        Self {
+            generation: Arc::new(Generation { value, expired_rx }),
+            expired_tx,
+        }
+    }
+}
+
+// One published value, paired with the receiver that signals its expiry. Each
+// call to [`Watcher::update`] creates a new generation and expires the previous
+// one.
+struct Generation<T> {
+    value: T,
+    // Keeps the receiver count non-zero so that dropping a receiver cloned in
+    // [`Snapshot::expired`] never takes the channel's internal lock, and serves
+    // as the source for those clones.
+    expired_rx: watch::Receiver<bool>,
+}
+
+/// A snapshot of one published value, taken via [`Watcher::snapshot`].
+pub(crate) struct Snapshot<T> {
+    generation: Arc<Generation<T>>,
+}
+
+impl<T> Snapshot<T> {
+    /// Returns the value captured when this snapshot was taken.
+    pub(crate) fn value(&self) -> &T {
+        &self.generation.value
+    }
+
+    /// Resolves once the captured value has been superseded by a newer one in
+    /// the [`Watcher`].  Returns `Err` only if the [`Watcher`] was dropped while
+    /// the value was still current.
+    pub(crate) async fn expired(&self) -> Result<(), watch::error::RecvError> {
+        let mut rx = self.generation.expired_rx.clone();
+        rx.wait_for(|expired| *expired).await.map(|_| ())
     }
 }
 
@@ -678,42 +714,66 @@ mod tests {
     }
 
     #[test]
-    fn watcher_cur_reflects_update() {
+    fn snapshot_reflects_update() {
         let watcher = Watcher::new(1u32);
-        assert_eq!(**watcher.cur(), 1);
+        assert_eq!(*watcher.snapshot().value(), 1);
         watcher.update(2);
-        assert_eq!(**watcher.cur(), 2);
+        assert_eq!(*watcher.snapshot().value(), 2);
     }
 
     // Covers the handoff in ActiveChannel::invoke: an update that lands after
-    // a cur() read must be returned by a subsequently created iter().
+    // snapshot() was called must expire that snapshot, even if nobody was awaiting
+    // expired() at the time.
     #[tokio::test]
-    async fn watcher_iter_sees_update_after_cur() {
+    async fn snapshot_expires_after_update() {
         let watcher = Watcher::new(1u32);
-        assert_eq!(**watcher.cur(), 1);
+        let snapshot = watcher.snapshot();
+        assert_eq!(*snapshot.value(), 1);
         watcher.update(2);
-        let mut iter = watcher.iter();
-        assert_eq!(iter.next().await, Some(2));
+        assert!(snapshot.expired().await.is_ok());
+        // The expired snapshot still holds its original value.
+        assert_eq!(*snapshot.value(), 1);
+        assert_eq!(*watcher.snapshot().value(), 2);
     }
 
     #[tokio::test]
-    async fn watcher_iter_waits_for_update() {
+    async fn snapshot_waits_for_update() {
         let watcher = Arc::new(Watcher::new(1u32));
-        let mut iter = watcher.iter();
-        assert_eq!(iter.next().await, Some(1));
+        let snapshot = watcher.snapshot();
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), iter.next())
+            tokio::time::timeout(Duration::from_millis(50), snapshot.expired())
                 .await
                 .is_err(),
-            "next() returned without an update"
+            "expired() resolved without an update"
         );
 
         let updater = {
             let watcher = watcher.clone();
             tokio::spawn(async move { watcher.update(2) })
         };
-        assert_eq!(iter.next().await, Some(2));
+        assert!(snapshot.expired().await.is_ok());
         updater.await.unwrap();
-        assert_eq!(**watcher.cur(), 2);
+        assert_eq!(*watcher.snapshot().value(), 2);
+    }
+
+    // A snapshot taken on an already superseded value is unaffected by later
+    // updates: expired() keeps resolving immediately.
+    #[tokio::test]
+    async fn stale_snapshot_stays_expired() {
+        let watcher = Watcher::new(1u32);
+        let snapshot = watcher.snapshot();
+        watcher.update(2);
+        watcher.update(3);
+        assert!(snapshot.expired().await.is_ok());
+        assert!(snapshot.expired().await.is_ok());
+        assert_eq!(*watcher.snapshot().value(), 3);
+    }
+
+    #[tokio::test]
+    async fn snapshot_errors_when_watcher_dropped() {
+        let watcher = Watcher::new(1u32);
+        let snapshot = watcher.snapshot();
+        drop(watcher);
+        assert!(snapshot.expired().await.is_err());
     }
 }
