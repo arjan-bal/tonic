@@ -52,6 +52,8 @@ pub(crate) mod resource;
 /// from a channel's Listener/RouteConfiguration/Cluster/Endpoints resources.
 pub(crate) mod xds_config;
 
+mod resolver;
+
 #[cfg(test)]
 mod tests {
     //! Sanity checks that the generated xDS modules are importable and usable

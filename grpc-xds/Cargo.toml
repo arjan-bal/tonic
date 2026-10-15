@@ -18,11 +18,15 @@ publish = false
 allowed_external_types = []
 
 [dependencies]
+grpc = { version = "0.10.0", path = "../grpc", default-features = false, features = [
+    "__unstable",
+] }
 protobuf = "4.35.1-release"
 protobuf-well-known-types = "4.35.1-release"
 bytes = "1.11.0"
 xds-client = { version = "0.1.0-alpha.4", path = "../xds-client", default-features = false }
 regex = "1"
+percent-encoding = {version = "2", default-features = false }
 
 [build-dependencies]
 protobuf-codegen = "4.35.1-release"
