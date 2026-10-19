@@ -22,11 +22,15 @@
  *
  */
 use std::sync::Arc;
+use std::sync::Mutex;
 
+use grpc::__unstable::client::name_resolution::ChannelController;
 use grpc::__unstable::client::name_resolution::Resolver;
 use grpc::__unstable::client::name_resolution::ResolverBuilder;
 use grpc::__unstable::client::name_resolution::ResolverOptions;
 use grpc::__unstable::client::name_resolution::Target;
+use grpc::__unstable::client::name_resolution::WorkScheduler;
+use grpc::__unstable::rt::BoxedTaskHandle;
 use percent_encoding::AsciiSet;
 use percent_encoding::NON_ALPHANUMERIC;
 use percent_encoding::utf8_percent_encode;
@@ -36,8 +40,9 @@ use crate::resolver::mocks::BootstrapConfig;
 use crate::resolver::mocks::DependencyManager;
 use crate::resolver::mocks::XdsClientProvider;
 use crate::resolver::mocks::XdsClientWrapper;
+use crate::resolver::mocks::XdsConfigResult;
+use crate::resolver::mocks::XdsConfigWatcher;
 use crate::resolver::nop_resolver::NopResolver;
-use crate::xds_config::XdsConfig;
 
 mod config_selector;
 mod mocks;
@@ -170,8 +175,74 @@ struct XdsResolver {
     dependency_manager: DependencyManager,
     active_clusters: Arc<ClusterRef>,
     lds_resource_name: String,
-    xds_config: Option<XdsConfig>,
+    /// Latest update from the dependency manager; `None` until the first one
+    /// arrives. Written by `update_task`, read by `work()`.
+    xds_config: Arc<Mutex<Option<XdsConfigResult>>>,
     current_config_selector: Option<Arc<XdsConfigSelector>>,
+    /// Task that polls the dependency manager for `XdsConfig` updates.
+    /// Aborted when the resolver is dropped.
+    update_task: BoxedTaskHandle,
+}
+
+impl XdsResolver {
+    /// Creates the resolver and starts watching `dependency_manager` for
+    /// `XdsConfig` updates.
+    ///
+    /// TODO: call from `Builder::build`.
+    fn new(
+        xds_client: Arc<XdsClientWrapper>,
+        mut dependency_manager: DependencyManager,
+        lds_resource_name: String,
+        options: ResolverOptions,
+    ) -> Self {
+        let xds_config = Arc::new(Mutex::new(None));
+        let update_task = options.runtime.spawn(Box::pin(watch_xds_config(
+            dependency_manager.watch(),
+            xds_config.clone(),
+            options.work_scheduler,
+        )));
+        Self {
+            xds_client,
+            dependency_manager,
+            active_clusters: Arc::new(ClusterRef {}),
+            lds_resource_name,
+            xds_config,
+            current_config_selector: None,
+            update_task,
+        }
+    }
+}
+
+/// Stores every update from `watcher` in `xds_config` and asks the channel to
+/// call the resolver's `work()` method. Returns when the dependency manager
+/// shuts down.
+async fn watch_xds_config(
+    mut watcher: XdsConfigWatcher,
+    xds_config: Arc<Mutex<Option<XdsConfigResult>>>,
+    work_scheduler: Arc<dyn WorkScheduler>,
+) {
+    while let Some(update) = watcher.next().await {
+        // The guard is dropped at the end of this statement, so the lock isn't
+        // held while scheduling work or across an await.
+        *xds_config.lock().unwrap() = Some(update);
+        work_scheduler.schedule_work();
+    }
+}
+
+impl Resolver for XdsResolver {
+    fn resolve_now(&mut self) {
+        todo!()
+    }
+
+    fn work(&mut self, _channel_controller: &mut dyn ChannelController) {
+        todo!()
+    }
+}
+
+impl Drop for XdsResolver {
+    fn drop(&mut self) {
+        self.update_task.abort();
+    }
 }
 
 struct ClusterRef {}
@@ -183,9 +254,15 @@ mod tests {
 
     use grpc::__unstable::client::name_resolution::ResolverBuilder;
     use grpc::__unstable::client::name_resolution::Target;
+    use tokio::sync::mpsc;
 
     use super::*;
     use crate::resolver::mocks::Authority;
+    use crate::resource::ListenerResource;
+    use crate::resource::RouteConfigResource;
+    use crate::resource::RouteSource;
+    use crate::resource::VirtualHost;
+    use crate::xds_config::XdsConfig;
 
     /// Returns clients wrapping a fixed bootstrap config, or a fixed error.
     struct FakeXdsClientProvider {
@@ -378,5 +455,134 @@ mod tests {
                 "target: {target}"
             );
         }
+    }
+
+    /// Notifies `tx` each time work is scheduled.
+    struct TestWorkScheduler {
+        tx: mpsc::UnboundedSender<()>,
+    }
+
+    impl WorkScheduler for TestWorkScheduler {
+        fn schedule_work(&self) {
+            let _ = self.tx.send(());
+        }
+    }
+
+    /// Returns a minimal valid `XdsConfig` for a Listener named "listener".
+    fn test_xds_config() -> XdsConfig {
+        let route_config = Arc::new(RouteConfigResource {
+            name: "routes".to_string(),
+            virtual_hosts: vec![VirtualHost {
+                name: "vhost".to_string(),
+                domains: vec!["*".to_string()],
+                routes: Vec::new(),
+            }],
+        });
+        let listener = Arc::new(ListenerResource {
+            name: "listener".to_string(),
+            route_source: RouteSource::Inline(route_config.clone()),
+        });
+        XdsConfig::try_new(listener, route_config, 0, HashMap::new()).expect("valid XdsConfig")
+    }
+
+    /// Handles for driving and observing a running `watch_xds_config` task.
+    struct WatchHarness {
+        /// Pushes updates to the mock dependency manager's watcher.
+        updates_tx: mpsc::UnboundedSender<XdsConfigResult>,
+        /// The state the task writes updates into.
+        xds_config: Arc<Mutex<Option<XdsConfigResult>>>,
+        /// Receives one message per `schedule_work()` call.
+        work_rx: mpsc::UnboundedReceiver<()>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl WatchHarness {
+        /// Waits until the task calls `schedule_work()`.
+        async fn wait_for_work(&mut self) {
+            self.work_rx.recv().await.expect("work was not scheduled");
+        }
+    }
+
+    /// Spawns `watch_xds_config` on the test runtime, watching a new mock
+    /// dependency manager.
+    fn start_watch() -> WatchHarness {
+        let (mut dependency_manager, updates_tx) = DependencyManager::new();
+        let (work_tx, work_rx) = mpsc::unbounded_channel();
+        let xds_config = Arc::new(Mutex::new(None));
+        let task = tokio::spawn(watch_xds_config(
+            dependency_manager.watch(),
+            xds_config.clone(),
+            Arc::new(TestWorkScheduler { tx: work_tx }),
+        ));
+        WatchHarness {
+            updates_tx,
+            xds_config,
+            work_rx,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn xds_config_update_is_stored_and_schedules_work() {
+        let mut harness = start_watch();
+        harness.updates_tx.send(Ok(test_xds_config())).unwrap();
+        harness.wait_for_work().await;
+
+        let stored = harness.xds_config.lock().unwrap();
+        match &*stored {
+            Some(Ok(config)) => assert_eq!(config.listener.name, "listener"),
+            other => panic!("expected a stored Ok config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn xds_config_error_is_stored_and_schedules_work() {
+        let mut harness = start_watch();
+        harness.updates_tx.send(Err("boom".to_string())).unwrap();
+        harness.wait_for_work().await;
+
+        let stored = harness.xds_config.lock().unwrap();
+        assert!(
+            matches!(&*stored, Some(Err(err)) if err == "boom"),
+            "expected a stored error, got {stored:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_update_replaces_earlier_one() {
+        let mut harness = start_watch();
+        harness.updates_tx.send(Ok(test_xds_config())).unwrap();
+        harness.updates_tx.send(Err("second".to_string())).unwrap();
+        harness.wait_for_work().await;
+        harness.wait_for_work().await;
+
+        let stored = harness.xds_config.lock().unwrap();
+        assert!(
+            matches!(&*stored, Some(Err(err)) if err == "second"),
+            "expected the later update, got {stored:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_task_exits_when_dependency_manager_shuts_down() {
+        let WatchHarness {
+            updates_tx,
+            xds_config,
+            mut work_rx,
+            task,
+        } = start_watch();
+        drop(updates_tx);
+        task.await.expect("task should exit cleanly");
+
+        assert!(xds_config.lock().unwrap().is_none());
+        assert!(work_rx.try_recv().is_err(), "no work should be scheduled");
+    }
+
+    #[test]
+    #[should_panic(expected = "called more than once")]
+    fn dependency_manager_watch_twice_panics() {
+        let (mut dependency_manager, _updates_tx) = DependencyManager::new();
+        let _watcher = dependency_manager.watch();
+        let _ = dependency_manager.watch();
     }
 }

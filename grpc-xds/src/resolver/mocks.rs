@@ -25,6 +25,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
+
+use crate::xds_config::XdsConfig;
+
 /// Mock xDS client.
 ///
 /// TODO: replace with the real xDS client once it is integrated.
@@ -50,7 +54,54 @@ pub(super) trait XdsClientProvider: Send + Sync {
     fn get_or_create(&self, name: &str) -> Result<Arc<XdsClientWrapper>, String>;
 }
 
-pub(super) struct DependencyManager {}
+/// An `XdsConfig` update from the dependency manager: a new snapshot, or an
+/// error that prevents the channel from getting one (e.g. the Listener or
+/// RouteConfiguration doesn't exist).
+pub(super) type XdsConfigResult = Result<XdsConfig, String>;
+
+/// Mock of the xDS dependency manager (gRFC A74).
+///
+/// TODO: replace with the real dependency manager once it is implemented.
+pub(super) struct DependencyManager {
+    watcher: Option<XdsConfigWatcher>,
+}
+
+impl DependencyManager {
+    /// Returns a mock dependency manager, and the sender used to push
+    /// `XdsConfig` updates to its watcher.
+    pub(super) fn new() -> (Self, mpsc::UnboundedSender<XdsConfigResult>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let dependency_manager = Self {
+            watcher: Some(XdsConfigWatcher { rx }),
+        };
+        (dependency_manager, tx)
+    }
+
+    /// Returns the watcher that receives this dependency manager's
+    /// `XdsConfig` updates.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once.
+    pub(super) fn watch(&mut self) -> XdsConfigWatcher {
+        self.watcher
+            .take()
+            .expect("DependencyManager::watch called more than once")
+    }
+}
+
+/// Receives `XdsConfig` updates from a [`DependencyManager`].
+pub(super) struct XdsConfigWatcher {
+    rx: mpsc::UnboundedReceiver<XdsConfigResult>,
+}
+
+impl XdsConfigWatcher {
+    /// Returns the next update, or `None` once the dependency manager has
+    /// shut down.
+    pub(super) async fn next(&mut self) -> Option<XdsConfigResult> {
+        self.rx.recv().await
+    }
+}
 
 /// Mock of a single bootstrap authority entry.
 #[derive(Debug, Clone)]
