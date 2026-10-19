@@ -22,15 +22,37 @@
  *
  */
 
+use std::sync::Arc;
+
 use grpc::__unstable::client::name_resolution::config_selector::ConfigSelector;
 use grpc::__unstable::client::name_resolution::config_selector::RpcConfig;
 use grpc::__unstable::client::name_resolution::config_selector::SelectConfigOptions;
 
+use super::ClusterRef;
+
+/// Routes each RPC to a cluster.
 #[derive(Debug)]
-pub struct XdsConfigSelector {}
+pub struct XdsConfigSelector {
+    cluster_refs: Vec<Arc<ClusterRef>>,
+}
+
+impl XdsConfigSelector {
+    pub(super) fn new(cluster_refs: Vec<Arc<ClusterRef>>) -> Self {
+        Self { cluster_refs }
+    }
+
+    /// Returns the names of the clusters this selector holds refs to.
+    #[cfg(test)]
+    pub(super) fn cluster_names(&self) -> Vec<&str> {
+        self.cluster_refs.iter().map(|c| c.name()).collect()
+    }
+}
 
 impl ConfigSelector for XdsConfigSelector {
     fn select_config(&self, options: SelectConfigOptions) -> Result<RpcConfig, grpc::StatusError> {
+        // TODO: pick a cluster and attach its ClusterRef to the RPC via
+        // `options.call_options.set_option(..)`, so the cluster stays in the
+        // service config until the RPC is done.
         todo!()
     }
 }

@@ -60,7 +60,7 @@ use grpc::StatusCodeError;
 use grpc::StatusError;
 use serde::Deserialize;
 
-static POLICY_NAME: &str = "xds_cluster_manager_experimental";
+pub(crate) static POLICY_NAME: &str = "xds_cluster_manager_experimental";
 static START: Once = Once::new();
 
 // Target cluster option for an RPC, keyed by its `TypeId` in `CallOptions`.

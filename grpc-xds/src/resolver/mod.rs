@@ -21,15 +21,21 @@
  * IN THE SOFTWARE.
  *
  */
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 
 use grpc::__unstable::client::name_resolution::ChannelController;
 use grpc::__unstable::client::name_resolution::Resolver;
 use grpc::__unstable::client::name_resolution::ResolverBuilder;
 use grpc::__unstable::client::name_resolution::ResolverOptions;
+use grpc::__unstable::client::name_resolution::ResolverUpdate;
 use grpc::__unstable::client::name_resolution::Target;
 use grpc::__unstable::client::name_resolution::WorkScheduler;
+use grpc::__unstable::client::name_resolution::config_selector::set_in_resolver_update;
 use grpc::__unstable::rt::BoxedTaskHandle;
 use percent_encoding::AsciiSet;
 use percent_encoding::NON_ALPHANUMERIC;
@@ -37,17 +43,25 @@ use percent_encoding::utf8_percent_encode;
 
 use crate::resolver::config_selector::XdsConfigSelector;
 use crate::resolver::mocks::BootstrapConfig;
+use crate::resolver::mocks::ClusterSubscription;
 use crate::resolver::mocks::DependencyManager;
 use crate::resolver::mocks::XdsClientProvider;
 use crate::resolver::mocks::XdsClientWrapper;
 use crate::resolver::mocks::XdsConfigResult;
 use crate::resolver::mocks::XdsConfigWatcher;
 use crate::resolver::nop_resolver::NopResolver;
+use crate::resolver::service_config::cds_cluster_manager_service_config;
+use crate::resource::RouteAction;
+use crate::xds_config::XdsConfig;
 
 mod config_selector;
 mod mocks;
 mod nop_resolver;
+mod service_config;
 
+// TODO: register this builder in the global resolver registry, in the same
+// place that calls `load_balancing::register()` for the LB policies named in
+// the resolver's service config.
 struct Builder {
     xds_client_provider: Arc<dyn XdsClientProvider>,
 }
@@ -173,12 +187,18 @@ fn populate_resource_template(template: &str, target: &str) -> String {
 struct XdsResolver {
     xds_client: Arc<XdsClientWrapper>,
     dependency_manager: DependencyManager,
-    active_clusters: Arc<ClusterRef>,
+    /// Clusters that must stay in the LB policy config, keyed by cluster name.
+    /// Weak, so the map doesn't keep clusters in use. An entry lives until its
+    /// last `ClusterRef` is dropped and `work()` prunes it.
+    active_clusters: HashMap<String, Weak<ClusterRef>>,
     lds_resource_name: String,
     /// Latest update from the dependency manager; `None` until the first one
     /// arrives. Written by `update_task`, read by `work()`.
     xds_config: Arc<Mutex<Option<XdsConfigResult>>>,
     current_config_selector: Option<Arc<XdsConfigSelector>>,
+    /// Given to each `ClusterRef`, so that dropping the last ref for a cluster
+    /// schedules a call to `work()`.
+    work_scheduler: Arc<dyn WorkScheduler>,
     /// Task that polls the dependency manager for `XdsConfig` updates.
     /// Aborted when the resolver is dropped.
     update_task: BoxedTaskHandle,
@@ -199,17 +219,95 @@ impl XdsResolver {
         let update_task = options.runtime.spawn(Box::pin(watch_xds_config(
             dependency_manager.watch(),
             xds_config.clone(),
-            options.work_scheduler,
+            options.work_scheduler.clone(),
         )));
         Self {
             xds_client,
             dependency_manager,
-            active_clusters: Arc::new(ClusterRef {}),
+            active_clusters: HashMap::new(),
             lds_resource_name,
             xds_config,
             current_config_selector: None,
+            work_scheduler: options.work_scheduler,
             update_task,
         }
+    }
+
+    /// Returns a ref to cluster `name`, subscribing to the cluster if no live
+    /// ref exists.
+    fn get_or_create_cluster_ref(&mut self, name: &str) -> Arc<ClusterRef> {
+        if let Some(cluster_ref) = self.active_clusters.get(name).and_then(Weak::upgrade) {
+            return cluster_ref;
+        }
+        // Either the cluster is new, or its last ref was dropped (which
+        // unsubscribed) and `work()` hasn't pruned it yet. Start a new ref,
+        // replacing any dead entry.
+        let cluster_ref = Arc::new(ClusterRef {
+            name: name.to_owned(),
+            _subscription: self.dependency_manager.subscribe_to_cluster(name),
+            work_scheduler: self.work_scheduler.clone(),
+        });
+        self.active_clusters
+            .insert(name.to_owned(), Arc::downgrade(&cluster_ref));
+        cluster_ref
+    }
+
+    /// Returns a config selector holding one ref to each cluster that
+    /// `xds_config`'s routes can send RPCs to.
+    fn new_config_selector(&mut self, xds_config: &XdsConfig) -> Arc<XdsConfigSelector> {
+        // A BTreeSet dedupes clusters used by several routes, in a
+        // deterministic order.
+        let mut names = BTreeSet::new();
+        for route in &xds_config.virtual_host().routes {
+            match &route.action {
+                RouteAction::Cluster(name) => {
+                    names.insert(name.as_str());
+                }
+                RouteAction::WeightedClusters(clusters) => {
+                    names.extend(clusters.iter().map(|c| c.name.as_str()));
+                }
+            }
+        }
+        let cluster_refs = names
+            .into_iter()
+            .map(|name| self.get_or_create_cluster_ref(name))
+            .collect();
+        Arc::new(XdsConfigSelector::new(cluster_refs))
+    }
+
+    /// Removes the clusters whose last `ClusterRef` was dropped. Returns
+    /// whether any cluster was removed.
+    fn remove_unused_clusters(&mut self) -> bool {
+        let num_clusters = self.active_clusters.len();
+        // Dropping a dead `Weak` never runs `ClusterRef::drop`; that already
+        // happened when its last ref was dropped.
+        self.active_clusters
+            .retain(|_, cluster_ref| cluster_ref.strong_count() > 0);
+        self.active_clusters.len() != num_clusters
+    }
+
+    /// Sends the channel a service config for the active clusters, along with
+    /// the current config selector. Does nothing before the first config
+    /// selector is created.
+    fn update_channel(&self, channel_controller: &mut dyn ChannelController) {
+        let Some(config_selector) = &self.current_config_selector else {
+            return;
+        };
+        let mut update = ResolverUpdate::default();
+        update.service_config = channel_controller
+            .parse_service_config(&self.service_config_json())
+            .map(Some);
+        // The channel falls back to its default config selector for updates
+        // without one, so every update must carry the current selector.
+        let update = set_in_resolver_update(config_selector.clone(), update);
+        // TODO: handle errors returned by the channel.
+        let _ = channel_controller.update(update);
+    }
+
+    /// Returns the service config for the active clusters. See
+    /// [`cds_cluster_manager_service_config`].
+    fn service_config_json(&self) -> String {
+        cds_cluster_manager_service_config(self.active_clusters.keys().map(String::as_str))
     }
 }
 
@@ -234,8 +332,13 @@ impl Resolver for XdsResolver {
         todo!()
     }
 
-    fn work(&mut self, _channel_controller: &mut dyn ChannelController) {
-        todo!()
+    fn work(&mut self, channel_controller: &mut dyn ChannelController) {
+        // TODO: create a new config selector when the XdsConfig changes. Keep
+        // pruning before building any update, so that no update names a
+        // cluster the dependency manager may have stopped watching.
+        if self.remove_unused_clusters() {
+            self.update_channel(channel_controller);
+        }
     }
 }
 
@@ -245,24 +348,69 @@ impl Drop for XdsResolver {
     }
 }
 
-struct ClusterRef {}
+/// A reference to a cluster that a config selector or an RPC may route to.
+/// While any `ClusterRef` for a cluster is alive, the cluster stays in the
+/// resolver's service config and the dependency manager stays subscribed to
+/// it.
+struct ClusterRef {
+    name: String,
+    /// Keeps the dependency manager subscribed to the cluster. Dropped, which
+    /// unsubscribes, together with the last ref.
+    _subscription: ClusterSubscription,
+    work_scheduler: Arc<dyn WorkScheduler>,
+}
+
+impl ClusterRef {
+    /// Returns the cluster name.
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl fmt::Debug for ClusterRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClusterRef")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ClusterRef {
+    fn drop(&mut self) {
+        // This can run on any thread, e.g. when an RPC finishes, so it must not
+        // touch the resolver. Ask the channel to call `work()`, which removes
+        // the cluster from the service config. The subscription is dropped
+        // right after this returns.
+        self.work_scheduler.schedule_work();
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use grpc::__unstable::client::load_balancing::LbPolicyBuilder;
+    use grpc::__unstable::client::load_balancing::ParsedLbConfig;
     use grpc::__unstable::client::name_resolution::ResolverBuilder;
     use grpc::__unstable::client::name_resolution::Target;
+    use grpc::__unstable::client::service_config::ParseResult;
+    use grpc::__unstable::rt::TaskHandle;
+    use serde_json::json;
     use tokio::sync::mpsc;
 
     use super::*;
     use crate::resolver::mocks::Authority;
-    use crate::resource::ListenerResource;
-    use crate::resource::RouteConfigResource;
-    use crate::resource::RouteSource;
     use crate::resource::DomainMatcher;
+    use crate::resource::ListenerResource;
+    use crate::resource::PathSpecifier;
+    use crate::resource::Route;
+    use crate::resource::RouteConfigResource;
+    use crate::resource::RouteMatch;
+    use crate::resource::RouteSource;
     use crate::resource::VirtualHost;
+    use crate::resource::WeightedCluster;
     use crate::xds_config::XdsConfig;
 
     /// Returns clients wrapping a fixed bootstrap config, or a fixed error.
@@ -471,12 +619,30 @@ mod tests {
 
     /// Returns a minimal valid `XdsConfig` for a Listener named "listener".
     fn test_xds_config() -> XdsConfig {
+        xds_config_with_routes(Vec::new())
+    }
+
+    /// Returns a valid `XdsConfig` whose virtual host has one route per
+    /// action, each matching every path.
+    fn xds_config_with_routes(actions: Vec<RouteAction>) -> XdsConfig {
+        let routes = actions
+            .into_iter()
+            .map(|action| Route {
+                route_match: RouteMatch {
+                    path_specifier: PathSpecifier::Prefix(String::new()),
+                    headers: Vec::new(),
+                    case_sensitive: true,
+                    match_fraction: None,
+                },
+                action,
+            })
+            .collect();
         let route_config = Arc::new(RouteConfigResource {
             name: "routes".to_string(),
             virtual_hosts: vec![VirtualHost {
                 name: "vhost".to_string(),
                 domains: vec![DomainMatcher::Universal],
-                routes: Vec::new(),
+                routes,
             }],
         });
         let listener = Arc::new(ListenerResource {
@@ -585,5 +751,328 @@ mod tests {
         let (mut dependency_manager, _updates_tx) = DependencyManager::new();
         let _watcher = dependency_manager.watch();
         let _ = dependency_manager.watch();
+    }
+
+    /// A task handle for resolvers built without an update task.
+    struct NoopTaskHandle;
+
+    impl TaskHandle for NoopTaskHandle {
+        fn abort(&self) {}
+    }
+
+    /// Records the service configs the resolver asks it to parse, and counts
+    /// the updates it receives.
+    #[derive(Default)]
+    struct FakeChannelController {
+        service_configs: Mutex<Vec<String>>,
+        updates: usize,
+    }
+
+    impl FakeChannelController {
+        /// Returns the service configs passed to `parse_service_config`, as
+        /// JSON values.
+        fn service_configs(&self) -> Vec<serde_json::Value> {
+            self.service_configs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|config| serde_json::from_str(config).unwrap())
+                .collect()
+        }
+    }
+
+    impl ChannelController for FakeChannelController {
+        fn update(&mut self, _update: ResolverUpdate) -> Result<(), String> {
+            self.updates += 1;
+            Ok(())
+        }
+
+        fn parse_service_config(&self, config: &str) -> ParseResult {
+            self.service_configs
+                .lock()
+                .unwrap()
+                .push(config.to_string());
+            // `ServiceConfig` can't be constructed outside of grpc.
+            Err("not supported by FakeChannelController".to_string())
+        }
+    }
+
+    /// Returns a resolver without an update task, and a receiver that gets a
+    /// message each time the resolver's work is scheduled.
+    ///
+    /// Builds the struct directly, since `XdsResolver::new` needs a
+    /// `ResolverOptions`, which tests can't create.
+    fn test_resolver() -> (XdsResolver, mpsc::UnboundedReceiver<()>) {
+        let (dependency_manager, _updates_tx) = DependencyManager::new();
+        let (work_tx, work_rx) = mpsc::unbounded_channel();
+        let resolver = XdsResolver {
+            xds_client: Arc::new(XdsClientWrapper {
+                bootstrap: BootstrapConfig::default(),
+            }),
+            dependency_manager,
+            active_clusters: HashMap::new(),
+            lds_resource_name: "listener".to_string(),
+            xds_config: Arc::new(Mutex::new(None)),
+            current_config_selector: None,
+            work_scheduler: Arc::new(TestWorkScheduler { tx: work_tx }),
+            update_task: Box::new(NoopTaskHandle),
+        };
+        (resolver, work_rx)
+    }
+
+    /// Returns how many times work was scheduled since the last call.
+    fn scheduled_work(work_rx: &mut mpsc::UnboundedReceiver<()>) -> usize {
+        let mut count = 0;
+        while work_rx.try_recv().is_ok() {
+            count += 1;
+        }
+        count
+    }
+
+    /// Returns the names of the resolver's active clusters, sorted.
+    fn active_clusters(resolver: &XdsResolver) -> Vec<&str> {
+        let mut names: Vec<&str> = resolver
+            .active_clusters
+            .keys()
+            .map(String::as_str)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Returns the resolver's live dependency manager subscriptions per
+    /// cluster.
+    fn subscriptions(resolver: &XdsResolver) -> BTreeMap<String, usize> {
+        resolver.dependency_manager.cluster_subscription_counts()
+    }
+
+    /// Returns a subscription count map with the given entries.
+    fn counts(entries: &[(&str, usize)]) -> BTreeMap<String, usize> {
+        entries
+            .iter()
+            .map(|(name, count)| (name.to_string(), *count))
+            .collect()
+    }
+
+    /// Returns the service config the resolver should generate for
+    /// `clusters`.
+    fn expected_service_config(clusters: &[&str]) -> serde_json::Value {
+        let children: serde_json::Map<String, serde_json::Value> = clusters
+            .iter()
+            .map(|name| {
+                let child = json!({ "childPolicy": [{ "cds_experimental": { "cluster": name } }] });
+                (format!("cluster:{name}"), child)
+            })
+            .collect();
+        json!({
+            "loadBalancingConfig": [
+                { "xds_cluster_manager_experimental": { "children": children } }
+            ]
+        })
+    }
+
+    #[test]
+    fn cluster_ref_is_shared_and_subscribes_once() {
+        let (mut resolver, _work_rx) = test_resolver();
+        let first = resolver.get_or_create_cluster_ref("a");
+        let second = resolver.get_or_create_cluster_ref("a");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(subscriptions(&resolver), counts(&[("a", 1)]));
+    }
+
+    #[test]
+    fn dropping_last_cluster_ref_unsubscribes_and_schedules_work() {
+        let (mut resolver, mut work_rx) = test_resolver();
+        let first = resolver.get_or_create_cluster_ref("a");
+        let second = first.clone();
+
+        drop(first);
+        assert_eq!(scheduled_work(&mut work_rx), 0);
+        assert_eq!(subscriptions(&resolver), counts(&[("a", 1)]));
+
+        drop(second);
+        assert_eq!(scheduled_work(&mut work_rx), 1);
+        assert_eq!(subscriptions(&resolver), counts(&[]));
+    }
+
+    #[test]
+    fn work_prunes_unused_clusters() {
+        let (mut resolver, mut work_rx) = test_resolver();
+        let old_selector = XdsConfigSelector::new(vec![
+            resolver.get_or_create_cluster_ref("a"),
+            resolver.get_or_create_cluster_ref("b"),
+        ]);
+        let current_selector =
+            XdsConfigSelector::new(vec![resolver.get_or_create_cluster_ref("a")]);
+        resolver.current_config_selector = Some(Arc::new(current_selector));
+
+        drop(old_selector);
+        assert_eq!(scheduled_work(&mut work_rx), 1);
+        let mut controller = FakeChannelController::default();
+        resolver.work(&mut controller);
+
+        assert_eq!(active_clusters(&resolver), ["a"]);
+        assert_eq!(subscriptions(&resolver), counts(&[("a", 1)]));
+        assert_eq!(controller.updates, 1);
+        assert_eq!(
+            controller.service_configs(),
+            [expected_service_config(&["a"])]
+        );
+    }
+
+    #[test]
+    fn rpc_ref_keeps_cluster_until_dropped() {
+        let (mut resolver, mut work_rx) = test_resolver();
+        let old_selector = XdsConfigSelector::new(vec![resolver.get_or_create_cluster_ref("b")]);
+        let current_selector =
+            XdsConfigSelector::new(vec![resolver.get_or_create_cluster_ref("a")]);
+        resolver.current_config_selector = Some(Arc::new(current_selector));
+        // Stands in for the ref an RPC routed to "b" will hold.
+        let rpc_ref = resolver.get_or_create_cluster_ref("b");
+
+        drop(old_selector);
+        assert_eq!(scheduled_work(&mut work_rx), 0);
+        let mut controller = FakeChannelController::default();
+        resolver.work(&mut controller);
+        assert_eq!(active_clusters(&resolver), ["a", "b"]);
+        assert_eq!(subscriptions(&resolver), counts(&[("a", 1), ("b", 1)]));
+        assert_eq!(controller.updates, 0);
+
+        drop(rpc_ref);
+        assert_eq!(scheduled_work(&mut work_rx), 1);
+        assert_eq!(subscriptions(&resolver), counts(&[("a", 1)]));
+        resolver.work(&mut controller);
+        assert_eq!(active_clusters(&resolver), ["a"]);
+        assert_eq!(controller.updates, 1);
+        assert_eq!(
+            controller.service_configs(),
+            [expected_service_config(&["a"])]
+        );
+    }
+
+    #[test]
+    fn work_without_unused_clusters_sends_no_update() {
+        let (mut resolver, _work_rx) = test_resolver();
+        let selector = XdsConfigSelector::new(vec![resolver.get_or_create_cluster_ref("a")]);
+        resolver.current_config_selector = Some(Arc::new(selector));
+
+        let mut controller = FakeChannelController::default();
+        resolver.work(&mut controller);
+
+        assert_eq!(active_clusters(&resolver), ["a"]);
+        assert_eq!(controller.updates, 0);
+        assert!(controller.service_configs().is_empty());
+    }
+
+    #[test]
+    fn work_without_config_selector_sends_no_update() {
+        let (mut resolver, _work_rx) = test_resolver();
+        drop(resolver.get_or_create_cluster_ref("a"));
+
+        let mut controller = FakeChannelController::default();
+        resolver.work(&mut controller);
+
+        assert!(active_clusters(&resolver).is_empty());
+        assert_eq!(controller.updates, 0);
+        assert!(controller.service_configs().is_empty());
+    }
+
+    #[test]
+    fn cluster_ref_recreated_before_prune_resubscribes() {
+        let (mut resolver, mut work_rx) = test_resolver();
+        // A current selector, so that removing a cluster would send an update.
+        resolver.current_config_selector = Some(Arc::new(XdsConfigSelector::new(Vec::new())));
+        drop(resolver.get_or_create_cluster_ref("a"));
+        assert_eq!(subscriptions(&resolver), counts(&[]));
+
+        // Reuse "a" before `work()` prunes its dead entry.
+        let _cluster_ref = resolver.get_or_create_cluster_ref("a");
+        assert_eq!(subscriptions(&resolver), counts(&[("a", 1)]));
+        assert_eq!(scheduled_work(&mut work_rx), 1);
+        let mut controller = FakeChannelController::default();
+        resolver.work(&mut controller);
+
+        assert_eq!(active_clusters(&resolver), ["a"]);
+        assert_eq!(controller.updates, 0);
+    }
+
+    #[test]
+    fn new_config_selector_refs_each_route_cluster_once() {
+        let (mut resolver, _work_rx) = test_resolver();
+        let config = xds_config_with_routes(vec![
+            RouteAction::Cluster("a".to_string()),
+            RouteAction::WeightedClusters(vec![
+                WeightedCluster {
+                    name: "b".to_string(),
+                    weight: 1,
+                },
+                WeightedCluster {
+                    name: "c".to_string(),
+                    weight: 1,
+                },
+            ]),
+            RouteAction::Cluster("a".to_string()),
+        ]);
+
+        let selector = resolver.new_config_selector(&config);
+
+        assert_eq!(selector.cluster_names(), ["a", "b", "c"]);
+        assert_eq!(
+            subscriptions(&resolver),
+            counts(&[("a", 1), ("b", 1), ("c", 1)])
+        );
+    }
+
+    #[test]
+    fn service_config_json_has_child_per_cluster() {
+        let (mut resolver, _work_rx) = test_resolver();
+        // A name that needs escaping in JSON.
+        let _refs = [
+            resolver.get_or_create_cluster_ref("b"),
+            resolver.get_or_create_cluster_ref("a\"x"),
+        ];
+
+        let service_config: serde_json::Value =
+            serde_json::from_str(&resolver.service_config_json()).unwrap();
+
+        assert_eq!(service_config, expected_service_config(&["a\"x", "b"]));
+    }
+
+    #[test]
+    fn service_config_parses_with_cluster_manager() {
+        crate::load_balancing::register();
+        let (mut resolver, _work_rx) = test_resolver();
+        let _refs = [
+            resolver.get_or_create_cluster_ref("a"),
+            resolver.get_or_create_cluster_ref("b"),
+        ];
+
+        let service_config: serde_json::Value =
+            serde_json::from_str(&resolver.service_config_json()).unwrap();
+        let parsed = ParsedLbConfig::parse(&service_config["loadBalancingConfig"].to_string())
+            .expect("cluster manager should parse the generated config");
+
+        assert_eq!(parsed.builder.name(), "xds_cluster_manager_experimental");
+    }
+
+    #[test]
+    fn dependency_manager_counts_cluster_subscriptions() {
+        let (dependency_manager, _updates_tx) = DependencyManager::new();
+        let first = dependency_manager.subscribe_to_cluster("a");
+        let second = dependency_manager.subscribe_to_cluster("a");
+        assert_eq!(
+            dependency_manager.cluster_subscription_counts(),
+            counts(&[("a", 2)])
+        );
+
+        drop(first);
+        assert_eq!(
+            dependency_manager.cluster_subscription_counts(),
+            counts(&[("a", 1)])
+        );
+
+        drop(second);
+        assert!(dependency_manager.cluster_subscription_counts().is_empty());
     }
 }

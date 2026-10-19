@@ -22,8 +22,11 @@
  *
  */
 
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use tokio::sync::mpsc;
 
@@ -64,6 +67,9 @@ pub(super) type XdsConfigResult = Result<XdsConfig, String>;
 /// TODO: replace with the real dependency manager once it is implemented.
 pub(super) struct DependencyManager {
     watcher: Option<XdsConfigWatcher>,
+    /// Number of live `ClusterSubscription`s per cluster name. Shared with the
+    /// subscriptions, which may outlive the dependency manager.
+    cluster_subscriptions: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl DependencyManager {
@@ -73,6 +79,7 @@ impl DependencyManager {
         let (tx, rx) = mpsc::unbounded_channel();
         let dependency_manager = Self {
             watcher: Some(XdsConfigWatcher { rx }),
+            cluster_subscriptions: Arc::default(),
         };
         (dependency_manager, tx)
     }
@@ -87,6 +94,55 @@ impl DependencyManager {
         self.watcher
             .take()
             .expect("DependencyManager::watch called more than once")
+    }
+
+    /// Subscribes to the Cluster resource `name`, so that the cluster stays in
+    /// the `XdsConfig` even if the route config stops referencing it. The
+    /// subscription lasts until the returned handle is dropped.
+    pub(super) fn subscribe_to_cluster(&self, name: &str) -> ClusterSubscription {
+        *self
+            .cluster_subscriptions
+            .lock()
+            .unwrap()
+            .entry(name.to_owned())
+            .or_default() += 1;
+        ClusterSubscription {
+            name: name.to_owned(),
+            cluster_subscriptions: self.cluster_subscriptions.clone(),
+        }
+    }
+
+    /// Returns the number of live subscriptions for each subscribed cluster.
+    #[cfg(test)]
+    pub(super) fn cluster_subscription_counts(&self) -> BTreeMap<String, usize> {
+        self.cluster_subscriptions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, count)| (name.clone(), *count))
+            .collect()
+    }
+}
+
+/// Keeps a [`DependencyManager`] subscribed to a cluster. Dropping it
+/// unsubscribes.
+///
+/// May be dropped on any thread, e.g. when the last RPC routed to the cluster
+/// finishes.
+pub(super) struct ClusterSubscription {
+    name: String,
+    cluster_subscriptions: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl Drop for ClusterSubscription {
+    fn drop(&mut self) {
+        let mut subscriptions = self.cluster_subscriptions.lock().unwrap();
+        if let Some(count) = subscriptions.get_mut(&self.name) {
+            *count -= 1;
+            if *count == 0 {
+                subscriptions.remove(&self.name);
+            }
+        }
     }
 }
 
