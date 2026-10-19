@@ -38,7 +38,6 @@ use tokio::sync::watch;
 
 use crate::StatusCodeError;
 use crate::StatusError;
-use crate::call_attributes::CallAttributes;
 use crate::client::CallOptions;
 use crate::client::ConnectivityState;
 use crate::client::DynInvoke;

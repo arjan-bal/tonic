@@ -31,12 +31,8 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::StatusError;
-<<<<<<< HEAD
-use crate::client::load_balancing::PickOptions;
-=======
 use crate::client::CallOptions;
 use crate::client::RequestHeaders;
->>>>>>> config-selector
 use crate::client::name_resolution::ResolverUpdate;
 
 /// The configuration to apply to a single RPC, as chosen by a
@@ -45,12 +41,6 @@ use crate::client::name_resolution::ResolverUpdate;
 #[non_exhaustive]
 pub struct RpcConfig {}
 
-<<<<<<< HEAD
-/// Controls what configuration to use for every RPC.
-///
-/// A `ConfigSelector` is supplied by a name resolver through the attributes of
-/// a [`ResolverUpdate`] and is consulted by the channel once per RPC.
-=======
 /// The data provided to a [`ConfigSelector`] when selecting the configuration
 /// for an RPC.
 #[non_exhaustive]
@@ -77,18 +67,13 @@ impl<'a> SelectConfigOptions<'a> {
 ///
 /// A `ConfigSelector` is supplied by a name resolver through the attributes of
 /// a `ResolverUpdate` and is consulted by the channel once per RPC.
->>>>>>> config-selector
 pub trait ConfigSelector: Send + Sync + Debug {
     /// Selects the configuration for the RPC, or terminates it with the
     /// returned error.
     ///
     /// Errors with a status code that the control plane may not use, as
     /// defined by gRFC A54, are converted to INTERNAL by the channel.
-<<<<<<< HEAD
-    fn select_config(&self, options: PickOptions) -> Result<RpcConfig, StatusError>;
-=======
     fn select_config(&self, options: SelectConfigOptions<'_>) -> Result<RpcConfig, StatusError>;
->>>>>>> config-selector
 }
 
 /// The config selector a channel uses when its resolver does not supply one.
@@ -96,11 +81,7 @@ pub trait ConfigSelector: Send + Sync + Debug {
 pub(crate) struct DefaultConfigSelector;
 
 impl ConfigSelector for DefaultConfigSelector {
-<<<<<<< HEAD
-    fn select_config(&self, _options: PickOptions) -> Result<RpcConfig, StatusError> {
-=======
     fn select_config(&self, _options: SelectConfigOptions<'_>) -> Result<RpcConfig, StatusError> {
->>>>>>> config-selector
         Ok(RpcConfig::default())
     }
 }
@@ -240,14 +221,10 @@ mod tests {
     }
 
     impl ConfigSelector for FakeConfigSelector {
-<<<<<<< HEAD
-        fn select_config(&self, options: PickOptions) -> Result<RpcConfig, StatusError> {
-=======
         fn select_config(
             &self,
             options: SelectConfigOptions<'_>,
         ) -> Result<RpcConfig, StatusError> {
->>>>>>> config-selector
             self.methods
                 .lock()
                 .unwrap()
@@ -290,16 +267,11 @@ mod tests {
     }
 
     impl ConfigSelector for ClusterConfigSelector {
-<<<<<<< HEAD
-        fn select_config(&self, options: PickOptions) -> Result<RpcConfig, StatusError> {
-            options.call_attributes.add(self.subscription.clone());
-=======
         fn select_config(
             &self,
             options: SelectConfigOptions<'_>,
         ) -> Result<RpcConfig, StatusError> {
             options.call_options.set_option(self.subscription.clone());
->>>>>>> config-selector
             // The test may have stopped listening.
             let _ = self.selected_tx.send(());
             Ok(RpcConfig::default())

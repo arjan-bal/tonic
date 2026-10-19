@@ -22,15 +22,15 @@
  *
  */
 
-use grpc::__unstable::client::load_balancing::PickOptions;
 use grpc::__unstable::client::name_resolution::config_selector::ConfigSelector;
 use grpc::__unstable::client::name_resolution::config_selector::RpcConfig;
+use grpc::__unstable::client::name_resolution::config_selector::SelectConfigOptions;
 
 #[derive(Debug)]
 pub struct XdsConfigSelector {}
 
 impl ConfigSelector for XdsConfigSelector {
-    fn select_config(&self, options: PickOptions) -> Result<RpcConfig, grpc::StatusError> {
+    fn select_config(&self, options: SelectConfigOptions) -> Result<RpcConfig, grpc::StatusError> {
         todo!()
     }
 }

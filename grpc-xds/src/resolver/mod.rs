@@ -261,6 +261,7 @@ mod tests {
     use crate::resource::ListenerResource;
     use crate::resource::RouteConfigResource;
     use crate::resource::RouteSource;
+    use crate::resource::DomainMatcher;
     use crate::resource::VirtualHost;
     use crate::xds_config::XdsConfig;
 
@@ -474,7 +475,7 @@ mod tests {
             name: "routes".to_string(),
             virtual_hosts: vec![VirtualHost {
                 name: "vhost".to_string(),
-                domains: vec!["*".to_string()],
+                domains: vec![DomainMatcher::Universal],
                 routes: Vec::new(),
             }],
         });
