@@ -75,6 +75,8 @@ pub use tonic::async_trait;
 #[cfg(feature = "__unstable")]
 #[doc(hidden)]
 pub mod __unstable {
+    pub use crate::private::Internal;
+
     pub mod rt {
         pub use crate::rt::*;
     }
@@ -87,6 +89,34 @@ pub mod __unstable {
         }
         pub mod service_config {
             pub use crate::client::service_config::*;
+        }
+    }
+    pub mod credentials {
+        pub mod client {
+            pub use crate::credentials::client::*;
+        }
+        pub mod server {
+            pub use crate::credentials::server::*;
+        }
+        pub mod common {
+            pub use crate::credentials::common::*;
+        }
+    }
+}
+
+/// Implementation details shared with other grpc crates.
+///
+/// Unlike `__unstable`, which holds APIs intended to become public eventually,
+/// everything here is permanently internal: it is not part of the public API,
+/// has no semver guarantees, and may change or be removed at any time.
+#[cfg(feature = "__internal")]
+#[doc(hidden)]
+pub mod __internal {
+    pub mod client {
+        pub mod name_resolution {
+            pub mod config_selector {
+                pub use crate::client::name_resolution::config_selector::*;
+            }
         }
     }
 }

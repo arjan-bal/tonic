@@ -69,6 +69,7 @@ use crate::client::name_resolution::config_selector;
 use crate::client::name_resolution::config_selector::ConfigSelector;
 use crate::client::name_resolution::config_selector::DefaultConfigSelector;
 use crate::client::name_resolution::config_selector::RpcConfig;
+use crate::client::name_resolution::config_selector::SelectConfigOptions;
 use crate::client::name_resolution::dns;
 use crate::client::name_resolution::global_registry;
 use crate::client::name_resolution::proxy_resolver;
@@ -366,18 +367,10 @@ impl Invoke for Arc<ActiveChannel> {
         headers: RequestHeaders,
         mut options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
-        let config = match self
+        let config = self
             .config_selector
-            .try_select_config(&headers, options.attributes_mut())
-        {
-            Some(config) => config,
-            // Only until the resolver produces its first result.
-            None => {
-                self.config_selector
-                    .wait_and_select_config(&headers, options.attributes_mut())
-                    .await
-            }
-        };
+            .select_config(SelectConfigOptions::new(&headers, &mut options))
+            .await;
         if let Err(status) = config {
             return FailingRecvStream::new_stream_pair(status, None);
         }
@@ -389,9 +382,7 @@ impl Invoke for Arc<ActiveChannel> {
                     None,
                 );
             };
-            let result = state
-                .picker
-                .pick(PickOptions::new(&headers, options.attributes_mut()));
+            let result = state.picker.pick(PickOptions::new(&headers, &options));
             match result {
                 PickResult::Pick(pr) => {
                     if let Some(sc) = pr.subchannel.downcast_ref::<InternalSubchannel>() {
@@ -652,10 +643,6 @@ struct SharedConfigSelectorInner {
     /// The current config selector. Until the resolver produces its first
     /// result, this is a [`DefaultConfigSelector`] that RPCs never use: they
     /// wait for `resolved` instead.
-    ///
-    /// `ArcSwap` stores a thin pointer, so the `Arc<dyn ConfigSelector>` (a fat
-    /// pointer) is itself stored in an `Arc`. `load` borrows the current value
-    /// without modifying reference counts.
     current: ArcSwap<Arc<dyn ConfigSelector>>,
     /// Set once `current` holds the selector from the resolver's first result.
     resolved: SetOnce<()>,
@@ -671,42 +658,19 @@ impl SharedConfigSelector {
         }
     }
 
-    /// Selects the configuration for an RPC, or returns `None` if the resolver
-    /// has not produced a result yet.
-    fn try_select_config(
+    /// Waits for the resolver's first result, then selects the configuration
+    /// for an RPC using `current`.
+    async fn select_config(
         &self,
-        headers: &RequestHeaders,
-        attributes: &mut CallAttributes,
-    ) -> Option<Result<RpcConfig, StatusError>> {
-        if !self.inner.resolved.initialized() {
-            return None;
-        }
-        Some(self.select_config(headers, attributes))
-    }
-
-    /// Waits for the resolver's first result, then selects the configuration.
-    async fn wait_and_select_config(
-        &self,
-        headers: &RequestHeaders,
-        attributes: &mut CallAttributes,
+        options: SelectConfigOptions<'_>,
     ) -> Result<RpcConfig, StatusError> {
         // Returns immediately if `resolved` is already set. `SetOnce` stays
         // set, so an `update` that races with this call can't be missed.
         self.inner.resolved.wait().await;
-        self.select_config(headers, attributes)
-    }
-
-    /// Selects the configuration using `current`. Callers must first check
-    /// that the resolver has produced a result.
-    fn select_config(
-        &self,
-        headers: &RequestHeaders,
-        attributes: &mut CallAttributes,
-    ) -> Result<RpcConfig, StatusError> {
         self.inner
             .current
             .load()
-            .select_config(PickOptions::new(headers, attributes))
+            .select_config(options)
             .map_err(sanitize_config_selector_status)
     }
 
