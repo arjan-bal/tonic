@@ -26,9 +26,8 @@
 //!
 //! Models the validated data shapes only (gRFC A28).
 
-// TODO: implement request routing components (
-// path/header/fraction matching, stripping `-bin` headers from request metadata before
-// evaluating header matchers) in the future resolver/interceptor layer that consumes `XdsConfig`.
+// Matching requests against these routes (path, header and fraction matching,
+// with `-bin` headers treated as absent) is implemented in `routing/route.rs`.
 
 use std::collections::HashSet;
 
@@ -166,6 +165,11 @@ pub(crate) enum HeaderMatchSpecifier {
 pub(crate) enum RouteAction {
     Cluster(String),
     WeightedClusters(Vec<WeightedCluster>),
+    /// Any action other than `route` (e.g. `redirect`, `direct_response`,
+    /// `non_forwarding_action`, or unset). The route is kept so that RPCs
+    /// matching it fail with UNAVAILABLE, rather than falling through to a
+    /// later route.
+    Unsupported,
 }
 
 /// A cluster with an associated weight for traffic splitting.
@@ -268,12 +272,9 @@ fn validate_route(route: RouteView<'_>) -> xds_client::Result<Option<Route>> {
             Some(action) => action,
             None => return Ok(None),
         },
-        // Per A28: action field must be "route", otherwise NACK.
-        _ => {
-            return Err(Error::Validation(
-                "only route action is supported for client routing".into(),
-            ));
-        }
+        // Keep routes with other actions, so that RPCs matching them fail
+        // instead of falling through to a later route.
+        _ => RouteAction::Unsupported,
     };
 
     Ok(Some(Route {
@@ -503,6 +504,7 @@ impl VirtualHost {
                         clusters.insert(wc.name.clone());
                     }
                 }
+                RouteAction::Unsupported => {}
             }
         }
         clusters
@@ -801,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_route_rejects_non_route_action() {
+    fn validate_route_keeps_non_route_action_as_unsupported() {
         let mut route_match = EnvoyRouteMatch::new();
         route_match.set_prefix("/");
         let mut route = EnvoyRoute::new();
@@ -812,13 +814,24 @@ mod tests {
         vh.set_name("vh1");
         vh.domains_mut().push("*");
         vh.routes_mut().push(route);
+        vh.routes_mut().push(make_route("/", "cluster-a"));
 
         let mut rc = RouteConfiguration::new();
         rc.set_name("rc-1");
         rc.virtual_hosts_mut().push(vh);
 
-        let err = RouteConfigResource::validate(rc).unwrap_err();
-        assert!(err.to_string().contains("only route action is supported"));
+        let validated = RouteConfigResource::validate(rc).expect("should validate");
+        let virtual_host = &validated.virtual_hosts[0];
+        assert_eq!(virtual_host.routes.len(), 2);
+        assert!(matches!(
+            virtual_host.routes[0].action,
+            RouteAction::Unsupported
+        ));
+        // Unsupported routes reference no clusters.
+        assert_eq!(
+            virtual_host.cluster_names(),
+            HashSet::from(["cluster-a".to_string()])
+        );
     }
 
     #[test]

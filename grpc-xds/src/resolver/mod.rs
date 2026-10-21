@@ -266,6 +266,7 @@ impl XdsResolver {
                 RouteAction::WeightedClusters(clusters) => {
                     names.extend(clusters.iter().map(|c| c.name.as_str()));
                 }
+                RouteAction::Unsupported => {}
             }
         }
         let cluster_refs = names
