@@ -21,7 +21,6 @@
  * IN THE SOFTWARE.
  *
  */
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -41,6 +40,9 @@ use percent_encoding::AsciiSet;
 use percent_encoding::NON_ALPHANUMERIC;
 use percent_encoding::utf8_percent_encode;
 
+use crate::resolver::config_selector::PickedCluster;
+use crate::resolver::config_selector::RouteTarget;
+use crate::resolver::config_selector::SelectorRoute;
 use crate::resolver::config_selector::XdsConfigSelector;
 use crate::resolver::mocks::BootstrapConfig;
 use crate::resolver::mocks::ClusterSubscription;
@@ -51,13 +53,20 @@ use crate::resolver::mocks::XdsConfigResult;
 use crate::resolver::mocks::XdsConfigWatcher;
 use crate::resolver::nop_resolver::NopResolver;
 use crate::resolver::service_config::cds_cluster_manager_service_config;
+use crate::resolver::service_config::cluster_child_name;
 use crate::resource::RouteAction;
+use crate::wrr::RandomWrrBuilder;
+use crate::wrr::WrrBuilder;
 use crate::xds_config::XdsConfig;
 
 mod config_selector;
 mod mocks;
 mod nop_resolver;
 mod service_config;
+
+pub(crate) use config_selector::picked_child_name;
+#[cfg(test)]
+pub(crate) use config_selector::set_picked_cluster_for_testing;
 
 // TODO: register this builder in the global resolver registry, in the same
 // place that calls `load_balancing::register()` for the LB policies named in
@@ -196,6 +205,8 @@ struct XdsResolver {
     /// arrives. Written by `update_task`, read by `work()`.
     xds_config: Arc<Mutex<Option<XdsConfigResult>>>,
     current_config_selector: Option<Arc<XdsConfigSelector>>,
+    /// Builds the weighted cluster pickers of new config selectors.
+    wrr_builder: RandomWrrBuilder,
     /// Given to each `ClusterRef`, so that dropping the last ref for a cluster
     /// schedules a call to `work()`.
     work_scheduler: Arc<dyn WorkScheduler>,
@@ -228,6 +239,7 @@ impl XdsResolver {
             lds_resource_name,
             xds_config,
             current_config_selector: None,
+            wrr_builder: RandomWrrBuilder::default(),
             work_scheduler: options.work_scheduler,
             update_task,
         }
@@ -252,28 +264,50 @@ impl XdsResolver {
         cluster_ref
     }
 
-    /// Returns a config selector holding one ref to each cluster that
-    /// `xds_config`'s routes can send RPCs to.
+    /// Returns a config selector for `xds_config`'s routes. It holds one ref
+    /// to each cluster the routes can send RPCs to.
     fn new_config_selector(&mut self, xds_config: &XdsConfig) -> Arc<XdsConfigSelector> {
-        // A BTreeSet dedupes clusters used by several routes, in a
-        // deterministic order.
-        let mut names = BTreeSet::new();
+        // One pick per cluster, shared by every route that names it.
+        let mut picks = HashMap::new();
+        let mut routes = Vec::new();
         for route in &xds_config.virtual_host().routes {
-            match &route.action {
+            let target = match &route.action {
                 RouteAction::Cluster(name) => {
-                    names.insert(name.as_str());
+                    RouteTarget::Cluster(self.picked_cluster(&mut picks, name))
                 }
                 RouteAction::WeightedClusters(clusters) => {
-                    names.extend(clusters.iter().map(|c| c.name.as_str()));
+                    let clusters: Vec<_> = clusters
+                        .iter()
+                        .map(|c| (self.picked_cluster(&mut picks, &c.name), c.weight))
+                        .collect();
+                    RouteTarget::WeightedClusters(self.wrr_builder.build(clusters))
                 }
-                RouteAction::Unsupported => {}
-            }
+                RouteAction::Unsupported => RouteTarget::Unsupported,
+            };
+            routes.push(SelectorRoute {
+                route_match: route.route_match.clone(),
+                target,
+            });
         }
-        let cluster_refs = names
-            .into_iter()
-            .map(|name| self.get_or_create_cluster_ref(name))
-            .collect();
-        Arc::new(XdsConfigSelector::new(cluster_refs))
+        Arc::new(XdsConfigSelector::new(routes))
+    }
+
+    /// Returns the pick of cluster `name` from `picks`, creating it, and
+    /// subscribing to the cluster if needed, if it isn't there yet.
+    fn picked_cluster<'a>(
+        &mut self,
+        picks: &mut HashMap<&'a str, Arc<PickedCluster>>,
+        name: &'a str,
+    ) -> Arc<PickedCluster> {
+        if let Some(picked) = picks.get(name) {
+            return picked.clone();
+        }
+        let picked = Arc::new(PickedCluster::new(
+            cluster_child_name(name),
+            self.get_or_create_cluster_ref(name),
+        ));
+        picks.insert(name, picked.clone());
+        picked
     }
 
     /// Removes the clusters whose last `ClusterRef` was dropped. Returns
@@ -352,20 +386,15 @@ impl Drop for XdsResolver {
 /// A reference to a cluster that a config selector or an RPC may route to.
 /// While any `ClusterRef` for a cluster is alive, the cluster stays in the
 /// resolver's service config and the dependency manager stays subscribed to
-/// it.
+/// it. Config selectors hold refs through their routes' `PickedCluster`s, and
+/// each RPC holds one through the `PickedCluster` the selector stores in its
+/// `CallOptions`, until the RPC is committed.
 struct ClusterRef {
     name: String,
     /// Keeps the dependency manager subscribed to the cluster. Dropped, which
     /// unsubscribes, together with the last ref.
     _subscription: ClusterSubscription,
     work_scheduler: Arc<dyn WorkScheduler>,
-}
-
-impl ClusterRef {
-    /// Returns the cluster name.
-    fn name(&self) -> &str {
-        &self.name
-    }
 }
 
 impl fmt::Debug for ClusterRef {
@@ -396,8 +425,12 @@ mod tests {
     use grpc::__unstable::client::load_balancing::ParsedLbConfig;
     use grpc::__unstable::client::name_resolution::ResolverBuilder;
     use grpc::__unstable::client::name_resolution::Target;
+    use grpc::__unstable::client::name_resolution::config_selector::ConfigSelector;
+    use grpc::__unstable::client::name_resolution::config_selector::SelectConfigOptions;
     use grpc::__unstable::client::service_config::ParseResult;
     use grpc::__unstable::rt::TaskHandle;
+    use grpc::client::CallOptions;
+    use grpc::client::RequestHeaders;
     use serde_json::json;
     use tokio::sync::mpsc;
 
@@ -412,6 +445,7 @@ mod tests {
     use crate::resource::RouteSource;
     use crate::resource::VirtualHost;
     use crate::resource::WeightedCluster;
+    use crate::wrr::test_utils::wrr_builder;
     use crate::xds_config::XdsConfig;
 
     /// Returns clients wrapping a fixed bootstrap config, or a fixed error.
@@ -815,10 +849,36 @@ mod tests {
             lds_resource_name: "listener".to_string(),
             xds_config: Arc::new(Mutex::new(None)),
             current_config_selector: None,
+            wrr_builder: RandomWrrBuilder::default(),
             work_scheduler: Arc::new(TestWorkScheduler { tx: work_tx }),
             update_task: Box::new(NoopTaskHandle),
         };
         (resolver, work_rx)
+    }
+
+    /// Returns a config selector from `resolver` with one route per cluster
+    /// in `clusters`, in order, each matching every path. RPCs therefore go to
+    /// the first cluster.
+    fn selector_for_clusters(
+        resolver: &mut XdsResolver,
+        clusters: &[&str],
+    ) -> Arc<XdsConfigSelector> {
+        let actions = clusters
+            .iter()
+            .map(|name| RouteAction::Cluster(name.to_string()))
+            .collect();
+        resolver.new_config_selector(&xds_config_with_routes(actions))
+    }
+
+    /// Runs `selector` for an RPC and returns the RPC's call options. Panics
+    /// if the selector fails the RPC.
+    fn select(selector: &XdsConfigSelector) -> CallOptions {
+        let headers = RequestHeaders::new().with_method_name("/pkg.Service/Method");
+        let mut call_options = CallOptions::new();
+        selector
+            .select_config(SelectConfigOptions::new(&headers, &mut call_options))
+            .expect("selector should pick a cluster");
+        call_options
     }
 
     /// Returns how many times work was scheduled since the last call.
@@ -900,13 +960,8 @@ mod tests {
     #[test]
     fn work_prunes_unused_clusters() {
         let (mut resolver, mut work_rx) = test_resolver();
-        let old_selector = XdsConfigSelector::new(vec![
-            resolver.get_or_create_cluster_ref("a"),
-            resolver.get_or_create_cluster_ref("b"),
-        ]);
-        let current_selector =
-            XdsConfigSelector::new(vec![resolver.get_or_create_cluster_ref("a")]);
-        resolver.current_config_selector = Some(Arc::new(current_selector));
+        let old_selector = selector_for_clusters(&mut resolver, &["a", "b"]);
+        resolver.current_config_selector = Some(selector_for_clusters(&mut resolver, &["a"]));
 
         drop(old_selector);
         assert_eq!(scheduled_work(&mut work_rx), 1);
@@ -923,14 +978,13 @@ mod tests {
     }
 
     #[test]
-    fn rpc_ref_keeps_cluster_until_dropped() {
+    fn rpc_keeps_cluster_until_committed() {
         let (mut resolver, mut work_rx) = test_resolver();
-        let old_selector = XdsConfigSelector::new(vec![resolver.get_or_create_cluster_ref("b")]);
-        let current_selector =
-            XdsConfigSelector::new(vec![resolver.get_or_create_cluster_ref("a")]);
-        resolver.current_config_selector = Some(Arc::new(current_selector));
-        // Stands in for the ref an RPC routed to "b" will hold.
-        let rpc_ref = resolver.get_or_create_cluster_ref("b");
+        let old_selector = selector_for_clusters(&mut resolver, &["b"]);
+        resolver.current_config_selector = Some(selector_for_clusters(&mut resolver, &["a"]));
+        // An RPC routed to "b" by the old selector that isn't committed yet.
+        let rpc_options = select(&old_selector);
+        assert_eq!(picked_child_name(&rpc_options), Some("cluster:b"));
 
         drop(old_selector);
         assert_eq!(scheduled_work(&mut work_rx), 0);
@@ -940,7 +994,8 @@ mod tests {
         assert_eq!(subscriptions(&resolver), counts(&[("a", 1), ("b", 1)]));
         assert_eq!(controller.updates, 0);
 
-        drop(rpc_ref);
+        // The channel drops the RPC's call options once it's committed.
+        drop(rpc_options);
         assert_eq!(scheduled_work(&mut work_rx), 1);
         assert_eq!(subscriptions(&resolver), counts(&[("a", 1)]));
         resolver.work(&mut controller);
@@ -955,8 +1010,7 @@ mod tests {
     #[test]
     fn work_without_unused_clusters_sends_no_update() {
         let (mut resolver, _work_rx) = test_resolver();
-        let selector = XdsConfigSelector::new(vec![resolver.get_or_create_cluster_ref("a")]);
-        resolver.current_config_selector = Some(Arc::new(selector));
+        resolver.current_config_selector = Some(selector_for_clusters(&mut resolver, &["a"]));
 
         let mut controller = FakeChannelController::default();
         resolver.work(&mut controller);
@@ -1018,11 +1072,41 @@ mod tests {
 
         let selector = resolver.new_config_selector(&config);
 
-        assert_eq!(selector.cluster_names(), ["a", "b", "c"]);
+        // Both routes naming "a" share one pick.
+        let routes = selector.routes();
+        match (&routes[0].target, &routes[2].target) {
+            (RouteTarget::Cluster(first), RouteTarget::Cluster(second)) => {
+                assert!(Arc::ptr_eq(first, second));
+            }
+            other => panic!("expected two single-cluster routes, got {other:?}"),
+        }
         assert_eq!(
             subscriptions(&resolver),
             counts(&[("a", 1), ("b", 1), ("c", 1)])
         );
+    }
+
+    #[test]
+    fn new_config_selector_uses_cluster_weights() {
+        let (mut resolver, _work_rx) = test_resolver();
+        resolver.wrr_builder = wrr_builder(&[0, 1, 3]);
+        let config = xds_config_with_routes(vec![RouteAction::WeightedClusters(vec![
+            WeightedCluster {
+                name: "b".to_string(),
+                weight: 1,
+            },
+            WeightedCluster {
+                name: "c".to_string(),
+                weight: 3,
+            },
+        ])]);
+        let selector = resolver.new_config_selector(&config);
+
+        let picks: Vec<String> = (0..3)
+            .map(|_| picked_child_name(&select(&selector)).unwrap().to_string())
+            .collect();
+
+        assert_eq!(picks, ["cluster:b", "cluster:c", "cluster:c"]);
     }
 
     #[test]
