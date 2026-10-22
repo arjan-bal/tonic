@@ -96,9 +96,6 @@ pub(super) struct SelectorRoute {
 pub(super) enum RouteTarget {
     Cluster(Arc<PickedCluster>),
     WeightedClusters(RandomWrr<Arc<PickedCluster>>),
-    /// RPCs matching the route fail instead of falling through to a later
-    /// route.
-    Unsupported,
 }
 
 impl XdsConfigSelector {
@@ -135,12 +132,6 @@ impl ConfigSelector for XdsConfigSelector {
                     "route has no cluster with a non-zero weight",
                 )
             })?,
-            RouteTarget::Unsupported => {
-                return Err(StatusError::new(
-                    StatusCodeError::Unavailable,
-                    "matched route does not have a supported route action",
-                ));
-            }
         };
         options.call_options.set_option(picked.clone());
         Ok(RpcConfig::default())
@@ -284,24 +275,6 @@ mod tests {
         let status = result.unwrap_err();
         assert_eq!(status.code(), StatusCodeError::Unavailable);
         assert_eq!(status.message(), "no matching route found");
-        assert_eq!(picked_child_name(&call_options), None);
-    }
-
-    #[test]
-    fn unsupported_action_fails_unavailable() {
-        let selector = XdsConfigSelector::new(vec![
-            route(prefix_match("/pkg."), RouteTarget::Unsupported),
-            route(prefix_match(""), RouteTarget::Cluster(picked("a"))),
-        ]);
-
-        let (result, call_options) = select(&selector, MetadataMap::new());
-
-        let status = result.unwrap_err();
-        assert_eq!(status.code(), StatusCodeError::Unavailable);
-        assert_eq!(
-            status.message(),
-            "matched route does not have a supported route action"
-        );
         assert_eq!(picked_child_name(&call_options), None);
     }
 

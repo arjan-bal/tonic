@@ -284,7 +284,6 @@ impl XdsResolver {
                         .collect();
                     RouteTarget::WeightedClusters(self.wrr_builder.build(clusters))
                 }
-                RouteAction::Unsupported => RouteTarget::Unsupported,
             };
             routes.push(SelectorRoute {
                 route_match: route.route_match.clone(),
