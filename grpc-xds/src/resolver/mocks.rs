@@ -112,6 +112,11 @@ impl DependencyManager {
         }
     }
 
+    /// Asks the dependency manager to re-resolve its DNS clusters.
+    ///
+    /// TODO: implement in the real dependency manager.
+    pub(super) fn request_reresolution(&self) {}
+
     /// Returns the number of live subscriptions for each subscribed cluster.
     #[cfg(test)]
     pub(super) fn cluster_subscription_counts(&self) -> BTreeMap<String, usize> {

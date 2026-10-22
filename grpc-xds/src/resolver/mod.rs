@@ -201,9 +201,11 @@ struct XdsResolver {
     /// last `ClusterRef` is dropped and `work()` prunes it.
     active_clusters: HashMap<String, Weak<ClusterRef>>,
     lds_resource_name: String,
-    /// Latest update from the dependency manager; `None` until the first one
-    /// arrives. Written by `update_task`, read by `work()`.
+    /// The dependency manager's latest update that `work()` hasn't applied
+    /// yet. Written by `update_task`; `work()` takes it.
     xds_config: Arc<Mutex<Option<XdsConfigResult>>>,
+    /// The config selector for the latest `XdsConfig`. `None` before the
+    /// first one arrives and after an error.
     current_config_selector: Option<Arc<XdsConfigSelector>>,
     /// Builds the weighted cluster pickers of new config selectors.
     wrr_builder: RandomWrrBuilder,
@@ -322,8 +324,8 @@ impl XdsResolver {
     }
 
     /// Sends the channel a service config for the active clusters, along with
-    /// the current config selector. Does nothing before the first config
-    /// selector is created.
+    /// the current config selector. Does nothing without a current config
+    /// selector, i.e. before the first `XdsConfig` and after an error.
     fn update_channel(&self, channel_controller: &mut dyn ChannelController) {
         let Some(config_selector) = &self.current_config_selector else {
             return;
@@ -335,7 +337,23 @@ impl XdsResolver {
         // The channel falls back to its default config selector for updates
         // without one, so every update must carry the current selector.
         let update = set_in_resolver_update(config_selector.clone(), update);
-        // TODO: handle errors returned by the channel.
+        // The result is ignored: the channel applies the update, including its
+        // config selector, even if the LB policy rejects it, and LB policies
+        // request re-resolution themselves, which calls `resolve_now`.
+        let _ = channel_controller.update(update);
+    }
+
+    /// Makes the channel stop using the previous xDS resources: the empty
+    /// service config selects the default LB policy, which fails RPCs because
+    /// there are no endpoints, adding `error` (the resolution note) to their
+    /// status. The update carries no config selector, so the channel goes back
+    /// to its default one and drops the previous selector, which releases its
+    /// clusters.
+    fn report_error(&self, channel_controller: &mut dyn ChannelController, error: String) {
+        let mut update = ResolverUpdate::default();
+        update.service_config = channel_controller.parse_service_config("{}").map(Some);
+        update.resolution_note = Some(error);
+        // See `update_channel` for why the result is ignored.
         let _ = channel_controller.update(update);
     }
 
@@ -364,14 +382,35 @@ async fn watch_xds_config(
 
 impl Resolver for XdsResolver {
     fn resolve_now(&mut self) {
-        todo!()
+        self.dependency_manager.request_reresolution();
     }
 
     fn work(&mut self, channel_controller: &mut dyn ChannelController) {
-        // TODO: create a new config selector when the XdsConfig changes. Keep
-        // pruning before building any update, so that no update names a
-        // cluster the dependency manager may have stopped watching.
-        if self.remove_unused_clusters() {
+        let pending = self.xds_config.lock().unwrap().take();
+        let new_config = match pending {
+            Some(Ok(xds_config)) => {
+                // Build the new selector before dropping the old one, so that
+                // clusters used by both keep their refs instead of being
+                // unsubscribed and subscribed again.
+                self.current_config_selector = Some(self.new_config_selector(&xds_config));
+                true
+            }
+            Some(Err(error)) => {
+                // Stop using the previous resources (gRFC A74).
+                self.current_config_selector = None;
+                self.remove_unused_clusters();
+                self.report_error(channel_controller, error);
+                return;
+            }
+            None => false,
+        };
+        // Prune after replacing the selector and before building the update,
+        // so that the update doesn't name a cluster the dependency manager may
+        // have stopped watching. The channel still holds the previous
+        // selector, so its clusters stay in the service config until the
+        // channel drops it (gRFC A31).
+        let removed = self.remove_unused_clusters();
+        if new_config || removed {
             self.update_channel(channel_controller);
         }
     }
@@ -429,6 +468,7 @@ mod tests {
     use grpc::__unstable::client::name_resolution::config_selector::SelectConfigOptions;
     use grpc::__unstable::client::service_config::ParseResult;
     use grpc::__unstable::rt::TaskHandle;
+    use grpc::attributes::Attributes;
     use grpc::client::CallOptions;
     use grpc::client::RequestHeaders;
     use serde_json::json;
@@ -801,6 +841,10 @@ mod tests {
     struct FakeChannelController {
         service_configs: Mutex<Vec<String>>,
         updates: usize,
+        /// The most recent update. Like a channel, this keeps the update's
+        /// config selector, and so its clusters, alive until the next update
+        /// replaces it.
+        last_update: Option<ResolverUpdate>,
     }
 
     impl FakeChannelController {
@@ -817,8 +861,9 @@ mod tests {
     }
 
     impl ChannelController for FakeChannelController {
-        fn update(&mut self, _update: ResolverUpdate) -> Result<(), String> {
+        fn update(&mut self, update: ResolverUpdate) -> Result<(), String> {
             self.updates += 1;
+            self.last_update = Some(update);
             Ok(())
         }
 
@@ -856,18 +901,43 @@ mod tests {
         (resolver, work_rx)
     }
 
-    /// Returns a config selector from `resolver` with one route per cluster
-    /// in `clusters`, in order, each matching every path. RPCs therefore go to
-    /// the first cluster.
-    fn selector_for_clusters(
-        resolver: &mut XdsResolver,
-        clusters: &[&str],
-    ) -> Arc<XdsConfigSelector> {
+    /// Returns an `XdsConfig` with one route per cluster in `clusters`, in
+    /// order, each matching every path. RPCs therefore go to the first
+    /// cluster.
+    fn config_for_clusters(clusters: &[&str]) -> XdsConfig {
         let actions = clusters
             .iter()
             .map(|name| RouteAction::Cluster(name.to_string()))
             .collect();
-        resolver.new_config_selector(&xds_config_with_routes(actions))
+        xds_config_with_routes(actions)
+    }
+
+    /// Returns a config selector from `resolver` for
+    /// [`config_for_clusters`]`(clusters)`.
+    fn selector_for_clusters(
+        resolver: &mut XdsResolver,
+        clusters: &[&str],
+    ) -> Arc<XdsConfigSelector> {
+        resolver.new_config_selector(&config_for_clusters(clusters))
+    }
+
+    /// Delivers `result` to `resolver` as the update task would, and runs
+    /// `work()`.
+    fn apply_result(
+        resolver: &mut XdsResolver,
+        controller: &mut FakeChannelController,
+        result: XdsConfigResult,
+    ) {
+        *resolver.xds_config.lock().unwrap() = Some(result);
+        resolver.work(controller);
+    }
+
+    /// Returns the resolver's current config selector. Panics if it has none.
+    fn current_selector(resolver: &XdsResolver) -> &XdsConfigSelector {
+        resolver
+            .current_config_selector
+            .as_deref()
+            .expect("resolver should have a config selector")
     }
 
     /// Runs `selector` for an RPC and returns the RPC's call options. Panics
@@ -1107,6 +1177,230 @@ mod tests {
             .collect();
 
         assert_eq!(picks, ["cluster:b", "cluster:c", "cluster:c"]);
+    }
+
+    #[test]
+    fn xds_config_sends_selector_and_service_config() {
+        let (mut resolver, _work_rx) = test_resolver();
+        let mut controller = FakeChannelController::default();
+        let config = xds_config_with_routes(vec![
+            RouteAction::Cluster("a".to_string()),
+            RouteAction::WeightedClusters(vec![
+                WeightedCluster {
+                    name: "b".to_string(),
+                    weight: 1,
+                },
+                WeightedCluster {
+                    name: "c".to_string(),
+                    weight: 1,
+                },
+            ]),
+        ]);
+
+        apply_result(&mut resolver, &mut controller, Ok(config));
+
+        assert_eq!(controller.updates, 1);
+        assert_eq!(
+            controller.service_configs(),
+            [expected_service_config(&["a", "b", "c"])]
+        );
+        let update = controller.last_update.as_ref().unwrap();
+        assert_ne!(
+            update.attributes,
+            Attributes::new(),
+            "update should carry the config selector"
+        );
+        assert_eq!(update.endpoints, Ok(Vec::new()));
+        assert_eq!(update.resolution_note, None);
+        // The first route matches every RPC.
+        let rpc = select(current_selector(&resolver));
+        assert_eq!(picked_child_name(&rpc), Some("cluster:a"));
+    }
+
+    #[test]
+    fn xds_config_is_applied_once() {
+        let (mut resolver, _work_rx) = test_resolver();
+        let mut controller = FakeChannelController::default();
+        apply_result(
+            &mut resolver,
+            &mut controller,
+            Ok(config_for_clusters(&["a"])),
+        );
+
+        resolver.work(&mut controller);
+
+        assert_eq!(controller.updates, 1);
+    }
+
+    #[test]
+    fn new_config_keeps_shared_cluster_ref() {
+        let (mut resolver, mut work_rx) = test_resolver();
+        let mut controller = FakeChannelController::default();
+        apply_result(
+            &mut resolver,
+            &mut controller,
+            Ok(config_for_clusters(&["a", "b"])),
+        );
+        let a_ref = resolver.active_clusters["a"].clone();
+
+        apply_result(
+            &mut resolver,
+            &mut controller,
+            Ok(config_for_clusters(&["a", "c"])),
+        );
+
+        // "a" kept its ref, so its subscription was never dropped.
+        assert!(Weak::ptr_eq(&a_ref, &resolver.active_clusters["a"]));
+        // The channel held the old selector until this update replaced it, so
+        // "b" is still in the update.
+        assert_eq!(
+            controller.service_configs().last(),
+            Some(&expected_service_config(&["a", "b", "c"]))
+        );
+        // Replacing the old selector released "b".
+        assert_eq!(scheduled_work(&mut work_rx), 1);
+        resolver.work(&mut controller);
+        assert_eq!(controller.updates, 3);
+        assert_eq!(
+            controller.service_configs().last(),
+            Some(&expected_service_config(&["a", "c"]))
+        );
+        assert_eq!(subscriptions(&resolver), counts(&[("a", 1), ("c", 1)]));
+    }
+
+    #[test]
+    fn rpc_keeps_old_cluster_across_config_update() {
+        let (mut resolver, mut work_rx) = test_resolver();
+        let mut controller = FakeChannelController::default();
+        apply_result(
+            &mut resolver,
+            &mut controller,
+            Ok(config_for_clusters(&["a"])),
+        );
+        let rpc = select(current_selector(&resolver));
+
+        apply_result(
+            &mut resolver,
+            &mut controller,
+            Ok(config_for_clusters(&["b"])),
+        );
+
+        assert_eq!(
+            controller.service_configs().last(),
+            Some(&expected_service_config(&["a", "b"]))
+        );
+        // The channel dropped the old selector, but the RPC still holds "a".
+        assert_eq!(scheduled_work(&mut work_rx), 0);
+        resolver.work(&mut controller);
+        assert_eq!(controller.updates, 2);
+
+        // The channel drops the RPC's call options once it's committed.
+        drop(rpc);
+        assert_eq!(scheduled_work(&mut work_rx), 1);
+        resolver.work(&mut controller);
+        assert_eq!(controller.updates, 3);
+        assert_eq!(
+            controller.service_configs().last(),
+            Some(&expected_service_config(&["b"]))
+        );
+        assert_eq!(subscriptions(&resolver), counts(&[("b", 1)]));
+    }
+
+    #[test]
+    fn xds_config_error_reports_resolution_note() {
+        let (mut resolver, mut work_rx) = test_resolver();
+        let mut controller = FakeChannelController::default();
+        apply_result(
+            &mut resolver,
+            &mut controller,
+            Ok(config_for_clusters(&["a"])),
+        );
+
+        apply_result(&mut resolver, &mut controller, Err("boom".to_string()));
+
+        assert_eq!(controller.updates, 2);
+        let update = controller.last_update.as_ref().unwrap();
+        assert_eq!(update.endpoints, Ok(Vec::new()));
+        assert_eq!(update.resolution_note.as_deref(), Some("boom"));
+        assert_eq!(
+            update.attributes,
+            Attributes::new(),
+            "update should not carry a config selector"
+        );
+        assert_eq!(controller.service_configs().last(), Some(&json!({})));
+        assert!(resolver.current_config_selector.is_none());
+        // Replacing the channel's selector released "a".
+        assert_eq!(subscriptions(&resolver), counts(&[]));
+        assert_eq!(scheduled_work(&mut work_rx), 1);
+        resolver.work(&mut controller);
+        assert!(active_clusters(&resolver).is_empty());
+        assert_eq!(controller.updates, 2);
+    }
+
+    #[test]
+    fn error_before_first_config_is_reported() {
+        let (mut resolver, _work_rx) = test_resolver();
+        let mut controller = FakeChannelController::default();
+
+        apply_result(&mut resolver, &mut controller, Err("boom".to_string()));
+
+        assert_eq!(controller.updates, 1);
+        let update = controller.last_update.as_ref().unwrap();
+        assert_eq!(update.endpoints, Ok(Vec::new()));
+        assert_eq!(update.resolution_note.as_deref(), Some("boom"));
+        assert_eq!(update.attributes, Attributes::new());
+        assert_eq!(controller.service_configs(), [json!({})]);
+    }
+
+    #[test]
+    fn no_update_when_clusters_released_after_error() {
+        let (mut resolver, mut work_rx) = test_resolver();
+        let mut controller = FakeChannelController::default();
+        apply_result(
+            &mut resolver,
+            &mut controller,
+            Ok(config_for_clusters(&["a"])),
+        );
+        let rpc = select(current_selector(&resolver));
+        apply_result(&mut resolver, &mut controller, Err("boom".to_string()));
+        assert_eq!(subscriptions(&resolver), counts(&[("a", 1)]));
+
+        drop(rpc);
+
+        assert_eq!(scheduled_work(&mut work_rx), 1);
+        resolver.work(&mut controller);
+        assert!(active_clusters(&resolver).is_empty());
+        assert_eq!(subscriptions(&resolver), counts(&[]));
+        assert_eq!(controller.updates, 2);
+    }
+
+    #[test]
+    fn config_after_error_restores_routing() {
+        let (mut resolver, _work_rx) = test_resolver();
+        let mut controller = FakeChannelController::default();
+        apply_result(
+            &mut resolver,
+            &mut controller,
+            Ok(config_for_clusters(&["a"])),
+        );
+        apply_result(&mut resolver, &mut controller, Err("boom".to_string()));
+
+        apply_result(
+            &mut resolver,
+            &mut controller,
+            Ok(config_for_clusters(&["b"])),
+        );
+
+        assert_eq!(controller.updates, 3);
+        assert_eq!(
+            controller.service_configs().last(),
+            Some(&expected_service_config(&["b"]))
+        );
+        let update = controller.last_update.as_ref().unwrap();
+        assert_ne!(update.attributes, Attributes::new());
+        assert_eq!(update.resolution_note, None);
+        let rpc = select(current_selector(&resolver));
+        assert_eq!(picked_child_name(&rpc), Some("cluster:b"));
     }
 
     #[test]
