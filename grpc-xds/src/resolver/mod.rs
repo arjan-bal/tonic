@@ -36,15 +36,11 @@ use grpc::__unstable::client::name_resolution::Target;
 use grpc::__unstable::client::name_resolution::WorkScheduler;
 use grpc::__unstable::client::name_resolution::config_selector::set_in_resolver_update;
 use grpc::__unstable::rt::BoxedTaskHandle;
-use percent_encoding::AsciiSet;
-use percent_encoding::NON_ALPHANUMERIC;
-use percent_encoding::utf8_percent_encode;
 
 use crate::resolver::config_selector::PickedCluster;
 use crate::resolver::config_selector::RouteTarget;
 use crate::resolver::config_selector::SelectorRoute;
 use crate::resolver::config_selector::XdsConfigSelector;
-use crate::resolver::mocks::BootstrapConfig;
 use crate::resolver::mocks::ClusterSubscription;
 use crate::resolver::mocks::DependencyManager;
 use crate::resolver::mocks::XdsClientProvider;
@@ -77,6 +73,10 @@ struct Builder {
 
 impl ResolverBuilder for Builder {
     fn build(&self, target: &Target, options: ResolverOptions) -> Box<dyn Resolver> {
+        let lds_resource_name = match listener_resource_name(target) {
+            Ok(name) => name.to_owned(),
+            Err(err) => return NopResolver::new_with_err(err, options),
+        };
         let xds_client = match self.xds_client_provider.get_or_create(&target.to_string()) {
             Ok(client) => client,
             Err(err) => {
@@ -86,13 +86,9 @@ impl ResolverBuilder for Builder {
                 );
             }
         };
-        let parsed = match parse_target(target, xds_client.bootstrap()) {
-            Ok(parsed) => parsed,
-            Err(err) => return NopResolver::new_with_err(err, options),
-        };
         // TODO: create the DependencyManager and XdsResolver using
-        // `xds_client` and `parsed.lds_resource_name`.
-        let _ = parsed;
+        // `xds_client` and `lds_resource_name`.
+        let _ = (xds_client, lds_resource_name);
         todo!()
     }
 
@@ -101,7 +97,7 @@ impl ResolverBuilder for Builder {
     }
 
     fn is_valid_uri(&self, uri: &Target) -> bool {
-        match parse_endpoint(uri) {
+        match listener_resource_name(uri) {
             Ok(_) => true,
             Err(err) => {
                 eprintln!("{err}");
@@ -111,86 +107,18 @@ impl ResolverBuilder for Builder {
     }
 }
 
-/// Output of full target validation, used when building a resolver.
-#[derive(Debug, PartialEq, Eq)]
-struct ParsedTarget {
-    /// Name of the Listener resource to watch.
-    lds_resource_name: String,
-}
-
-/// Validates the parts of `target` that don't depend on the bootstrap config.
-/// Returns the endpoint: the target path without its leading "/".
-fn parse_endpoint(target: &Target) -> Result<&str, String> {
+/// Returns the name of the Listener resource to watch for `target`: the
+/// target path without its leading "/" (gRFC A27). The target's authority is
+/// ignored.
+fn listener_resource_name(target: &Target) -> Result<&str, String> {
     let path = target.path();
-    let endpoint = path.strip_prefix('/').unwrap_or(path);
-    if endpoint.is_empty() || endpoint.ends_with('/') {
+    let name = path.strip_prefix('/').unwrap_or(path);
+    if name.is_empty() || name.ends_with('/') {
         return Err(format!(
             "xds: target {target} path does not contain a valid data plane authority"
         ));
     }
-    Ok(endpoint)
-}
-
-/// Validates `target` against `bootstrap` and computes the name of the
-/// Listener resource to watch. Fails if the target has an authority that is
-/// not in the bootstrap config.
-fn parse_target(target: &Target, bootstrap: &BootstrapConfig) -> Result<ParsedTarget, String> {
-    let endpoint = parse_endpoint(target)?;
-
-    // Use the top-level template, or the per-authority one if the target has
-    // an authority.
-    let mut template = bootstrap
-        .client_default_listener_resource_name_template
-        .as_str();
-    let authority = target.authority_host_port();
-    if !authority.is_empty() {
-        let authority_config = bootstrap.authorities.get(&authority).ok_or_else(|| {
-            format!(
-                "xds: authority {authority:?} specified in dial target {target} is not found in \
-                 the bootstrap file"
-            )
-        })?;
-        if !authority_config
-            .client_listener_resource_name_template
-            .is_empty()
-        {
-            template = &authority_config.client_listener_resource_name_template;
-        }
-    }
-    Ok(ParsedTarget {
-        lds_resource_name: populate_resource_template(template, endpoint),
-    })
-}
-
-/// Replaces every "%s" in `template` with `target`. If the template is an
-/// "xdstp:" URI, `target` is percent-encoded first (with '/' kept as is).
-fn populate_resource_template(template: &str, target: &str) -> String {
-    // Characters to percent-encode when putting a target into an "xdstp:"
-    // resource name. Only characters allowed in a URI path (RFC 3986
-    // section 3.3) may appear unencoded, as gRFC A47 requires. This set keeps
-    // alphanumerics, '-', '_', '.', '~', '$', '&', '+', '=', ':', '@' and '/',
-    // and encodes everything else.
-    static XDSTP_PATH_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
-        .remove(b'-')
-        .remove(b'_')
-        .remove(b'.')
-        .remove(b'~')
-        .remove(b'$')
-        .remove(b'&')
-        .remove(b'+')
-        .remove(b'=')
-        .remove(b':')
-        .remove(b'@')
-        .remove(b'/');
-
-    if !template.contains("%s") {
-        return template.to_owned();
-    }
-    if template.starts_with("xdstp:") {
-        let encoded = utf8_percent_encode(target, XDSTP_PATH_ENCODE_SET).to_string();
-        return template.replace("%s", &encoded);
-    }
-    template.replace("%s", target)
+    Ok(name)
 }
 
 struct XdsResolver {
@@ -474,7 +402,6 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::resolver::mocks::Authority;
     use crate::resource::DomainMatcher;
     use crate::resource::ListenerResource;
     use crate::resource::PathSpecifier;
@@ -487,16 +414,12 @@ mod tests {
     use crate::wrr::test_utils::wrr_builder;
     use crate::xds_config::XdsConfig;
 
-    /// Returns clients wrapping a fixed bootstrap config, or a fixed error.
-    struct FakeXdsClientProvider {
-        bootstrap: Result<BootstrapConfig, String>,
-    }
+    /// Fails every attempt to create an xDS client.
+    struct FailingXdsClientProvider;
 
-    impl XdsClientProvider for FakeXdsClientProvider {
+    impl XdsClientProvider for FailingXdsClientProvider {
         fn get_or_create(&self, _name: &str) -> Result<Arc<XdsClientWrapper>, String> {
-            self.bootstrap
-                .clone()
-                .map(|bootstrap| Arc::new(XdsClientWrapper { bootstrap }))
+            Err("xds client must not be created".to_string())
         }
     }
 
@@ -506,40 +429,14 @@ mod tests {
 
     fn builder() -> Builder {
         Builder {
-            xds_client_provider: Arc::new(FakeXdsClientProvider {
-                bootstrap: Err("bootstrap must not be read".to_string()),
-            }),
-        }
-    }
-
-    /// Validates `target` against the bootstrap returned by a client from
-    /// `FakeXdsClientProvider`, as the resolver does when it is built.
-    fn parse_with_provider(
-        target_str: &str,
-        bootstrap: BootstrapConfig,
-    ) -> Result<ParsedTarget, String> {
-        let provider = FakeXdsClientProvider {
-            bootstrap: Ok(bootstrap),
-        };
-        let target = target(target_str);
-        let client = provider.get_or_create(&target.to_string())?;
-        parse_target(&target, client.bootstrap())
-    }
-
-    fn bootstrap_with_authority(name: &str) -> BootstrapConfig {
-        BootstrapConfig {
-            authorities: HashMap::from([(
-                name.to_string(),
-                Authority::with_default_template(name),
-            )]),
-            ..Default::default()
+            xds_client_provider: Arc::new(FailingXdsClientProvider),
         }
     }
 
     #[test]
     fn is_valid_uri_accepts_valid_targets() {
         let builder = builder();
-        // No bootstrap is needed, so the provider's error is never seen.
+        // No xDS client is needed, so the provider's error is never seen.
         assert!(builder.is_valid_uri(&target("xds:///foo")));
         assert!(builder.is_valid_uri(&target("xds://auth/foo")));
         assert!(builder.is_valid_uri(&target("xds:///foo/bar")));
@@ -556,128 +453,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_target_default_template() {
-        let parsed = parse_with_provider("xds:///foo.example.com", BootstrapConfig::default());
-        assert_eq!(
-            parsed,
-            Ok(ParsedTarget {
-                lds_resource_name: "foo.example.com".to_string()
-            })
-        );
-    }
-
-    #[test]
-    fn parse_target_custom_top_level_template() {
-        let bootstrap = BootstrapConfig {
-            client_default_listener_resource_name_template: "/listeners/%s".to_string(),
-            ..Default::default()
-        };
-        let parsed = parse_with_provider("xds:///foo", bootstrap).unwrap();
-        assert_eq!(parsed.lds_resource_name, "/listeners/foo");
-    }
-
-    #[test]
-    fn parse_target_top_level_xdstp_template_is_encoded() {
-        let bootstrap = BootstrapConfig {
-            client_default_listener_resource_name_template:
-                "xdstp://auth/envoy.config.listener.v3.Listener/%s".to_string(),
-            ..Default::default()
-        };
-        let parsed = parse_with_provider("xds:///[::1]:8080", bootstrap).unwrap();
-        assert_eq!(
-            parsed.lds_resource_name,
-            "xdstp://auth/envoy.config.listener.v3.Listener/%5B::1%5D:8080"
-        );
-    }
-
-    #[test]
-    fn parse_target_known_authority_default_template() {
-        let parsed =
-            parse_with_provider("xds://auth.com/svc", bootstrap_with_authority("auth.com"))
-                .unwrap();
-        assert_eq!(
-            parsed.lds_resource_name,
-            "xdstp://auth.com/envoy.config.listener.v3.Listener/svc"
-        );
-    }
-
-    #[test]
-    fn parse_target_unknown_authority() {
-        let parsed = parse_with_provider("xds://other/svc", bootstrap_with_authority("auth.com"));
-        let err = parsed.unwrap_err();
-        assert!(err.contains("\"other\""), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn parse_target_authority_without_authorities_in_bootstrap() {
-        let parsed = parse_with_provider("xds://auth.com/svc", BootstrapConfig::default());
-        assert!(parsed.is_err());
-    }
-
-    #[test]
-    fn parse_target_rejects_empty_endpoint() {
-        let parsed = parse_with_provider("xds:///", BootstrapConfig::default());
-        assert!(parsed.is_err());
-    }
-
-    #[test]
-    fn xds_client_provider_error_is_propagated() {
-        let provider = FakeXdsClientProvider {
-            bootstrap: Err("no bootstrap".to_string()),
-        };
-        assert_eq!(
-            provider.get_or_create("xds:///foo").err(),
-            Some("no bootstrap".to_string())
-        );
-    }
-
-    #[test]
-    fn populate_resource_template_cases() {
-        let cases = [
-            // (template, target, want)
-            ("/name/template", "[::1]:8080", "/name/template"),
-            (
-                "/name/template/%s",
-                "[::1]:8080",
-                "/name/template/[::1]:8080",
-            ),
-            (
-                "xdstp://authority.com/%s",
-                "0.0.0.0:8080",
-                "xdstp://authority.com/0.0.0.0:8080",
-            ),
-            (
-                "xdstp://authority.com/%s",
-                "[::1]:8080",
-                "xdstp://authority.com/%5B::1%5D:8080",
-            ),
-        ];
-        for (template, target, want) in cases {
-            assert_eq!(
-                populate_resource_template(template, target),
-                want,
-                "template: {template}, target: {target}"
-            );
-        }
-    }
-
-    #[test]
-    fn xdstp_encoding_details() {
+    fn listener_resource_name_is_target_path() {
         let cases = [
             // (target, want)
-            ("server.example.com", "server.example.com"),
-            ("my/service/region", "my/service/region"),
-            ("a b", "a%20b"),
-            ("a,b;c", "a%2Cb%3Bc"),
-            ("-_.~$&+=:@", "-_.~$&+=:@"),
+            ("xds:///foo.example.com", "foo.example.com"),
+            ("xds:///foo.example.com:8080", "foo.example.com:8080"),
+            ("xds:///foo/bar", "foo/bar"),
+            // The authority is ignored.
+            ("xds://auth.com/svc", "svc"),
         ];
-        for (target, want) in cases {
+        for (target_str, want) in cases {
             assert_eq!(
-                populate_resource_template("xdstp://a/%s", target),
-                format!("xdstp://a/{want}"),
-                "target: {target}"
+                listener_resource_name(&target(target_str)),
+                Ok(want),
+                "target: {target_str}"
             );
         }
+    }
+
+    #[test]
+    fn listener_resource_name_rejects_empty_path() {
+        assert!(listener_resource_name(&target("xds:///")).is_err());
     }
 
     /// Notifies `tx` each time work is scheduled.
@@ -885,9 +681,7 @@ mod tests {
         let (dependency_manager, _updates_tx) = DependencyManager::new();
         let (work_tx, work_rx) = mpsc::unbounded_channel();
         let resolver = XdsResolver {
-            xds_client: Arc::new(XdsClientWrapper {
-                bootstrap: BootstrapConfig::default(),
-            }),
+            xds_client: Arc::new(XdsClientWrapper),
             dependency_manager,
             active_clusters: HashMap::new(),
             lds_resource_name: "listener".to_string(),

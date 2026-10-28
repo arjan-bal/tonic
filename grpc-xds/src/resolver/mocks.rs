@@ -35,16 +35,7 @@ use crate::xds_config::XdsConfig;
 /// Mock xDS client.
 ///
 /// TODO: replace with the real xDS client once it is integrated.
-pub(super) struct XdsClientWrapper {
-    pub(super) bootstrap: BootstrapConfig,
-}
-
-impl XdsClientWrapper {
-    /// Returns the bootstrap config this client was created with.
-    pub(super) fn bootstrap(&self) -> &BootstrapConfig {
-        &self.bootstrap
-    }
-}
+pub(super) struct XdsClientWrapper;
 
 /// Creates or reuses xDS clients, keyed by name (gRFC A71).
 ///
@@ -161,47 +152,5 @@ impl XdsConfigWatcher {
     /// shut down.
     pub(super) async fn next(&mut self) -> Option<XdsConfigResult> {
         self.rx.recv().await
-    }
-}
-
-/// Mock of a single bootstrap authority entry.
-#[derive(Debug, Clone)]
-pub(super) struct Authority {
-    /// Must start with "xdstp://<authority>/". Defaults to
-    /// "xdstp://<authority>/envoy.config.listener.v3.Listener/%s".
-    pub(super) client_listener_resource_name_template: String,
-}
-
-impl Authority {
-    /// Returns an authority entry that uses the default listener resource name
-    /// template for `authority_name`.
-    pub(super) fn with_default_template(authority_name: &str) -> Self {
-        Self {
-            client_listener_resource_name_template: format!(
-                "xdstp://{authority_name}/envoy.config.listener.v3.Listener/%s"
-            ),
-        }
-    }
-}
-
-/// Mock of the client-side parts of the xDS bootstrap config used by the
-/// resolver (gRFC A27 / A47).
-///
-/// TODO: replace with the real bootstrap once it is implemented.
-#[derive(Debug, Clone)]
-pub(crate) struct BootstrapConfig {
-    /// Template for the Listener name when the target has no authority.
-    /// Defaults to "%s".
-    pub(super) client_default_listener_resource_name_template: String,
-    /// Map from authority name to its config.
-    pub(super) authorities: HashMap<String, Authority>,
-}
-
-impl Default for BootstrapConfig {
-    fn default() -> Self {
-        Self {
-            client_default_listener_resource_name_template: "%s".to_string(),
-            authorities: HashMap::new(),
-        }
     }
 }
