@@ -91,37 +91,36 @@ impl HeaderMatcher {
     }
 }
 
-/// Returns the value a header matcher sees for header `name`:
+/// Returns the value a header matcher sees for header `name`, which must be
+/// lowercase (header matcher names are lowercased when RDS is parsed):
 /// - `-bin` headers count as absent (gRFC A28);
 /// - `content-type` is always "application/grpc";
 /// - any other header is looked up in `metadata`, with multiple values joined
-///   with ",". Names are case-insensitive.
+///   with ",".
 fn header_value<'a>(metadata: &'a MetadataMap, name: &str) -> Option<Cow<'a, str>> {
-    let name = if name.bytes().any(|b| b.is_ascii_uppercase()) {
-        Cow::Owned(name.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(name)
-    };
     if name.ends_with("-bin") {
         return None;
     }
     if name == "content-type" {
         return Some(Cow::Borrowed("application/grpc"));
     }
-    let mut values = metadata.get_all(name.as_ref()).iter();
-    let first = values.next()?.to_str();
-    let Some(second) = values.next() else {
+    let values = metadata.get_all(name);
+    let mut iter = values.iter().map(|value| value.to_str());
+    let first = iter.next()?;
+    let Some(second) = iter.next() else {
         return Some(Cow::Borrowed(first));
     };
-    let second = second.to_str();
-    let mut joined = String::with_capacity(first.len() + 1 + second.len());
+    // Compute the joined length up front so the string is allocated once.
+    let len = iter.fold(first.len() + 1 + second.len(), |len, value| {
+        len + 1 + value.len()
+    });
+    let mut joined = String::with_capacity(len);
     joined.push_str(first);
-    joined.push(',');
-    joined.push_str(second);
-    for value in values {
+    for value in values.iter().skip(1) {
         joined.push(',');
         joined.push_str(value.to_str());
     }
+    debug_assert_eq!(joined.len(), len);
     Some(Cow::Owned(joined))
 }
 
@@ -246,8 +245,34 @@ mod tests {
         ] {
             let description = format!("{matcher:?}");
             let matcher = header("x-foo", HeaderMatchSpecifier::String(matcher));
-            assert_eq!(header_matches(matcher, &md), expected, "{description}");
+            assert_eq!(
+                header_matches(matcher.clone(), &md),
+                expected,
+                "{description}"
+            );
+            // A present header's result is inverted.
+            assert_eq!(
+                header_matches(inverted(matcher), &md),
+                !expected,
+                "inverted {description}"
+            );
         }
+    }
+
+    #[test]
+    fn empty_header_value_is_present() {
+        let mut md = MetadataMap::new();
+        md.append("x-foo", MetadataValue::from_static(""));
+        let contains = header(
+            "x-foo",
+            HeaderMatchSpecifier::String(StringMatcher::contains("v", false).unwrap()),
+        );
+        assert!(!header_matches(contains.clone(), &md));
+        assert!(header_matches(inverted(contains), &md));
+        assert!(header_matches(
+            header("x-foo", HeaderMatchSpecifier::Present),
+            &md
+        ));
     }
 
     #[test]
@@ -347,24 +372,45 @@ mod tests {
 
     #[test]
     fn multiple_header_values_are_joined_with_commas() {
-        let md = metadata(&[("x-foo", "a"), ("x-foo", "b"), ("x-foo", "c")]);
-        let exact = |value: &str| {
-            header(
-                "x-foo",
-                HeaderMatchSpecifier::String(StringMatcher::exact(value, false)),
-            )
-        };
-        assert!(header_matches(exact("a,b,c"), &md));
-        assert!(!header_matches(exact("a"), &md));
-    }
-
-    #[test]
-    fn header_names_match_case_insensitively() {
-        let md = metadata(&[("x-foo", "v")]);
-        assert!(header_matches(
-            header("X-Foo", HeaderMatchSpecifier::Present),
-            &md
-        ));
+        let two = metadata(&[("x-foo", "abc"), ("x-foo", "tv123")]);
+        let three = metadata(&[("x-foo", "abc"), ("x-foo", "def"), ("x-foo", "tv123")]);
+        // String matchers see only the joined value, never the individual
+        // values.
+        for (md, matcher, expected) in [
+            (&two, StringMatcher::exact("abc,tv123", false), true),
+            (&two, StringMatcher::exact("tv123", false), false),
+            (&two, StringMatcher::prefix("abc,", false).unwrap(), true),
+            (&two, StringMatcher::prefix("tv", false).unwrap(), false),
+            (&two, StringMatcher::suffix(",tv123", false).unwrap(), true),
+            (&two, StringMatcher::suffix("abc", false).unwrap(), false),
+            (
+                &two,
+                StringMatcher::safe_regex(regex("[abc]*,tv[0-9]+")),
+                true,
+            ),
+            (&two, StringMatcher::safe_regex(regex("tv[0-9]+")), false),
+            (&three, StringMatcher::exact("abc,def,tv123", false), true),
+            (&three, StringMatcher::exact("abc", false), false),
+            (
+                &three,
+                StringMatcher::prefix("abc,def,", false).unwrap(),
+                true,
+            ),
+            (
+                &three,
+                StringMatcher::suffix("def,tv123", false).unwrap(),
+                true,
+            ),
+            (
+                &three,
+                StringMatcher::safe_regex(regex("[a-f,]*tv[0-9]+")),
+                true,
+            ),
+        ] {
+            let description = format!("{matcher:?}");
+            let matcher = header("x-foo", HeaderMatchSpecifier::String(matcher));
+            assert_eq!(header_matches(matcher, md), expected, "{description}");
+        }
     }
 
     #[test]
