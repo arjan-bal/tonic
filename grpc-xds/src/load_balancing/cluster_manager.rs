@@ -60,12 +60,10 @@ use grpc::StatusCodeError;
 use grpc::StatusError;
 use serde::Deserialize;
 
+use crate::resolver::picked_child_name;
+
 static POLICY_NAME: &str = "xds_cluster_manager_experimental";
 static START: Once = Once::new();
-
-// Target cluster option for an RPC, keyed by its `TypeId` in `CallOptions`.
-#[derive(Debug, Clone)]
-struct XdsCluster(Arc<str>);
 
 // Validated configuration for `xds_cluster_manager_experimental`.
 // Maps a cluster name to a load balancing configuration for that cluster.
@@ -182,8 +180,8 @@ impl LbPolicy for ClusterManagerPolicy {
     }
 }
 
-// Picker that delegates to the child picker corresponding to the cluster
-// call option.
+// Picker that delegates to the child picker of the cluster the xDS config
+// selector routed the RPC to.
 #[derive(Debug)]
 struct ClusterPicker {
     children: HashMap<String, Arc<dyn Picker>>,
@@ -191,9 +189,7 @@ struct ClusterPicker {
 
 impl Picker for ClusterPicker {
     fn pick(&self, options: PickOptions<'_>) -> PickResult {
-        options
-            .call_options
-            .get_option::<XdsCluster>()
+        picked_child_name(options.call_options)
             .ok_or_else(|| {
                 debug_assert!(false, "cluster manager: cluster attribute not present");
                 StatusError::new(
@@ -202,11 +198,11 @@ impl Picker for ClusterPicker {
                 )
             })
             .and_then(|cluster| {
-                self.children.get(&*cluster.0).ok_or_else(|| {
-                    debug_assert!(false, "cluster manager: unknown cluster '{}'", cluster.0);
+                self.children.get(cluster).ok_or_else(|| {
+                    debug_assert!(false, "cluster manager: unknown cluster '{cluster}'");
                     StatusError::new(
                         StatusCodeError::Internal,
-                        format!("cluster manager: unknown cluster '{}'", cluster.0),
+                        format!("cluster manager: unknown cluster '{cluster}'"),
                     )
                 })
             })
@@ -238,6 +234,7 @@ mod tests {
     use grpc::core::Address;
 
     use super::*;
+    use crate::resolver::set_picked_child_for_testing;
 
     #[test]
     fn parse_config() {
@@ -283,7 +280,7 @@ mod tests {
 
         // Unknown cluster -> debug_assert panic, or Drop(Internal) in release.
         let mut opts = CallOptions::new();
-        opts.set_option(XdsCluster("cluster_unknown".into()));
+        set_picked_child_for_testing(&mut opts, "cluster_unknown");
         match cluster_picker.pick(PickOptions::new(&req, &opts)) {
             PickResult::Drop(err) => {
                 assert_eq!(err.code(), StatusCodeError::Internal);
@@ -396,7 +393,7 @@ mod tests {
 
         let req = RequestHeaders::new();
         let mut opts_b = CallOptions::new();
-        opts_b.set_option(XdsCluster("cluster_b".into()));
+        set_picked_child_for_testing(&mut opts_b, "cluster_b");
         match state.picker.pick(PickOptions::new(&req, &opts_b)) {
             PickResult::Drop(err) => assert_eq!(err.code(), StatusCodeError::Internal),
             other => panic!("expected Drop for removed cluster, got {other:?}"),
@@ -490,7 +487,7 @@ mod tests {
         let req = RequestHeaders::new();
         let picked = PickedChild::default();
         let mut opts = CallOptions::new();
-        opts.set_option(XdsCluster(cluster.into()));
+        set_picked_child_for_testing(&mut opts, cluster);
         opts.set_option(picked.clone());
         assert!(matches!(
             picker.pick(PickOptions::new(&req, &opts)),
@@ -504,7 +501,7 @@ mod tests {
         let req = RequestHeaders::new();
         let endpoints = ChildEndpoints::default();
         let mut opts = CallOptions::new();
-        opts.set_option(XdsCluster(cluster.into()));
+        set_picked_child_for_testing(&mut opts, cluster);
         opts.set_option(endpoints.clone());
         assert!(matches!(
             picker.pick(PickOptions::new(&req, &opts)),
