@@ -27,6 +27,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use super::*;
+use crate::attributes::Attributes;
 use crate::client::ConnectivityState;
 use crate::client::load_balancing::LbPolicy;
 use crate::client::load_balancing::LbPolicyBuilder;
@@ -41,9 +42,18 @@ use crate::client::load_balancing::test_utils;
 use crate::client::load_balancing::test_utils::StubPolicyFuncs;
 use crate::client::load_balancing::test_utils::TestEnv;
 use crate::client::name_resolution::Endpoint;
-use crate::client::name_resolution::ResolverUpdate;
 use crate::core::Address;
 use crate::rt::default_runtime;
+
+impl ChildData {
+    /// Returns whether the child has been created and is currently
+    /// deactivated.
+    fn is_deactivated(&self) -> bool {
+        self.child
+            .as_ref()
+            .is_some_and(|child| child.deactivation_timer.is_some())
+    }
+}
 
 /// Verifies that configuration parsing rejects configs where a priority
 /// name in `priorities` has no corresponding entry in `children`.
@@ -237,18 +247,62 @@ async fn empty_priorities_reports_transient_failure() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+    env.send_resolver_update_with_config(vec![], &cfg).unwrap();
 
     env.expect_failing_picker("priority policy has empty priority list");
     env.expect_no_events();
+}
+
+/// Verifies that every field of the resolver update is passed to the child
+/// policy.
+#[tokio::test]
+async fn child_receives_all_resolver_update_fields() {
+    #[derive(Debug, PartialEq, Eq)]
+    struct Marker(u32);
+
+    let received: Arc<Mutex<Option<ResolverUpdate>>> = Arc::default();
+    let received_clone = received.clone();
+    test_utils::reg_stub_policy(
+        "stub_propagate_fields",
+        StubPolicyFuncs {
+            resolver_update: Some(Arc::new(move |_data, update, _cfg, _controller| {
+                *received_clone.lock().unwrap() = Some(update);
+                Ok(())
+            })),
+            ..Default::default()
+        },
+    );
+
+    let mut env = setup_test_env();
+    let js = r#"{
+  "priorities": ["child-0"],
+  "children": {
+    "child-0": {"config": [{"stub_propagate_fields": {}}]}
+  }
+}"#;
+    let cfg = Builder {}
+        .parse_config(&LbConfigJson::new(js).unwrap())
+        .unwrap();
+    let endpoint = new_test_endpoint("child-0", "127.0.0.1:8000");
+    let update = ResolverUpdate {
+        attributes: Attributes::new().add(Marker(7)),
+        endpoints: Ok(vec![endpoint.clone()]),
+        service_config: Err("service config error".to_string()),
+        resolution_note: Some("note".to_string()),
+    };
+    let _ = env.policy.resolver_update(update, &cfg, &mut env.tcc);
+
+    let got = received
+        .lock()
+        .unwrap()
+        .take()
+        .expect("child received no resolver update");
+    assert_eq!(got.attributes.get::<Marker>(), Some(&Marker(7)));
+    assert_eq!(got.service_config.unwrap_err(), "service config error");
+    assert_eq!(got.resolution_note.as_deref(), Some("note"));
+    // The child's name is removed from the front of the endpoint's path.
+    let want_endpoint = endpoint_filtering::set_path_in_endpoint(endpoint, vec![]);
+    assert_eq!(got.endpoints, Ok(vec![want_endpoint]));
 }
 
 /// Verifies that when a high-priority child is READY, traffic routes to it
@@ -272,22 +326,18 @@ async fn high_priority_ready_and_add_remove_lower() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
     // child-0 should be lazily instantiated and connecting. child-1 should NOT
     // be created while child-0 is connecting.
-    let sc0 = env.expect_new_subchannel();
+    let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
 
@@ -308,24 +358,20 @@ async fn high_priority_ready_and_add_remove_lower() {
     let cfg2 = Builder {}
         .parse_config(&LbConfigJson::new(js2).unwrap())
         .unwrap();
-    let update2 = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
             new_test_endpoint("child-2", "127.0.0.1:8002"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update2, &cfg2, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg2,
+    )
+    .unwrap();
 
     // The update is forwarded to child-0, whose stub creates a subchannel for
     // every resolver update.  child-0 is still Ready, so the picker is
     // unchanged. child-1 and child-2 should still not be created.
-    env.expect_new_subchannel();
+    env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_no_events();
 }
 
@@ -348,20 +394,16 @@ async fn switch_priority_failover_and_failback() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
-    let sc0 = env.expect_new_subchannel();
+    let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
     env.send_subchannel_update(&sc0, &SubchannelState::ready());
@@ -377,7 +419,7 @@ async fn switch_priority_failover_and_failback() {
     // child-0 requests re-resolution. Failover: child-1 is lazily created and
     // starts connecting.
     env.expect_request_resolution();
-    let sc1 = env.expect_new_subchannel();
+    let sc1 = env.expect_new_subchannel_for("127.0.0.1:8001");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
 
@@ -414,21 +456,17 @@ async fn init_timeout_failover() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
     // child-0 is connecting; child-1 is not initialized before the timeout.
-    env.expect_new_subchannel();
+    env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
 
@@ -457,7 +495,7 @@ async fn init_timeout_failover() {
     ));
 
     // child-1 should have been lazily initialized and selected.
-    env.expect_new_subchannel();
+    env.expect_new_subchannel_for("127.0.0.1:8001");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
 }
@@ -481,19 +519,15 @@ async fn connecting_to_connecting_does_not_restart_timer() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
-    let sc0 = env.expect_new_subchannel();
+        ],
+        &cfg,
+    )
+    .unwrap();
+    let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
 
@@ -521,7 +555,7 @@ async fn connecting_to_connecting_does_not_restart_timer() {
     ));
 
     // Failover: child-1 is lazily created and selected.
-    env.expect_new_subchannel();
+    env.expect_new_subchannel_for("127.0.0.1:8001");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
 }
@@ -546,20 +580,16 @@ async fn transient_failure_to_connecting_enters_connecting_expired() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
-    let sc0 = env.expect_new_subchannel();
+    let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
 
@@ -567,7 +597,7 @@ async fn transient_failure_to_connecting_enters_connecting_expired() {
     // initialized.
     env.send_subchannel_update(&sc0, &SubchannelState::transient_failure("fail"));
     env.expect_request_resolution();
-    let sc1 = env.expect_new_subchannel();
+    let sc1 = env.expect_new_subchannel_for("127.0.0.1:8001");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
 
@@ -591,8 +621,9 @@ async fn transient_failure_to_connecting_enters_connecting_expired() {
 }
 
 /// Verifies the 15-minute deactivation retention timer, background update
-/// retention, child pruning upon timer expiration, and subsequent clean
-/// reactivation without panic.
+/// retention (including running the failover timer of a deactivated child),
+/// child pruning upon timer expiration, and subsequent clean reactivation
+/// without panic.
 #[tokio::test(start_paused = true)]
 async fn deactivation_and_reactivation() {
     reg_stub("stub_dr_0");
@@ -610,27 +641,23 @@ async fn deactivation_and_reactivation() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
-    let sc0 = env.expect_new_subchannel();
+    let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
 
     // child-0 fails -> failover to child-1.
     env.send_subchannel_update(&sc0, &SubchannelState::transient_failure("fail"));
     env.expect_request_resolution();
-    let sc1 = env.expect_new_subchannel();
+    let sc1 = env.expect_new_subchannel_for("127.0.0.1:8001");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
     env.send_subchannel_update(&sc1, &SubchannelState::ready());
@@ -656,6 +683,12 @@ async fn deactivation_and_reactivation() {
     let data = env.expect_schedule_work();
     env.policy.work(data, &mut env.tcc);
     env.expect_no_events();
+    let child_1 = env.policy.child("child-1").unwrap();
+    assert!(child_1.is_deactivated());
+    assert!(matches!(
+        child_1.state(),
+        Some(ChildState::ConnectingExpired)
+    ));
     // Advance time past 15 minutes (901 seconds).
     advance_time(Duration::from_secs(15 * 60 + 1)).await;
 
@@ -670,7 +703,7 @@ async fn deactivation_and_reactivation() {
     // Now child-0 fails again. child-1 should be re-created.
     env.send_subchannel_update(&sc0, &SubchannelState::transient_failure("fail again"));
     env.expect_request_resolution();
-    env.expect_new_subchannel();
+    env.expect_new_subchannel_for("127.0.0.1:8001");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
 }
@@ -696,20 +729,16 @@ async fn ignore_reresolution_requests_configuration() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
-    let sc0 = env.expect_new_subchannel();
+    let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
 
@@ -717,7 +746,7 @@ async fn ignore_reresolution_requests_configuration() {
     env.send_subchannel_update(&sc0, &SubchannelState::transient_failure("fail"));
     // Since child-0 has ignoreReresolutionRequests = true, tcc does NOT
     // receive RequestResolution. Failover occurs to child-1.
-    let sc1 = env.expect_new_subchannel();
+    let sc1 = env.expect_new_subchannel_for("127.0.0.1:8001");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
 
@@ -750,20 +779,16 @@ async fn remove_child_from_config_deletes_immediately() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
-    env.expect_new_subchannel();
+    env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
     assert!(env.policy.child("child-0").is_some());
@@ -779,19 +804,15 @@ async fn remove_child_from_config_deletes_immediately() {
     let cfg2 = Builder {}
         .parse_config(&LbConfigJson::new(js2).unwrap())
         .unwrap();
-    let update2 = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![new_test_endpoint("child-0", "127.0.0.1:8000")]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update2, &cfg2, &mut env.tcc)
-        .unwrap();
+    env.send_resolver_update_with_config(
+        vec![new_test_endpoint("child-0", "127.0.0.1:8000")],
+        &cfg2,
+    )
+    .unwrap();
 
     // The update is forwarded to child-0, whose stub creates a subchannel for
     // every resolver update.  The picker is unchanged.
-    env.expect_new_subchannel();
+    env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_no_events();
 
     // child-1 must be removed immediately (gRFC A115).
@@ -847,17 +868,13 @@ async fn work_item_filtering_drops_timer_work_and_forwards_child_work() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![new_test_endpoint("child-0", "127.0.0.1:8000")]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+    env.send_resolver_update_with_config(
+        vec![new_test_endpoint("child-0", "127.0.0.1:8000")],
+        &cfg,
+    )
+    .unwrap();
 
-    env.expect_new_subchannel();
+    env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
 
     // Deliver a PriorityTimerWork item: it should be consumed by PriorityPolicy
@@ -901,20 +918,16 @@ async fn picker_updates_are_debounced_for_inactive_child_events() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
-    let sc0 = env.expect_new_subchannel();
+    let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
 
@@ -989,20 +1002,16 @@ async fn exit_idle_wakes_only_current_priority() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
+    env.send_resolver_update_with_config(
+        vec![
             new_test_endpoint("child-0", "127.0.0.1:8000"),
             new_test_endpoint("child-1", "127.0.0.1:8001"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+        ],
+        &cfg,
+    )
+    .unwrap();
 
-    let sc0 = env.expect_new_subchannel();
+    let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.expect_no_events();
 
@@ -1019,7 +1028,7 @@ async fn exit_idle_wakes_only_current_priority() {
     // Fail child-0 so priority fails over to child-1, then transition child-1
     // to Idle. Calling exit_idle wakes only child-1, not child-0.
     env.send_subchannel_update(&sc0, &SubchannelState::transient_failure("fail"));
-    let sc1 = env.expect_new_subchannel();
+    let sc1 = env.expect_new_subchannel_for("127.0.0.1:8001");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.send_subchannel_update(&sc1, &SubchannelState::idle());
     env.expect_picker_state(ConnectivityState::Idle);
@@ -1039,74 +1048,8 @@ async fn exit_idle_wakes_only_current_priority() {
     env.expect_no_events();
 }
 
-/// A deactivated child that goes READY -> CONNECTING must run its failover timer.
-#[tokio::test(start_paused = true)]
-async fn deactivated_child_connecting_starts_failover_timer() {
-    reg_stub("stub_dft_0");
-    reg_stub("stub_dft_1");
-    reg_stub("stub_dft_2");
-
-    let mut env = setup_test_env();
-    let js = r#"{
-  "priorities": ["child-0", "child-1", "child-2"],
-  "children": {
-    "child-0": {"config": [{"stub_dft_0": {}}]},
-    "child-1": {"config": [{"stub_dft_1": {}}]},
-    "child-2": {"config": [{"stub_dft_2": {}}]}
-  }
-}"#;
-    let cfg = Builder {}
-        .parse_config(&LbConfigJson::new(js).unwrap())
-        .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
-            new_test_endpoint("child-0", "127.0.0.1:8300"),
-            new_test_endpoint("child-1", "127.0.0.1:8301"),
-            new_test_endpoint("child-2", "127.0.0.1:8302"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
-
-    let sc0 = env.expect_new_subchannel();
-    env.expect_picker_state(ConnectivityState::Connecting);
-    env.send_subchannel_update(&sc0, &SubchannelState::transient_failure("a fails"));
-    env.expect_request_resolution();
-    let sc1 = env.expect_new_subchannel();
-    env.expect_picker_state(ConnectivityState::Connecting);
-    env.send_subchannel_update(&sc1, &SubchannelState::ready());
-    env.expect_picker_state(ConnectivityState::Ready);
-    env.send_subchannel_update(&sc1, &SubchannelState::transient_failure("b fails"));
-    env.expect_request_resolution();
-    let sc2 = env.expect_new_subchannel();
-    env.expect_picker_state(ConnectivityState::Connecting);
-    env.send_subchannel_update(&sc2, &SubchannelState::ready());
-    env.expect_picker_state(ConnectivityState::Ready);
-    env.send_subchannel_update(&sc1, &SubchannelState::ready());
-    env.expect_picker_state(ConnectivityState::Ready);
-    env.send_subchannel_update(&sc0, &SubchannelState::ready());
-    env.expect_picker_state(ConnectivityState::Ready);
-    assert!(env.policy.child("child-1").unwrap().is_deactivated());
-
-    // child-1 is deactivated while READY, then goes CONNECTING.
-    env.send_subchannel_update(&sc1, &SubchannelState::connecting());
-    env.expect_no_events();
-    advance_time(Duration::from_secs(11)).await;
-    let data = env.expect_schedule_work();
-    env.policy.work(data, &mut env.tcc);
-    env.expect_no_events();
-
-    // child-0 fails: child-1's timer has expired, so child-2 (READY) wins.
-    env.send_subchannel_update(&sc0, &SubchannelState::transient_failure("a fails again"));
-    env.expect_request_resolution();
-    env.expect_picker_state(ConnectivityState::Ready);
-}
-
-/// Deactivation preserves the remaining failover-timer time.
+/// Verifies that a failover timer started while a child is active keeps
+/// running through deactivation and is not restarted on reactivation.
 #[tokio::test(start_paused = true)]
 async fn deactivated_child_preserves_pending_failover_timer() {
     reg_stub("stub_dpt_0");
@@ -1125,29 +1068,25 @@ async fn deactivated_child_preserves_pending_failover_timer() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
-            new_test_endpoint("child-0", "127.0.0.1:8400"),
-            new_test_endpoint("child-1", "127.0.0.1:8401"),
-            new_test_endpoint("child-2", "127.0.0.1:8402"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+    env.send_resolver_update_with_config(
+        vec![
+            new_test_endpoint("child-0", "127.0.0.1:8000"),
+            new_test_endpoint("child-1", "127.0.0.1:8001"),
+            new_test_endpoint("child-2", "127.0.0.1:8002"),
+        ],
+        &cfg,
+    )
+    .unwrap();
 
-    let sc0 = env.expect_new_subchannel();
+    let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.send_subchannel_update(&sc0, &SubchannelState::transient_failure("a fails"));
     env.expect_request_resolution();
-    let sc1 = env.expect_new_subchannel();
+    let sc1 = env.expect_new_subchannel_for("127.0.0.1:8001");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.send_subchannel_update(&sc1, &SubchannelState::transient_failure("b fails"));
     env.expect_request_resolution();
-    let sc2 = env.expect_new_subchannel();
+    let sc2 = env.expect_new_subchannel_for("127.0.0.1:8002");
     env.expect_picker_state(ConnectivityState::Connecting);
 
     // child-2 READY, then child-1 READY -> child-1 active, child-2 deactivated.
@@ -1172,8 +1111,10 @@ async fn deactivated_child_preserves_pending_failover_timer() {
     env.send_subchannel_update(&sc0, &SubchannelState::transient_failure("a fails again"));
     env.expect_request_resolution();
     env.expect_picker_state(ConnectivityState::Connecting);
+    env.expect_no_events();
 
-    // 1s later child-1's preserved timer expires; child-2 (READY) wins.
+    // Shortly after, child-1's preserved timer expires (10s after it started,
+    // not 10s after reactivation); child-2 (READY) is selected.
     advance_time(Duration::from_secs(2)).await;
     let data = env.expect_schedule_work();
     env.policy.work(data, &mut env.tcc);
@@ -1181,9 +1122,9 @@ async fn deactivated_child_preserves_pending_failover_timer() {
     env.expect_no_events();
 }
 
-/// A child that is deactivated after TRANSIENT_FAILURE and goes CONNECTING
-/// while deactivated is not given a new failover timer on reactivation, since
-/// it has not been READY or IDLE since failing.
+/// Verifies that a child that is deactivated after TRANSIENT_FAILURE and goes
+/// CONNECTING while deactivated is not given a new failover timer, since it has
+/// not been READY or IDLE since failing, and so is skipped on reactivation.
 #[tokio::test(start_paused = true)]
 async fn deactivated_child_failed_then_connecting_has_no_failover_timer() {
     reg_stub("stub_dfc_0");
@@ -1202,29 +1143,25 @@ async fn deactivated_child_failed_then_connecting_has_no_failover_timer() {
     let cfg = Builder {}
         .parse_config(&LbConfigJson::new(js).unwrap())
         .unwrap();
-    let update = ResolverUpdate {
-        attributes: Default::default(),
-        endpoints: Ok(vec![
-            new_test_endpoint("child-0", "127.0.0.1:8500"),
-            new_test_endpoint("child-1", "127.0.0.1:8501"),
-            new_test_endpoint("child-2", "127.0.0.1:8502"),
-        ]),
-        service_config: Ok(None),
-        resolution_note: None,
-    };
-    env.policy
-        .resolver_update(update, &cfg, &mut env.tcc)
-        .unwrap();
+    env.send_resolver_update_with_config(
+        vec![
+            new_test_endpoint("child-0", "127.0.0.1:8000"),
+            new_test_endpoint("child-1", "127.0.0.1:8001"),
+            new_test_endpoint("child-2", "127.0.0.1:8002"),
+        ],
+        &cfg,
+    )
+    .unwrap();
 
-    let sc0 = env.expect_new_subchannel();
+    let sc0 = env.expect_new_subchannel_for("127.0.0.1:8000");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.send_subchannel_update(&sc0, &SubchannelState::transient_failure("a fails"));
     env.expect_request_resolution();
-    let sc1 = env.expect_new_subchannel();
+    let sc1 = env.expect_new_subchannel_for("127.0.0.1:8001");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.send_subchannel_update(&sc1, &SubchannelState::transient_failure("b fails"));
     env.expect_request_resolution();
-    let sc2 = env.expect_new_subchannel();
+    let sc2 = env.expect_new_subchannel_for("127.0.0.1:8002");
     env.expect_picker_state(ConnectivityState::Connecting);
     env.send_subchannel_update(&sc2, &SubchannelState::ready());
     env.expect_picker_state(ConnectivityState::Ready);

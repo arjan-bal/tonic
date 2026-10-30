@@ -216,15 +216,6 @@ impl ChildData {
     fn state(&self) -> Option<&ChildState> {
         self.child.as_ref().map(|child| &child.state)
     }
-
-    /// Returns whether the child has been created and is currently
-    /// deactivated.
-    #[cfg(test)]
-    fn is_deactivated(&self) -> bool {
-        self.child
-            .as_ref()
-            .is_some_and(|child| child.deactivation_timer.is_some())
-    }
 }
 
 /// A child policy that has been created, along with its lifecycle state.
@@ -240,22 +231,8 @@ struct CreatedChild {
     /// a reactivated child resumes with its failover timer and failure
     /// history intact.
     state: ChildState,
-    /// The 15-minute deactivation timer ([`DEACTIVATION_TIMEOUT`]), present
-    /// only while the child is deactivated.
-    ///
-    /// A child is deactivated when it has been superseded by a
-    /// higher-priority child reaching `ReadyOrIdle` state.  If higher
-    /// priorities fail before this timer expires, the child is reactivated
-    /// immediately without connection churn. If the timer expires, the child
-    /// is destroyed (see [gRFC A56 (Section Child Lifetime Management)]).
-    ///
-    /// Per [gRFC A115], only children still configured in `PriorityConfig`
-    /// are deactivated; unconfigured children are removed immediately.
-    ///
-    /// [gRFC A56 (Section Child Lifetime Management)]:
-    ///   https://github.com/grpc/proposal/blob/master/A56-priority-lb-policy.md#child-lifetime-management
-    /// [gRFC A115]:
-    ///   https://github.com/grpc/proposal/blob/master/A115-remove-priority-lb-child-policy-cache.md
+    /// The 15-minute deactivation timer, present only while the child is
+    /// deactivated.
     deactivation_timer: Option<Timer>,
 }
 
@@ -323,8 +300,7 @@ impl Timer {
     }
 }
 
-/// Connectivity states of a child policy under `priority_experimental`, as
-/// tracked for failover.
+/// Connectivity states of a child policy, as tracked for failover.
 ///
 /// The child's most recently reported [`LbState`] is not stored here; it is
 /// available via [`Child::state`].  Whether the child is deactivated is
@@ -470,11 +446,14 @@ impl LbPolicy for PriorityPolicy {
 
     fn resolver_update(
         &mut self,
-        update: ResolverUpdate,
+        mut update: ResolverUpdate,
         config: &Self::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
-        let mut sharded_endpoints = update.endpoints.map(endpoint_filtering::group_by_path);
+        // Take the endpoints out of `update` (rather than moving the field) so
+        // the rest of `update` can still be copied into each child's update.
+        let mut sharded_endpoints = mem::replace(&mut update.endpoints, Ok(Vec::new()))
+            .map(endpoint_filtering::group_by_path);
 
         // Index the existing children by name so they can be moved into the
         // new priority order.  Children that are no longer configured are left
@@ -490,12 +469,7 @@ impl LbPolicy for PriorityPolicy {
                 Err(status) => Err(status.clone()),
             };
 
-            let resolver_update = ResolverUpdate {
-                attributes: update.attributes.clone(),
-                endpoints,
-                service_config: update.service_config.clone(),
-                resolution_note: update.resolution_note.clone(),
-            };
+            let resolver_update = update.with_endpoints(endpoints);
 
             let child_data = match old_children.remove(name) {
                 Some(mut child_data) => {
