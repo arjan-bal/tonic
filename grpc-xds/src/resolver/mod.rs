@@ -34,10 +34,9 @@ use grpc::__unstable::client::name_resolution::ResolverOptions;
 use grpc::__unstable::client::name_resolution::ResolverUpdate;
 use grpc::__unstable::client::name_resolution::Target;
 use grpc::__unstable::client::name_resolution::WorkScheduler;
-use grpc::__unstable::client::name_resolution::config_selector::set_in_resolver_update;
 use grpc::__unstable::rt::BoxedTaskHandle;
 
-use crate::resolver::config_selector::PickedCluster;
+use crate::resolver::config_selector::ClusterInterceptor;
 use crate::resolver::config_selector::RouteTarget;
 use crate::resolver::config_selector::SelectorRoute;
 use crate::resolver::config_selector::XdsConfigSelector;
@@ -197,18 +196,21 @@ impl XdsResolver {
     /// Returns a config selector for `xds_config`'s routes. It holds one ref
     /// to each cluster the routes can send RPCs to.
     fn new_config_selector(&mut self, xds_config: &XdsConfig) -> Arc<XdsConfigSelector> {
-        // One pick per cluster, shared by every route that names it.
-        let mut picks = HashMap::new();
+        // One interceptor per cluster, shared by every route that names it.
+        let mut interceptors = HashMap::new();
         let mut routes = Vec::new();
         for route in &xds_config.virtual_host().routes {
             let target = match &route.action {
                 RouteAction::Cluster(name) => {
-                    RouteTarget::Cluster(self.picked_cluster(&mut picks, name))
+                    RouteTarget::Cluster(self.cluster_interceptor(&mut interceptors, name))
                 }
                 RouteAction::WeightedClusters(clusters) => {
                     let clusters: Vec<_> = clusters
                         .iter()
-                        .map(|c| (self.picked_cluster(&mut picks, &c.name), c.weight))
+                        .map(|c| {
+                            let interceptor = self.cluster_interceptor(&mut interceptors, &c.name);
+                            (interceptor, c.weight)
+                        })
                         .collect();
                     RouteTarget::WeightedClusters(self.wrr_builder.build(clusters))
                 }
@@ -221,22 +223,23 @@ impl XdsResolver {
         Arc::new(XdsConfigSelector::new(routes))
     }
 
-    /// Returns the pick of cluster `name` from `picks`, creating it, and
-    /// subscribing to the cluster if needed, if it isn't there yet.
-    fn picked_cluster<'a>(
+    /// Returns the interceptor for cluster `name` from `interceptors`,
+    /// creating it, and subscribing to the cluster if needed, if it isn't
+    /// there yet.
+    fn cluster_interceptor<'a>(
         &mut self,
-        picks: &mut HashMap<&'a str, Arc<PickedCluster>>,
+        interceptors: &mut HashMap<&'a str, Arc<ClusterInterceptor>>,
         name: &'a str,
-    ) -> Arc<PickedCluster> {
-        if let Some(picked) = picks.get(name) {
-            return picked.clone();
+    ) -> Arc<ClusterInterceptor> {
+        if let Some(interceptor) = interceptors.get(name) {
+            return interceptor.clone();
         }
-        let picked = Arc::new(PickedCluster::new(
+        let interceptor = Arc::new(ClusterInterceptor::new(
             cluster_child_name(name),
             self.get_or_create_cluster_ref(name),
         ));
-        picks.insert(name, picked.clone());
-        picked
+        interceptors.insert(name, interceptor.clone());
+        interceptor
     }
 
     /// Removes the clusters whose last `ClusterRef` was dropped. Returns
@@ -263,7 +266,7 @@ impl XdsResolver {
             .map(Some);
         // The channel falls back to its default config selector for updates
         // without one, so every update must carry the current selector.
-        let update = set_in_resolver_update(config_selector.clone(), update);
+        let update = update.with_config_selector(config_selector.clone());
         // The result is ignored: the channel applies the update, including its
         // config selector, even if the LB policy rejects it, and LB policies
         // request re-resolution themselves, which calls `resolve_now`.
@@ -352,9 +355,10 @@ impl Drop for XdsResolver {
 /// A reference to a cluster that a config selector or an RPC may route to.
 /// While any `ClusterRef` for a cluster is alive, the cluster stays in the
 /// resolver's service config and the dependency manager stays subscribed to
-/// it. Config selectors hold refs through their routes' `PickedCluster`s, and
-/// each RPC holds one through the `PickedCluster` the selector stores in its
-/// `CallOptions`, until the RPC is committed.
+/// it. Config selectors hold refs through the `ClusterInterceptor` of each
+/// cluster their routes can send RPCs to, and each RPC holds the interceptor
+/// of the cluster it was routed to until the channel's `invoke` for the RPC
+/// returns, i.e. until the RPC is committed.
 struct ClusterRef {
     name: String,
     /// Keeps the dependency manager subscribed to the cluster. Dropped, which
@@ -392,16 +396,17 @@ mod tests {
     use grpc::__unstable::client::name_resolution::ResolverBuilder;
     use grpc::__unstable::client::name_resolution::Target;
     use grpc::__unstable::client::name_resolution::config_selector::ConfigSelector;
+    use grpc::__unstable::client::name_resolution::config_selector::RpcConfig;
     use grpc::__unstable::client::name_resolution::config_selector::SelectConfigOptions;
     use grpc::__unstable::client::service_config::ParseResult;
     use grpc::__unstable::rt::TaskHandle;
     use grpc::attributes::Attributes;
-    use grpc::client::CallOptions;
     use grpc::client::RequestHeaders;
     use serde_json::json;
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::resolver::config_selector::test_utils::route_rpc;
     use crate::resource::DomainMatcher;
     use crate::resource::ListenerResource;
     use crate::resource::PathSpecifier;
@@ -733,15 +738,23 @@ mod tests {
             .expect("resolver should have a config selector")
     }
 
-    /// Runs `selector` for an RPC and returns the RPC's call options. Panics
-    /// if the selector fails the RPC.
-    fn select(selector: &XdsConfigSelector) -> CallOptions {
+    /// Starts an RPC on `selector` and returns its config. Like a channel
+    /// holds it until the RPC's `invoke` returns, holding the config keeps the
+    /// cluster the RPC was routed to. Panics if the selector fails the RPC.
+    fn start_rpc(selector: &XdsConfigSelector) -> RpcConfig {
         let headers = RequestHeaders::new().with_method_name("/pkg.Service/Method");
-        let mut call_options = CallOptions::new();
         selector
-            .select_config(SelectConfigOptions::new(&headers, &mut call_options))
-            .expect("selector should pick a cluster");
-        call_options
+            .select_config(SelectConfigOptions::new(&headers))
+            .expect("selector should pick a cluster")
+    }
+
+    /// Returns the cluster manager child that `selector` routes an RPC to.
+    /// Panics if the selector fails the RPC.
+    async fn picked_child(selector: &XdsConfigSelector) -> String {
+        let headers = RequestHeaders::new().with_method_name("/pkg.Service/Method");
+        route_rpc(selector, headers)
+            .await
+            .expect("selector should pick a cluster")
     }
 
     /// Returns how many times work was scheduled since the last call.
@@ -840,14 +853,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rpc_keeps_cluster_until_committed() {
+    #[tokio::test]
+    async fn rpc_keeps_cluster_until_committed() {
         let (mut resolver, mut work_rx) = test_resolver();
         let old_selector = selector_for_clusters(&mut resolver, &["b"]);
         resolver.current_config_selector = Some(selector_for_clusters(&mut resolver, &["a"]));
         // An RPC routed to "b" by the old selector that isn't committed yet.
-        let rpc_options = select(&old_selector);
-        assert_eq!(picked_child_name(&rpc_options), Some("cluster:b"));
+        assert_eq!(picked_child(&old_selector).await, "cluster:b");
+        let rpc = start_rpc(&old_selector);
 
         drop(old_selector);
         assert_eq!(scheduled_work(&mut work_rx), 0);
@@ -857,8 +870,8 @@ mod tests {
         assert_eq!(subscriptions(&resolver), counts(&[("a", 1), ("b", 1)]));
         assert_eq!(controller.updates, 0);
 
-        // The channel drops the RPC's call options once it's committed.
-        drop(rpc_options);
+        // The channel drops the RPC's config once the RPC is committed.
+        drop(rpc);
         assert_eq!(scheduled_work(&mut work_rx), 1);
         assert_eq!(subscriptions(&resolver), counts(&[("a", 1)]));
         resolver.work(&mut controller);
@@ -949,8 +962,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn new_config_selector_uses_cluster_weights() {
+    #[tokio::test]
+    async fn new_config_selector_uses_cluster_weights() {
         let (mut resolver, _work_rx) = test_resolver();
         resolver.wrr_builder = wrr_builder(&[0, 1, 3]);
         let config = xds_config_with_routes(vec![RouteAction::WeightedClusters(vec![
@@ -965,15 +978,16 @@ mod tests {
         ])]);
         let selector = resolver.new_config_selector(&config);
 
-        let picks: Vec<String> = (0..3)
-            .map(|_| picked_child_name(&select(&selector)).unwrap().to_string())
-            .collect();
+        let mut picks = Vec::new();
+        for _ in 0..3 {
+            picks.push(picked_child(&selector).await);
+        }
 
         assert_eq!(picks, ["cluster:b", "cluster:c", "cluster:c"]);
     }
 
-    #[test]
-    fn xds_config_sends_selector_and_service_config() {
+    #[tokio::test]
+    async fn xds_config_sends_selector_and_service_config() {
         let (mut resolver, _work_rx) = test_resolver();
         let mut controller = FakeChannelController::default();
         let config = xds_config_with_routes(vec![
@@ -1006,8 +1020,7 @@ mod tests {
         assert_eq!(update.endpoints, Ok(Vec::new()));
         assert_eq!(update.resolution_note, None);
         // The first route matches every RPC.
-        let rpc = select(current_selector(&resolver));
-        assert_eq!(picked_child_name(&rpc), Some("cluster:a"));
+        assert_eq!(picked_child(current_selector(&resolver)).await, "cluster:a");
     }
 
     #[test]
@@ -1070,7 +1083,7 @@ mod tests {
             &mut controller,
             Ok(config_for_clusters(&["a"])),
         );
-        let rpc = select(current_selector(&resolver));
+        let rpc = start_rpc(current_selector(&resolver));
 
         apply_result(
             &mut resolver,
@@ -1087,7 +1100,7 @@ mod tests {
         resolver.work(&mut controller);
         assert_eq!(controller.updates, 2);
 
-        // The channel drops the RPC's call options once it's committed.
+        // The channel drops the RPC's config once the RPC is committed.
         drop(rpc);
         assert_eq!(scheduled_work(&mut work_rx), 1);
         resolver.work(&mut controller);
@@ -1097,6 +1110,44 @@ mod tests {
             Some(&expected_service_config(&["b"]))
         );
         assert_eq!(subscriptions(&resolver), counts(&[("b", 1)]));
+    }
+
+    #[test]
+    fn rpc_keeps_only_its_cluster_across_config_update() {
+        let (mut resolver, mut work_rx) = test_resolver();
+        let mut controller = FakeChannelController::default();
+        apply_result(
+            &mut resolver,
+            &mut controller,
+            Ok(config_for_clusters(&["a", "b"])),
+        );
+        // Routed to "a", the first route's cluster.
+        let rpc = start_rpc(current_selector(&resolver));
+
+        apply_result(
+            &mut resolver,
+            &mut controller,
+            Ok(config_for_clusters(&["c"])),
+        );
+
+        // Replacing the old selector released "b", but the RPC still holds
+        // "a".
+        assert_eq!(scheduled_work(&mut work_rx), 1);
+        assert_eq!(subscriptions(&resolver), counts(&[("a", 1), ("c", 1)]));
+        resolver.work(&mut controller);
+        assert_eq!(
+            controller.service_configs().last(),
+            Some(&expected_service_config(&["a", "c"]))
+        );
+
+        drop(rpc);
+        assert_eq!(scheduled_work(&mut work_rx), 1);
+        resolver.work(&mut controller);
+        assert_eq!(
+            controller.service_configs().last(),
+            Some(&expected_service_config(&["c"]))
+        );
+        assert_eq!(subscriptions(&resolver), counts(&[("c", 1)]));
     }
 
     #[test]
@@ -1154,7 +1205,7 @@ mod tests {
             &mut controller,
             Ok(config_for_clusters(&["a"])),
         );
-        let rpc = select(current_selector(&resolver));
+        let rpc = start_rpc(current_selector(&resolver));
         apply_result(&mut resolver, &mut controller, Err("boom".to_string()));
         assert_eq!(subscriptions(&resolver), counts(&[("a", 1)]));
 
@@ -1167,8 +1218,8 @@ mod tests {
         assert_eq!(controller.updates, 2);
     }
 
-    #[test]
-    fn config_after_error_restores_routing() {
+    #[tokio::test]
+    async fn config_after_error_restores_routing() {
         let (mut resolver, _work_rx) = test_resolver();
         let mut controller = FakeChannelController::default();
         apply_result(
@@ -1192,8 +1243,7 @@ mod tests {
         let update = controller.last_update.as_ref().unwrap();
         assert_ne!(update.attributes, Attributes::new());
         assert_eq!(update.resolution_note, None);
-        let rpc = select(current_selector(&resolver));
-        assert_eq!(picked_child_name(&rpc), Some("cluster:b"));
+        assert_eq!(picked_child(current_selector(&resolver)).await, "cluster:b");
     }
 
     #[test]

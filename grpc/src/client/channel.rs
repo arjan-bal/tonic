@@ -65,7 +65,6 @@ use crate::client::load_balancing::{self};
 use crate::client::name_resolution::ResolverBuilder;
 use crate::client::name_resolution::ResolverUpdate;
 use crate::client::name_resolution::Target;
-use crate::client::name_resolution::config_selector;
 use crate::client::name_resolution::config_selector::ConfigSelector;
 use crate::client::name_resolution::config_selector::DefaultConfigSelector;
 use crate::client::name_resolution::config_selector::RpcConfig;
@@ -141,11 +140,26 @@ impl Channel {
         target: impl Into<String>,
         credentials: Arc<dyn ChannelCredentials>,
     ) -> ChannelBuilder {
+        Self::builder_with_runtime(target, credentials, default_runtime())
+    }
+
+    /// Creates a new channel builder for the given target, credentials, and
+    /// runtime.
+    ///
+    /// Always available. When the `_runtime-tokio` feature is enabled,
+    /// [`builder()`](Channel::builder) can be used instead to use the default
+    /// Tokio runtime.
+    #[doc(hidden)]
+    pub fn builder_with_runtime(
+        target: impl Into<String>,
+        credentials: Arc<dyn ChannelCredentials>,
+        runtime: GrpcRuntime,
+    ) -> ChannelBuilder {
         ChannelBuilder {
             target: target.into(),
             credentials,
             authority: None,
-            runtime: default_runtime(),
+            runtime,
         }
     }
 
@@ -177,7 +191,19 @@ impl Invoke for Channel {
         options: CallOptions,
     ) -> (Self::SendStream, Self::RecvStream) {
         let ac = self.inner.get_active_channel();
-        ac.invoke(headers, options).await
+        let selected = ac
+            .config_selector
+            .select_config(SelectConfigOptions::new(&headers))
+            .await;
+        let config = match selected {
+            Ok(config) => config,
+            Err(status) => return FailingRecvStream::new_stream_pair(status, None),
+        };
+        match config.interceptor {
+            Some(interceptor) => interceptor.dyn_intercept(headers, options, ac).await,
+            // Avoid heap allocations and dynamic dispatch.
+            None => ac.invoke(headers, options).await,
+        }
     }
 }
 
@@ -365,24 +391,17 @@ impl ActiveChannel {
     fn connectivity_state(&self) -> ConnectivityState {
         self.lb_watcher.snapshot().value().connectivity_state
     }
-}
 
-impl Invoke for Arc<ActiveChannel> {
-    type SendStream = Box<dyn DynSendStream>;
-    type RecvStream = Box<dyn DynRecvStream>;
-
+    /// Starts an RPC on a subchannel picked by the current LB picker, waiting
+    /// for a new picker while picks are queued.
+    ///
+    /// Unlike [`DynInvoke::dyn_invoke`], this doesn't box the returned future,
+    /// so callers that don't need dynamic dispatch avoid an allocation.
     async fn invoke(
         &self,
         headers: RequestHeaders,
-        mut options: CallOptions,
-    ) -> (Self::SendStream, Self::RecvStream) {
-        let config = self
-            .config_selector
-            .select_config(SelectConfigOptions::new(&headers, &mut options))
-            .await;
-        if let Err(status) = config {
-            return FailingRecvStream::new_stream_pair(status, None);
-        }
+        options: CallOptions,
+    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
         // Fast path: snapshot the latest LB state without locking and pick
         // with its picker.
         let mut snapshot = self.lb_watcher.snapshot();
@@ -413,6 +432,17 @@ impl Invoke for Arc<ActiveChannel> {
             // pick with the newest state.
             snapshot = snapshot.next().await;
         }
+    }
+}
+
+#[crate::async_trait]
+impl DynInvoke for ActiveChannel {
+    async fn dyn_invoke(
+        &self,
+        headers: RequestHeaders,
+        options: CallOptions,
+    ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
+        self.invoke(headers, options).await
     }
 }
 
@@ -474,13 +504,13 @@ impl ResolverChannelController {
 }
 
 impl name_resolution::ChannelController for ResolverChannelController {
-    fn update(&mut self, update: ResolverUpdate) -> Result<(), String> {
+    fn update(&mut self, mut update: ResolverUpdate) -> Result<(), String> {
         let (builder, config) = match update.service_config.as_ref() {
             Ok(Some(sc)) => sc.lb_config(),
             _ => ServiceConfig::default_lb_policy(),
         };
 
-        let (cfg_selector, update) = config_selector::from_resolver_update(update);
+        let cfg_selector = update.take_config_selector();
 
         let gsb_config = GracefulSwitchLbConfig::new(builder, config);
 
