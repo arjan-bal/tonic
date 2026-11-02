@@ -93,6 +93,10 @@ pub use client::watch::{ProcessingDone, ResourceEvent, ResourceWatcher};
 pub use client::{XdsClient, XdsClientBuilder};
 pub use codec::XdsCodec;
 pub use error::{Error, Result};
+pub use lrs::{
+    BackendMetricPropagation, BackendMetrics, CallOutcome, CallTracker, ClusterLevelStats,
+    ClusterLocalityStats, LoadStore,
+};
 pub use message::{DiscoveryRequest, DiscoveryResponse, ErrorDetail, Locality, Node, ResourceAny};
 pub use metrics::{Instrument, InstrumentKind, KeyValue, MetricsRecorder, StringValue, Value};
 

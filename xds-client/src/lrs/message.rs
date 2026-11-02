@@ -30,25 +30,116 @@
 
 use std::time::Duration;
 
+use crate::message::Locality;
 use crate::message::Node;
 
 /// A load stats request to send to the LRS server.
 ///
 /// This struct borrows data to avoid unnecessary allocations when encoding.
 /// The data only needs to live long enough for the codec to encode it.
-// TODO: add `cluster_stats` once load reporting is implemented.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct LoadStatsRequest<'a> {
     /// The node reporting load.
     pub node: &'a Node,
+    /// Load reports. Empty for the initial request.
+    pub cluster_stats: &'a [ClusterStats],
 }
 
 impl<'a> LoadStatsRequest<'a> {
-    /// Create a new load stats request for the given node.
+    /// Create a new load stats request for the given node, without load
+    /// reports.
     pub fn new(node: &'a Node) -> Self {
-        Self { node }
+        Self {
+            node,
+            cluster_stats: &[],
+        }
     }
+
+    /// Set the load reports to send.
+    pub fn with_cluster_stats(mut self, cluster_stats: &'a [ClusterStats]) -> Self {
+        self.cluster_stats = cluster_stats;
+        self
+    }
+}
+
+/// Load stats for one (cluster, EDS service) over one reporting interval.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct ClusterStats {
+    /// Name of the cluster.
+    pub cluster_name: String,
+    /// EDS service name of the cluster, or empty if it has none. Encoded as
+    /// `cluster_service_name`.
+    pub eds_service_name: String,
+    /// Stats for each locality that had calls in the interval.
+    pub upstream_locality_stats: Vec<UpstreamLocalityStats>,
+    /// Number of calls dropped by the client, including drops without a
+    /// category.
+    pub total_dropped_requests: u64,
+    /// Number of calls dropped for each drop category.
+    pub dropped_requests: Vec<DroppedRequests>,
+    /// Time covered by this report.
+    pub load_report_interval: Duration,
+}
+
+/// Load stats for the calls sent to one locality.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct UpstreamLocalityStats {
+    /// The locality the calls were sent to.
+    pub locality: Locality,
+    /// Calls that finished successfully in the interval.
+    pub total_successful_requests: u64,
+    /// Calls in progress at the time of the report.
+    pub total_requests_in_progress: u64,
+    /// Calls that failed in the interval.
+    pub total_error_requests: u64,
+    /// Calls started in the interval.
+    pub total_issued_requests: u64,
+    /// CPU utilization reported by endpoints in the interval, if propagated.
+    pub cpu_utilization: Option<UnnamedEndpointLoadMetricStats>,
+    /// Memory utilization reported by endpoints in the interval, if propagated.
+    pub mem_utilization: Option<UnnamedEndpointLoadMetricStats>,
+    /// Application utilization reported by endpoints in the interval, if
+    /// propagated.
+    pub application_utilization: Option<UnnamedEndpointLoadMetricStats>,
+    /// Named backend metrics reported by endpoints in the interval, named
+    /// `named_metrics.<key>`.
+    pub load_metric_stats: Vec<EndpointLoadMetricStats>,
+}
+
+/// A backend metric reported in a top-level field of [`UpstreamLocalityStats`],
+/// aggregated over the calls that reported it.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct UnnamedEndpointLoadMetricStats {
+    /// Number of calls that finished with this metric.
+    pub num_requests_finished_with_metric: u64,
+    /// Sum of the metric's values over those calls.
+    pub total_metric_value: f64,
+}
+
+/// A named backend metric, aggregated over the calls that reported it.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct EndpointLoadMetricStats {
+    /// Name of the metric.
+    pub metric_name: String,
+    /// Number of calls that finished with this metric.
+    pub num_requests_finished_with_metric: u64,
+    /// Sum of the metric's values over those calls.
+    pub total_metric_value: f64,
+}
+
+/// Number of calls dropped for one drop category.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct DroppedRequests {
+    /// The drop category, from the EDS `drop_overloads`.
+    pub category: String,
+    /// Number of calls dropped for this category.
+    pub dropped_count: u64,
 }
 
 /// A load stats response from the LRS server.

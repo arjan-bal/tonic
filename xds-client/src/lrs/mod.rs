@@ -22,18 +22,29 @@
  *
  */
 
-//! Load Reporting Service Client]
-//! (https://www.envoyproxy.io/docs/envoy/latest/api-v3/service/load_stats/v3/lrs.proto)
+//! [Load Reporting Service](https://www.envoyproxy.io/docs/envoy/latest/api-v3/service/load_stats/v3/lrs.proto)
+//! client.
 
 use bytes::Bytes;
 
 use crate::error::Result;
-use crate::lrs::message::{LoadStatsRequest, LoadStatsResponse};
+use crate::lrs::message::LoadStatsRequest;
+use crate::lrs::message::LoadStatsResponse;
 use crate::message::Node;
 use crate::runtime::Runtime;
 use crate::transport::TransportBuilder;
 
+pub mod backend_metrics;
+pub mod load_store;
 pub mod message;
+
+pub use backend_metrics::BackendMetricPropagation;
+pub use backend_metrics::BackendMetrics;
+pub use load_store::CallOutcome;
+pub use load_store::CallTracker;
+pub use load_store::ClusterLevelStats;
+pub use load_store::ClusterLocalityStats;
+pub use load_store::LoadStore;
 
 /// Trait for encoding/decoding LRS (Load Reporting Service) messages.
 ///
