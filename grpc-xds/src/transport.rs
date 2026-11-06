@@ -27,18 +27,16 @@
 //! This transport uses the `grpc` crate's [`Channel`] and low-level streams
 //! to send and receive raw bytes.
 
-// TODO: remove once XdsClient is wired up in grpc-xds.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use bytes::Buf;
 use bytes::Bytes;
+use grpc::__unstable::client::channel_builder_with_runtime;
 use grpc::__unstable::rt::GrpcRuntime;
 use grpc::client::CallOptions;
 use grpc::client::Channel;
-use grpc::client::DynRecvStream;
-use grpc::client::DynSendStream;
+use grpc::client::ChannelRecvStream;
+use grpc::client::ChannelSendStream;
 use grpc::client::Invoke as _;
 use grpc::client::RecvStream as _;
 use grpc::client::RequestHeaders;
@@ -90,7 +88,7 @@ impl TransportBuilder for GrpcTransportBuilder {
     type Transport = GrpcTransport;
 
     async fn build(&self, server: &ServerConfig) -> Result<Self::Transport> {
-        let channel = Channel::builder_with_runtime(
+        let channel = channel_builder_with_runtime(
             server.uri(),
             self.credentials.clone(),
             self.runtime.clone(),
@@ -135,7 +133,7 @@ impl Transport for GrpcTransport {
 }
 
 /// Sending half of a `GrpcTransport` stream.
-pub(crate) struct GrpcStreamSender(Box<dyn DynSendStream>);
+pub(crate) struct GrpcStreamSender(ChannelSendStream);
 
 impl std::fmt::Debug for GrpcStreamSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -155,7 +153,7 @@ impl TransportSender for GrpcStreamSender {
 }
 
 /// Receiving half of a `GrpcTransport` stream.
-pub(crate) struct GrpcStreamReceiver(Box<dyn DynRecvStream>);
+pub(crate) struct GrpcStreamReceiver(ChannelRecvStream);
 
 impl std::fmt::Debug for GrpcStreamReceiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -304,7 +302,7 @@ mod tests {
         )
         .build();
 
-        let mut watcher = client.watch::<ListenerResource>("listener-1").await;
+        let mut watcher = client.watch::<ListenerResource>("listener-1");
         let event = watcher.next().await.expect("watcher event");
         let ResourceEvent::ResourceChanged {
             result: Ok(listener),
