@@ -44,15 +44,6 @@
 //! checked *before* taking the final snapshot of the counters, so no counts
 //! are lost.
 
-// The report side is used only by tests until the LRS worker is added.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the report side is used by the LRS worker, added in a follow-up"
-    )
-)]
-
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -75,6 +66,7 @@ use crate::lrs::message::DroppedRequests;
 use crate::lrs::message::EndpointLoadMetricStats;
 use crate::lrs::message::UnnamedEndpointLoadMetricStats;
 use crate::lrs::message::UpstreamLocalityStats;
+use crate::lrs::worker::WorkerHandle;
 use crate::message::Locality;
 
 /// Locks `mutex`, ignoring poisoning: the data protected by the mutexes in
@@ -86,35 +78,64 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Creates recorders for loads reported to one LRS server.
 ///
-/// Cheap to clone. Getting a recorder briefly locks a registry shared with the
-/// LRS worker. Recording call counts and uncategorized drops is lock-free;
+/// Cheap to clone. Reporting to the server continues while any `LoadStore`
+/// for it, or any recorder or [`CallTracker`] created from one, exists, so
+/// that calls in progress when the last `LoadStore` is dropped are still
+/// reported. Getting a recorder briefly locks a registry shared with the LRS
+/// worker. Recording call counts and uncategorized drops is lock-free;
 /// categorized drops and backend metrics take a short per-recorder lock.
-/// Recorders created after the LRS client has shut down still work, but their
-/// loads are never reported.
-#[derive(Clone, Debug)]
+/// Recorders still work after reporting has stopped, but their loads are never
+/// reported.
+#[derive(Clone)]
 pub struct LoadStore {
-    registry: Weak<Mutex<Registry>>,
+    inner: Arc<LoadStoreInner>,
+}
+
+impl fmt::Debug for LoadStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoadStore").finish_non_exhaustive()
+    }
+}
+
+/// State shared by all the clones of a [`LoadStore`].
+pub(super) struct LoadStoreInner {
+    /// Shared with the worker's `LoadReporter`. The worker outlives every
+    /// `LoadStoreInner` (see `_worker`), so this keeps the registry alive
+    /// only if the worker task ends abnormally, e.g. panics.
+    registry: Arc<Mutex<Registry>>,
+    /// Keeps the LRS worker for the server running: it holds the only strong
+    /// sender of the worker's queue, so dropping the last reference to this
+    /// `LoadStoreInner` closes the queue and stops the worker.
+    _worker: WorkerHandle,
 }
 
 impl LoadStore {
+    /// Returns a reference to this store that doesn't keep it, or the
+    /// worker, alive.
+    pub(super) fn downgrade(&self) -> Weak<LoadStoreInner> {
+        Arc::downgrade(&self.inner)
+    }
+
+    /// Returns the store referenced by `weak`, if it's still alive.
+    pub(super) fn upgrade(weak: &Weak<LoadStoreInner>) -> Option<Self> {
+        weak.upgrade().map(|inner| Self { inner })
+    }
+
     /// Returns a recorder for cluster-level stats, such as dropped calls.
     pub fn cluster_level_stats(
         &self,
         cluster_name: &str,
         eds_service_name: &str,
     ) -> ClusterLevelStats {
-        let counters = match self.registry.upgrade() {
-            Some(registry) => {
-                let mut registry = lock(&registry);
-                registry
-                    .entry(cluster_name, eds_service_name)
-                    .cluster_level
-                    .get_or_insert_with(Arc::default)
-                    .clone()
-            }
-            None => Arc::default(),
-        };
-        ClusterLevelStats { counters }
+        let counters = lock(&self.inner.registry)
+            .entry(cluster_name, eds_service_name)
+            .cluster_level
+            .get_or_insert_with(Arc::default)
+            .clone();
+        ClusterLevelStats {
+            counters,
+            _store: self.inner.clone(),
+        }
     }
 
     /// Returns a recorder for calls sent to endpoints in `locality`.
@@ -130,33 +151,40 @@ impl LoadStore {
         locality: &Locality,
         propagation: Arc<BackendMetricPropagation>,
     ) -> ClusterLocalityStats {
-        let counters = match self.registry.upgrade() {
-            Some(registry) => {
-                let mut registry = lock(&registry);
-                let localities = &mut registry.entry(cluster_name, eds_service_name).localities;
-                // Look up before inserting, to clone the locality only when
-                // creating new counters.
-                match localities.get(locality) {
-                    Some(counters) => counters.clone(),
-                    None => localities.entry(locality.clone()).or_default().clone(),
-                }
+        let counters = {
+            let mut registry = lock(&self.inner.registry);
+            let localities = &mut registry.entry(cluster_name, eds_service_name).localities;
+            // Look up before inserting, to clone the locality only when
+            // creating new counters.
+            match localities.get(locality) {
+                Some(counters) => counters.clone(),
+                None => localities.entry(locality.clone()).or_default().clone(),
             }
-            None => Arc::default(),
         };
         ClusterLocalityStats {
             recorder: Arc::new(LocalityRecorder {
                 counters,
                 propagation,
+                _store: self.inner.clone(),
             }),
         }
     }
 }
 
 /// Records stats for one (cluster, EDS service) that aren't specific to a
-/// locality. Cheap to clone.
-#[derive(Clone, Debug)]
+/// locality. Cheap to clone. Keeps reporting to its server running.
+#[derive(Clone)]
 pub struct ClusterLevelStats {
     counters: Arc<ClusterLevelCounters>,
+    /// Keeps reporting running, so that drops recorded after the last
+    /// `LoadStore` was dropped are still reported.
+    _store: Arc<LoadStoreInner>,
+}
+
+impl fmt::Debug for ClusterLevelStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClusterLevelStats").finish_non_exhaustive()
+    }
 }
 
 impl ClusterLevelStats {
@@ -178,9 +206,17 @@ impl ClusterLevelStats {
 }
 
 /// Records calls for one (cluster, EDS service, locality). Cheap to clone.
-#[derive(Clone, Debug)]
+/// It and its call trackers keep reporting to its server running.
+#[derive(Clone)]
 pub struct ClusterLocalityStats {
     recorder: Arc<LocalityRecorder>,
+}
+
+impl fmt::Debug for ClusterLocalityStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClusterLocalityStats")
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClusterLocalityStats {
@@ -197,10 +233,12 @@ impl ClusterLocalityStats {
 
 /// A locality's counters, and the propagation config of the `locality_stats`
 /// call that returned them. Shared by a recorder's clones and call trackers.
-#[derive(Debug)]
 struct LocalityRecorder {
     counters: Arc<LocalityCounters>,
     propagation: Arc<BackendMetricPropagation>,
+    /// Keeps reporting running, so that calls finishing after the last
+    /// `LoadStore` was dropped are still reported.
+    _store: Arc<LoadStoreInner>,
 }
 
 /// Tracks one call started on a [`ClusterLocalityStats`].
@@ -210,11 +248,16 @@ struct LocalityRecorder {
 /// [`finish_with_metrics`](Self::finish_with_metrics), for example because the
 /// call's future was cancelled, the call is recorded as failed, so the
 /// in-progress count never leaks.
-#[derive(Debug)]
 #[must_use = "dropping the tracker immediately records the call as failed"]
 pub struct CallTracker {
     /// Set until the end of the call is recorded.
     recorder: Option<Arc<LocalityRecorder>>,
+}
+
+impl fmt::Debug for CallTracker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CallTracker").finish_non_exhaustive()
+    }
 }
 
 impl CallTracker {
@@ -239,14 +282,13 @@ impl CallTracker {
         let Some(recorder) = self.recorder.take() else {
             return;
         };
-        // Record the end of the call first, so that it's recorded even if
-        // iterating the named metrics panics.
         recorder.counters.record_finish(outcome);
         let propagation = &*recorder.propagation;
         if !propagation.propagates_any() {
             return;
         }
-        let mut sums = lock(&recorder.counters.backend_metrics);
+        let backend_metrics = &recorder.counters.backend_metrics;
+        let mut sums = lock(backend_metrics);
         if propagation.propagates_cpu_utilization() {
             sums.cpu_utilization.add(metrics.cpu_utilization);
         }
@@ -301,7 +343,7 @@ pub enum CallOutcome {
 }
 
 /// Counters of a [`ClusterLevelStats`].
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct ClusterLevelCounters {
     uncategorized_drops: AtomicU64,
     /// Locked only by `record_drop` and snapshots.
@@ -330,7 +372,7 @@ impl ClusterLevelCounters {
 }
 
 /// Counters of a [`ClusterLocalityStats`].
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct LocalityCounters {
     issued: AtomicU64,
     /// A gauge: not reset by snapshots.
@@ -377,7 +419,7 @@ impl LocalityCounters {
 }
 
 /// Backend metrics recorded for a locality since the previous snapshot.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct BackendMetricSums {
     cpu_utilization: MetricSum,
     mem_utilization: MetricSum,
@@ -434,7 +476,7 @@ impl BackendMetricsSnapshot {
 }
 
 /// Number and sum of the values reported for a backend metric.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct MetricSum {
     count: u64,
     total: f64,
@@ -466,14 +508,6 @@ struct Registry {
     clock: Clock,
 }
 
-impl fmt::Debug for Registry {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Registry")
-            .field("clusters", &self.clusters)
-            .finish_non_exhaustive()
-    }
-}
-
 impl Registry {
     /// Returns the entry for the given cluster, creating it if needed.
     fn entry(&mut self, cluster_name: &str, eds_service_name: &str) -> &mut ClusterEntry {
@@ -488,12 +522,8 @@ impl Registry {
     }
 
     /// See [`LoadReporter::snapshot`].
-    fn snapshot(&mut self, selection: ClusterSelection<'_>) -> Vec<ClusterStats> {
+    fn snapshot(&mut self, selection: &ClusterSelection) -> Vec<ClusterStats> {
         let now = (self.clock)();
-        let selected: Option<HashSet<&str>> = match selection {
-            ClusterSelection::All => None,
-            ClusterSelection::Only(names) => Some(names.iter().map(String::as_str).collect()),
-        };
         let mut reports = Vec::new();
         self.clusters.retain(|key, entry| {
             // Take the interval, and reset it, before pruning, and even if
@@ -501,9 +531,10 @@ impl Registry {
             let interval = now.saturating_duration_since(entry.last_report_at);
             entry.last_report_at = now;
             let stats = entry.snapshot_and_prune(key, interval);
-            let is_selected = selected
-                .as_ref()
-                .is_none_or(|names| names.contains(key.cluster_name.as_str()));
+            let is_selected = match selection {
+                ClusterSelection::All => true,
+                ClusterSelection::Only(names) => names.contains(&key.cluster_name),
+            };
             if let Some(stats) = stats.filter(|_| is_selected) {
                 reports.push(stats);
             }
@@ -513,13 +544,12 @@ impl Registry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct ClusterKey {
     cluster_name: String,
     eds_service_name: String,
 }
 
-#[derive(Debug)]
 struct ClusterEntry {
     cluster_level: Option<Arc<ClusterLevelCounters>>,
     localities: HashMap<Locality, Arc<LocalityCounters>>,
@@ -584,42 +614,39 @@ impl ClusterEntry {
 /// Builds load reports for one LRS server.
 ///
 /// Owned by that server's LRS worker task, for as long as the worker runs,
-/// across streams. The registry of counters lives as long as this does.
-#[derive(Debug)]
+/// across streams. Shares the registry of counters with the server's
+/// `LoadStore`s.
 pub(super) struct LoadReporter {
     registry: Arc<Mutex<Registry>>,
 }
 
 /// Which clusters a report covers, from the LRS server's response.
-#[derive(Debug, Clone, Copy)]
-pub(super) enum ClusterSelection<'a> {
+pub(super) enum ClusterSelection {
     /// `send_all_clusters` was set.
     All,
     /// Only the clusters with these names, with any EDS service name.
-    Only(&'a [String]),
+    Only(HashSet<String>),
 }
 
 impl LoadReporter {
-    /// Creates a reporter measuring time with [`Instant::now`].
-    pub(super) fn new() -> Self {
-        Self::with_clock(Arc::new(Instant::now))
-    }
-
-    /// Creates a reporter measuring time with `clock`.
-    pub(super) fn with_clock(clock: Clock) -> Self {
-        Self {
-            registry: Arc::new(Mutex::new(Registry {
-                clusters: HashMap::new(),
-                clock,
-            })),
-        }
-    }
-
-    /// Returns a handle for creating recorders in this reporter's registry.
-    pub(super) fn load_store(&self) -> LoadStore {
-        LoadStore {
-            registry: Arc::downgrade(&self.registry),
-        }
+    /// Creates a reporter measuring time with `clock`, and the `LoadStore` for
+    /// its registry, which keeps `worker` running.
+    ///
+    /// This is the only `LoadStore` created for the registry; the others are
+    /// its clones. So there is a single `LoadStoreInner`, holding the only
+    /// `WorkerHandle`, whose lifetime is the worker's.
+    pub(super) fn new(clock: Clock, worker: WorkerHandle) -> (Self, LoadStore) {
+        let registry = Arc::new(Mutex::new(Registry {
+            clusters: HashMap::new(),
+            clock,
+        }));
+        let load_store = LoadStore {
+            inner: Arc::new(LoadStoreInner {
+                registry: registry.clone(),
+                _worker: worker,
+            }),
+        };
+        (Self { registry }, load_store)
     }
 
     /// Snapshots, resets and prunes every entry, and returns the stats of the
@@ -628,7 +655,7 @@ impl LoadReporter {
     /// The stats of unselected clusters are discarded, so that if the LRS
     /// server asks for them later, their first report doesn't include loads
     /// from previous intervals.
-    pub(super) fn snapshot(&mut self, selection: ClusterSelection<'_>) -> Vec<ClusterStats> {
+    pub(super) fn snapshot(&mut self, selection: &ClusterSelection) -> Vec<ClusterStats> {
         lock(&self.registry).snapshot(selection)
     }
 }
@@ -660,8 +687,7 @@ mod tests {
 
     fn new_reporter() -> (LoadReporter, LoadStore, FakeClock) {
         let clock = FakeClock::new();
-        let reporter = LoadReporter::with_clock(clock.clock());
-        let store = reporter.load_store();
+        let (reporter, store) = LoadReporter::new(clock.clock(), WorkerHandle::detached());
         (reporter, store, clock)
     }
 
@@ -701,6 +727,10 @@ mod tests {
         Arc::default()
     }
 
+    fn only(cluster_names: &[&str]) -> ClusterSelection {
+        ClusterSelection::Only(cluster_names.iter().map(|&name| name.to_owned()).collect())
+    }
+
     fn propagation(specs: &[&str]) -> Arc<BackendMetricPropagation> {
         Arc::new(BackendMetricPropagation::from_metric_specs(specs))
     }
@@ -729,7 +759,7 @@ mod tests {
         clone.start_call().finish(CallOutcome::Failed);
         let in_flight = stats.start_call();
 
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         assert_eq!(reports.len(), 1);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.total_issued_requests, 3);
@@ -738,13 +768,13 @@ mod tests {
         assert_eq!(got.total_requests_in_progress, 1);
 
         // The in-progress count isn't reset, so it's reported again.
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.total_issued_requests, 0);
         assert_eq!(got.total_requests_in_progress, 1);
 
         in_flight.finish(CallOutcome::Succeeded);
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.total_successful_requests, 1);
         assert_eq!(got.total_requests_in_progress, 0);
@@ -756,7 +786,7 @@ mod tests {
         let stats = store.locality_stats("cluster", "eds", &locality("r1"), no_propagation());
         drop(stats.start_call());
 
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.total_issued_requests, 1);
         assert_eq!(got.total_error_requests, 1);
@@ -780,39 +810,13 @@ mod tests {
                 .with_named_metrics(named_metrics),
         );
 
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.total_successful_requests, 1);
         assert_eq!(got.cpu_utilization, None);
         assert_eq!(got.mem_utilization, None);
         assert_eq!(got.application_utilization, None);
         assert!(got.load_metric_stats.is_empty());
-    }
-
-    #[test]
-    fn records_call_end_if_named_metrics_panic() {
-        let (mut reporter, store, _) = new_reporter();
-        let stats = store.locality_stats(
-            "cluster",
-            "eds",
-            &locality("r1"),
-            propagation(&["named_metrics.*"]),
-        );
-        let tracker = stats.start_call();
-        let named_metrics = std::iter::from_fn(|| -> Option<(&str, f64)> { panic!("bad metrics") });
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tracker.finish_with_metrics(
-                CallOutcome::Succeeded,
-                BackendMetrics::new().with_named_metrics(named_metrics),
-            );
-        }));
-        assert!(result.is_err());
-
-        // The call isn't left in progress, and the poisoned lock is recovered.
-        let reports = reporter.snapshot(ClusterSelection::All);
-        let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
-        assert_eq!(got.total_successful_requests, 1);
-        assert_eq!(got.total_requests_in_progress, 0);
     }
 
     #[test]
@@ -837,7 +841,7 @@ mod tests {
             .start_call()
             .finish_with_metrics(CallOutcome::Failed, BackendMetrics::new());
 
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.cpu_utilization, unnamed(2, 0.5));
         assert_eq!(got.mem_utilization, None);
@@ -846,7 +850,7 @@ mod tests {
 
         // Metrics are reset by snapshots.
         stats.start_call().finish(CallOutcome::Succeeded);
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.cpu_utilization, None);
         assert_eq!(got.application_utilization, None);
@@ -880,7 +884,7 @@ mod tests {
             );
         }
 
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         let got = cluster(&reports, "cluster", "eds");
         let got_some = locality_stats(got, "some");
         assert_eq!(
@@ -934,7 +938,7 @@ mod tests {
                 .with_named_metrics(hash_map.iter().map(|(k, v)| (k.as_str(), *v))),
         );
 
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(
             got.load_metric_stats,
@@ -968,7 +972,7 @@ mod tests {
 
         // Both recorders share counters, but each recorded only what its
         // config allows.
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         let got = cluster(&reports, "cluster", "eds");
         assert_eq!(got.upstream_locality_stats.len(), 1);
         let got = locality_stats(got, "r1");
@@ -1003,10 +1007,10 @@ mod tests {
 
         // A key recorded since the previous snapshot is kept, but reset.
         record_a();
-        reporter.snapshot(ClusterSelection::All);
+        reporter.snapshot(&ClusterSelection::All);
         assert!(has_key("a"));
         record_a();
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(
             got.load_metric_stats,
@@ -1015,7 +1019,7 @@ mod tests {
         assert!(has_key("a"));
 
         // A key not recorded since the previous snapshot is removed.
-        reporter.snapshot(ClusterSelection::All);
+        reporter.snapshot(&ClusterSelection::All);
         assert!(!has_key("a"));
     }
 
@@ -1030,7 +1034,7 @@ mod tests {
         stats.record_drop("");
         stats.record_uncategorized_drop();
 
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         let got = cluster(&reports, "cluster", "eds");
         assert_eq!(got.total_dropped_requests, 5);
         // Reports aren't in any particular order.
@@ -1056,7 +1060,7 @@ mod tests {
         assert!(got.upstream_locality_stats.is_empty());
 
         // Drops are reset by snapshots.
-        assert!(reporter.snapshot(ClusterSelection::All).is_empty());
+        assert!(reporter.snapshot(&ClusterSelection::All).is_empty());
     }
 
     #[test]
@@ -1073,7 +1077,7 @@ mod tests {
         d1.record_uncategorized_drop();
         d2.record_uncategorized_drop();
 
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         assert_eq!(reports.len(), 1);
         let got = cluster(&reports, "cluster", "eds");
         assert_eq!(got.upstream_locality_stats.len(), 2);
@@ -1094,12 +1098,12 @@ mod tests {
         assert_eq!(num_entries(&reporter), 1);
 
         // The final counts are reported once, and the entry is pruned.
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         let got = cluster(&reports, "cluster", "eds");
         assert_eq!(locality_stats(got, "r1").total_successful_requests, 1);
         assert_eq!(got.total_dropped_requests, 1);
         assert_eq!(num_entries(&reporter), 0);
-        assert!(reporter.snapshot(ClusterSelection::All).is_empty());
+        assert!(reporter.snapshot(&ClusterSelection::All).is_empty());
     }
 
     #[test]
@@ -1109,13 +1113,13 @@ mod tests {
         let tracker = stats.start_call();
         drop(stats);
 
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.total_requests_in_progress, 1);
         assert_eq!(num_entries(&reporter), 1);
 
         tracker.finish(CallOutcome::Succeeded);
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.total_successful_requests, 1);
         assert_eq!(got.total_requests_in_progress, 0);
@@ -1128,22 +1132,23 @@ mod tests {
         let stats = store.locality_stats("cluster", "eds", &locality("r1"), no_propagation());
         stats.start_call().finish(CallOutcome::Succeeded);
         drop(stats);
-        reporter.snapshot(ClusterSelection::All);
+        reporter.snapshot(&ClusterSelection::All);
         assert_eq!(num_entries(&reporter), 0);
 
         let stats = store.locality_stats("cluster", "eds", &locality("r1"), no_propagation());
         stats.start_call().finish(CallOutcome::Failed);
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         let got = locality_stats(cluster(&reports, "cluster", "eds"), "r1");
         assert_eq!(got.total_issued_requests, 1);
         assert_eq!(got.total_error_requests, 1);
         assert_eq!(got.total_successful_requests, 0);
     }
 
+    /// Recorders keep working if the reporter is gone, as when the worker task
+    /// ends abnormally: the stores keep the registry alive.
     #[test]
     fn recorders_work_after_reporter_is_gone() {
-        let reporter = LoadReporter::new();
-        let store = reporter.load_store();
+        let (reporter, store, _) = new_reporter();
         let all = propagation(&["cpu_utilization", "named_metrics.*"]);
         let before = store.locality_stats("cluster", "eds", &locality("r1"), all.clone());
         drop(reporter);
@@ -1171,16 +1176,14 @@ mod tests {
             stats.start_call().finish(CallOutcome::Succeeded);
         }
 
-        let selection = ["a".to_owned()];
-        let reports = reporter.snapshot(ClusterSelection::Only(&selection));
+        let reports = reporter.snapshot(&only(&["a"]));
         assert_eq!(reports.len(), 2);
         cluster(&reports, "a", "eds1");
         cluster(&reports, "a", "eds2");
 
         // The loads of "b" were discarded, rather than carried over.
         b.start_call().finish(CallOutcome::Failed);
-        let selection = ["b".to_owned()];
-        let reports = reporter.snapshot(ClusterSelection::Only(&selection));
+        let reports = reporter.snapshot(&only(&["b"]));
         assert_eq!(reports.len(), 1);
         let got = locality_stats(cluster(&reports, "b", "eds1"), "r1");
         assert_eq!(got.total_issued_requests, 1);
@@ -1189,8 +1192,7 @@ mod tests {
 
         // Entries of unselected clusters are pruned too.
         drop(b);
-        let selection = ["a".to_owned()];
-        reporter.snapshot(ClusterSelection::Only(&selection));
+        reporter.snapshot(&only(&["a"]));
         assert_eq!(num_entries(&reporter), 2);
     }
 
@@ -1203,7 +1205,7 @@ mod tests {
         let busy_idle = store.locality_stats("busy", "eds", &locality("idle"), no_propagation());
         let _tracker = busy.start_call();
 
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         assert_eq!(reports.len(), 1);
         let got = cluster(&reports, "busy", "eds");
         assert_eq!(got.upstream_locality_stats.len(), 1);
@@ -1227,7 +1229,7 @@ mod tests {
         clock.advance(Duration::from_secs(2));
         record(&a);
         record(&b);
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         assert_eq!(
             cluster(&reports, "a", "eds").load_report_interval,
             Duration::from_secs(2)
@@ -1238,15 +1240,14 @@ mod tests {
         clock.advance(Duration::from_secs(3));
         record(&a);
         record(&b);
-        let selection = ["a".to_owned()];
-        let reports = reporter.snapshot(ClusterSelection::Only(&selection));
+        let reports = reporter.snapshot(&only(&["a"]));
         assert_eq!(
             cluster(&reports, "a", "eds").load_report_interval,
             Duration::from_secs(3)
         );
         clock.advance(Duration::from_secs(4));
         record(&b);
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         assert_eq!(
             cluster(&reports, "b", "eds").load_report_interval,
             Duration::from_secs(4)
@@ -1257,7 +1258,7 @@ mod tests {
         clock.advance(Duration::from_secs(5));
         record(&a);
         drop(a);
-        let reports = reporter.snapshot(ClusterSelection::All);
+        let reports = reporter.snapshot(&ClusterSelection::All);
         assert_eq!(
             cluster(&reports, "a", "eds").load_report_interval,
             Duration::from_secs(5)
@@ -1310,10 +1311,10 @@ mod tests {
                 })
                 .collect();
             while !workers.iter().all(|w| w.is_finished()) {
-                add(reporter.snapshot(ClusterSelection::All));
+                add(reporter.snapshot(&ClusterSelection::All));
             }
         });
-        add(reporter.snapshot(ClusterSelection::All));
+        add(reporter.snapshot(&ClusterSelection::All));
 
         assert_eq!(issued, THREADS * ITERATIONS);
         assert_eq!(succeeded, THREADS * ITERATIONS);

@@ -73,6 +73,10 @@ use crate::transport::TransportBuilder;
 use crate::transport::TransportReceiver;
 use crate::transport::TransportSender;
 
+/// The gRPC method of the ADS stream.
+pub(crate) const ADS_METHOD: &str =
+    "/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources";
+
 /// Per-client A78 metric attributes (`grpc.target` + `grpc.xds.server`).
 ///
 /// Both values are stored as `Arc<str>` so each emission clones them as a
@@ -1483,7 +1487,7 @@ impl<R: Runtime, TB: TransportBuilder> TransportContext<R, TB> {
         let mut backoff = Backoff::new(self.retry_policy);
         loop {
             if let Ok(transport) = self.builder.build(server).await
-                && let Ok((tx, rx)) = transport.new_stream().await
+                && let Ok((tx, rx)) = transport.new_stream(ADS_METHOD).await
             {
                 let (writes, write_rx) = mpsc::unbounded_channel();
                 let (cancel, cancelled) = oneshot::channel();
@@ -2087,11 +2091,11 @@ mod tests {
         type Sender = <MockTransport as Transport>::Sender;
         type Receiver = <MockTransport as Transport>::Receiver;
 
-        async fn new_stream(&self) -> Result<(Self::Sender, Self::Receiver)> {
+        async fn new_stream(&self, method: &'static str) -> Result<(Self::Sender, Self::Receiver)> {
             if matches!(self.phase, ReconnectPhase::Stream) {
                 connection_gate(&self.gates).await?;
             }
-            self.inner.new_stream().await
+            self.inner.new_stream(method).await
         }
     }
 
@@ -2111,6 +2115,10 @@ mod tests {
         async fn sleep(&self, duration: Duration) {
             let _ = self.sleeps.send(duration);
             TokioRuntime.sleep(duration).await;
+        }
+
+        fn now(&self) -> std::time::Instant {
+            TokioRuntime.now()
         }
     }
 

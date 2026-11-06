@@ -34,20 +34,16 @@ use std::iter;
 /// The default propagates nothing, as when the field is unset.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackendMetricPropagation {
-    /// Bitmask of `CPU_UTILIZATION`, `MEM_UTILIZATION`,
-    /// `APPLICATION_UTILIZATION` and `ALL_NAMED_METRICS`.
-    bits: u8,
-    /// Keys of the named metrics to propagate. Not used if `ALL_NAMED_METRICS`
-    /// is set.
+    cpu_utilization: bool,
+    mem_utilization: bool,
+    application_utilization: bool,
+    all_named_metrics: bool,
+    /// Keys of the named metrics to propagate. Not used if
+    /// `all_named_metrics` is set.
     named_metric_keys: HashSet<String>,
 }
 
 impl BackendMetricPropagation {
-    const CPU_UTILIZATION: u8 = 1 << 0;
-    const MEM_UTILIZATION: u8 = 1 << 1;
-    const APPLICATION_UTILIZATION: u8 = 1 << 2;
-    const ALL_NAMED_METRICS: u8 = 1 << 3;
-
     /// Prefix of the specs of named metrics, and of their names in load
     /// reports.
     pub(super) const NAMED_METRICS_PREFIX: &'static str = "named_metrics.";
@@ -60,11 +56,11 @@ impl BackendMetricPropagation {
         for spec in specs {
             let spec = spec.as_ref();
             match spec {
-                "cpu_utilization" => propagation.bits |= Self::CPU_UTILIZATION,
-                "mem_utilization" => propagation.bits |= Self::MEM_UTILIZATION,
-                "application_utilization" => propagation.bits |= Self::APPLICATION_UTILIZATION,
+                "cpu_utilization" => propagation.cpu_utilization = true,
+                "mem_utilization" => propagation.mem_utilization = true,
+                "application_utilization" => propagation.application_utilization = true,
                 _ => match spec.strip_prefix(Self::NAMED_METRICS_PREFIX) {
-                    Some("*") => propagation.bits |= Self::ALL_NAMED_METRICS,
+                    Some("*") => propagation.all_named_metrics = true,
                     Some(key) => {
                         propagation.named_metric_keys.insert(key.to_owned());
                     }
@@ -77,37 +73,43 @@ impl BackendMetricPropagation {
 
     /// Whether CPU utilization is propagated.
     pub fn propagates_cpu_utilization(&self) -> bool {
-        self.bits & Self::CPU_UTILIZATION != 0
+        self.cpu_utilization
     }
 
     /// Whether memory utilization is propagated.
     pub fn propagates_mem_utilization(&self) -> bool {
-        self.bits & Self::MEM_UTILIZATION != 0
+        self.mem_utilization
     }
 
     /// Whether application utilization is propagated.
     pub fn propagates_application_utilization(&self) -> bool {
-        self.bits & Self::APPLICATION_UTILIZATION != 0
+        self.application_utilization
     }
 
     /// Whether all named metrics are propagated.
     pub fn propagates_all_named_metrics(&self) -> bool {
-        self.bits & Self::ALL_NAMED_METRICS != 0
+        self.all_named_metrics
     }
 
     /// Whether the named metric with `key` is propagated.
     pub fn propagates_named_metric(&self, key: &str) -> bool {
-        self.propagates_all_named_metrics() || self.named_metric_keys.contains(key)
+        self.all_named_metrics || self.named_metric_keys.contains(key)
     }
 
     /// Whether any metric is propagated.
     pub(super) fn propagates_any(&self) -> bool {
-        self.bits != 0 || !self.named_metric_keys.is_empty()
+        self.propagates_utilizations() || self.propagates_named_metrics()
+    }
+
+    /// Whether any of the CPU, memory and application utilizations is
+    /// propagated.
+    pub(super) fn propagates_utilizations(&self) -> bool {
+        self.cpu_utilization || self.mem_utilization || self.application_utilization
     }
 
     /// Whether any named metric is propagated.
     pub(super) fn propagates_named_metrics(&self) -> bool {
-        self.propagates_all_named_metrics() || !self.named_metric_keys.is_empty()
+        self.all_named_metrics || !self.named_metric_keys.is_empty()
     }
 }
 

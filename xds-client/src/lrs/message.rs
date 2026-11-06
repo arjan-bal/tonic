@@ -42,18 +42,28 @@ use crate::message::Node;
 pub struct LoadStatsRequest<'a> {
     /// The node reporting load.
     pub node: &'a Node,
+    /// Client features to advertise in the request's node, as
+    /// `Node.client_features`. Only set on the initial request.
+    pub client_features: &'a [&'a str],
     /// Load reports. Empty for the initial request.
     pub cluster_stats: &'a [ClusterStats],
 }
 
 impl<'a> LoadStatsRequest<'a> {
-    /// Create a new load stats request for the given node, without load
-    /// reports.
+    /// Create a new load stats request for the given node, without client
+    /// features or load reports.
     pub fn new(node: &'a Node) -> Self {
         Self {
             node,
+            client_features: &[],
             cluster_stats: &[],
         }
+    }
+
+    /// Set the client features to advertise.
+    pub fn with_client_features(mut self, client_features: &'a [&'a str]) -> Self {
+        self.client_features = client_features;
+        self
     }
 
     /// Set the load reports to send.
@@ -152,9 +162,6 @@ pub struct LoadStatsResponse {
     pub send_all_clusters: bool,
     /// The minimum interval of time to collect stats over.
     pub load_reporting_interval: Duration,
-    /// Whether endpoint-level load reports should be sent, in addition to
-    /// cluster-level ones.
-    pub report_endpoint_granularity: bool,
 }
 
 impl LoadStatsResponse {
@@ -178,12 +185,6 @@ impl LoadStatsResponse {
     /// Set whether stats should be sent for all clusters.
     pub fn with_send_all_clusters(mut self, send_all_clusters: bool) -> Self {
         self.send_all_clusters = send_all_clusters;
-        self
-    }
-
-    /// Set whether endpoint-level load reports should be sent.
-    pub fn with_report_endpoint_granularity(mut self, report_endpoint_granularity: bool) -> Self {
-        self.report_endpoint_granularity = report_endpoint_granularity;
         self
     }
 }
