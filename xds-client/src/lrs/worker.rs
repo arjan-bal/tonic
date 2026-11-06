@@ -424,7 +424,7 @@ async fn run_transport<R: Runtime, TB: TransportBuilder, C: LrsCodec>(
 }
 
 /// Writes queued requests, and forwards decoded responses to the worker. It
-/// runs until either of the following event:
+/// runs until one of the following happens:
 /// * the stream fails,
 /// * a response can't be decoded,
 /// * the server ends the stream, or
@@ -482,8 +482,9 @@ async fn run_stream<T: Transport, C: LrsCodec>(
             }
             () = &mut read_loop => return,
         }
-        // The worker is dropped the events_rx after sending the last report.
-        // Half-close the stream.
+        // Every queued request was written, and the worker closed the queue:
+        // it has sent its final report, or dropped the stream, which also
+        // cancels it. Half-close the stream, and read until the server ends it.
         drop(stream_tx);
         read_loop.await;
     };

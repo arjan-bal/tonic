@@ -30,12 +30,14 @@
 //!
 //! # Design
 //!
-//! The counters of each recorder are shared, through an [`Arc`], between the
-//! recorder (and its clones and call trackers) and a registry of all the
-//! counters for one LRS server. Getting a recorder briefly locks the registry;
-//! recording on it doesn't, except for categorized drops and backend metrics,
-//! which lock the recorder's own maps. Dropping a recorder only decrements the
-//! reference count: it doesn't lock anything or send a message.
+//! The counters of each cluster, and of each of its localities, are shared,
+//! through an [`Arc`], between their recorders (and the recorders' clones and
+//! call trackers) and a registry of all the counters for one LRS server.
+//! Getting a recorder briefly locks the registry; recording on it doesn't,
+//! except for categorized drops and backend metrics, which lock a map in the
+//! counters, shared with the other recorders for the same cluster or
+//! locality. Dropping a recorder only decrements the reference count: it
+//! doesn't lock anything or send a message.
 //!
 //! The LRS worker builds each load report while holding the registry lock.
 //! Entries whose recorders have all been dropped are pruned then, lazily: if
@@ -83,7 +85,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// that calls in progress when the last `LoadStore` is dropped are still
 /// reported. Getting a recorder briefly locks a registry shared with the LRS
 /// worker. Recording call counts and uncategorized drops is lock-free;
-/// categorized drops and backend metrics take a short per-recorder lock.
+/// categorized drops and backend metrics take a short lock, shared by the
+/// recorders for the same cluster, or locality.
 /// Recorders still work after reporting has stopped, but their loads are never
 /// reported.
 #[derive(Clone)]
@@ -272,7 +275,11 @@ impl CallTracker {
     /// allowed by the recorder's [`BackendMetricPropagation`].
     ///
     /// The named metrics are iterated while holding a lock on the locality's
-    /// counters, so iterating them must not record on the same locality.
+    /// counters. To avoid deadlocks, iterating them must neither get
+    /// recorders from a [`LoadStore`] (load reports take the locality's lock
+    /// while holding the one taken to get recorders), nor call
+    /// `finish_with_metrics` on any locality (it takes that locality's lock).
+    /// Other recording methods are safe to call.
     pub fn finish_with_metrics<N, K, V>(mut self, outcome: CallOutcome, metrics: BackendMetrics<N>)
     where
         N: IntoIterator<Item = (K, V)>,
