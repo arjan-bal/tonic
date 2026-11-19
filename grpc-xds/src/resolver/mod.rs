@@ -35,6 +35,7 @@ use grpc::__unstable::client::name_resolution::ResolverUpdate;
 use grpc::__unstable::client::name_resolution::Target;
 use grpc::__unstable::client::name_resolution::WorkScheduler;
 use grpc::__unstable::rt::BoxedTaskHandle;
+use grpc::client::CallOptions;
 
 use crate::resolver::config_selector::ClusterInterceptor;
 use crate::resolver::config_selector::RouteTarget;
@@ -58,10 +59,6 @@ mod config_selector;
 mod mocks;
 mod nop_resolver;
 mod service_config;
-
-pub(crate) use config_selector::picked_child_name;
-#[cfg(test)]
-pub(crate) use config_selector::set_picked_cluster_for_testing;
 
 // TODO: register this builder in the global resolver registry, in the same
 // place that calls `load_balancing::register()` for the LB policies named in
@@ -124,9 +121,9 @@ struct XdsResolver {
     xds_client: Arc<XdsClientWrapper>,
     dependency_manager: DependencyManager,
     /// Clusters that must stay in the LB policy config, keyed by cluster name.
-    /// Weak, so the map doesn't keep clusters in use. An entry lives until its
-    /// last `ClusterRef` is dropped and `work()` prunes it.
-    active_clusters: HashMap<String, Weak<ClusterRef>>,
+    /// Weak, so the map doesn't keep clusters in use. An entry lives until the
+    /// last ref to its `PickedCluster` is dropped and `work()` prunes it.
+    active_clusters: HashMap<String, Weak<PickedCluster>>,
     lds_resource_name: String,
     /// The dependency manager's latest update that `work()` hasn't applied
     /// yet. Written by `update_task`; `work()` takes it.
@@ -136,8 +133,8 @@ struct XdsResolver {
     current_config_selector: Option<Arc<XdsConfigSelector>>,
     /// Builds the weighted cluster pickers of new config selectors.
     wrr_builder: RandomWrrBuilder,
-    /// Given to each `ClusterRef`, so that dropping the last ref for a cluster
-    /// schedules a call to `work()`.
+    /// Given to each `PickedCluster`, so that dropping the last ref to a
+    /// cluster schedules a call to `work()`.
     work_scheduler: Arc<dyn WorkScheduler>,
     /// Task that polls the dependency manager for `XdsConfig` updates.
     /// Aborted when the resolver is dropped.
@@ -176,15 +173,15 @@ impl XdsResolver {
 
     /// Returns a ref to cluster `name`, subscribing to the cluster if no live
     /// ref exists.
-    fn get_or_create_cluster_ref(&mut self, name: &str) -> Arc<ClusterRef> {
+    fn get_or_create_cluster_ref(&mut self, name: &str) -> Arc<PickedCluster> {
         if let Some(cluster_ref) = self.active_clusters.get(name).and_then(Weak::upgrade) {
             return cluster_ref;
         }
         // Either the cluster is new, or its last ref was dropped (which
         // unsubscribed) and `work()` hasn't pruned it yet. Start a new ref,
         // replacing any dead entry.
-        let cluster_ref = Arc::new(ClusterRef {
-            name: name.to_owned(),
+        let cluster_ref = Arc::new(PickedCluster {
+            child_name: cluster_child_name(name),
             _subscription: self.dependency_manager.subscribe_to_cluster(name),
             work_scheduler: self.work_scheduler.clone(),
         });
@@ -235,19 +232,18 @@ impl XdsResolver {
             return interceptor.clone();
         }
         let interceptor = Arc::new(ClusterInterceptor::new(
-            cluster_child_name(name),
             self.get_or_create_cluster_ref(name),
         ));
         interceptors.insert(name, interceptor.clone());
         interceptor
     }
 
-    /// Removes the clusters whose last `ClusterRef` was dropped. Returns
-    /// whether any cluster was removed.
+    /// Removes the clusters whose last ref was dropped. Returns whether any
+    /// cluster was removed.
     fn remove_unused_clusters(&mut self) -> bool {
         let num_clusters = self.active_clusters.len();
-        // Dropping a dead `Weak` never runs `ClusterRef::drop`; that already
-        // happened when its last ref was dropped.
+        // Dropping a dead `Weak` never runs `PickedCluster::drop`; that
+        // already happened when its last ref was dropped.
         self.active_clusters
             .retain(|_, cluster_ref| cluster_ref.strong_count() > 0);
         self.active_clusters.len() != num_clusters
@@ -352,30 +348,35 @@ impl Drop for XdsResolver {
     }
 }
 
-/// A reference to a cluster that a config selector or an RPC may route to.
-/// While any `ClusterRef` for a cluster is alive, the cluster stays in the
-/// resolver's service config and the dependency manager stays subscribed to
-/// it. Config selectors hold refs through the `ClusterInterceptor` of each
-/// cluster their routes can send RPCs to, and each RPC holds the interceptor
-/// of the cluster it was routed to until the channel's `invoke` for the RPC
-/// returns, i.e. until the RPC is committed.
-struct ClusterRef {
-    name: String,
+/// A cluster that a config selector or an RPC may route to. There is one per
+/// cluster, shared by the `ClusterInterceptor` of every config selector whose
+/// routes can send RPCs to the cluster, and by every RPC routed to it: the
+/// interceptor stores an `Arc<PickedCluster>` in each RPC's `CallOptions`,
+/// where it tells the cluster manager picker which child to pick from.
+///
+/// While any `Arc<PickedCluster>` for a cluster is alive, the cluster stays in
+/// the resolver's service config and the dependency manager stays subscribed
+/// to it. Each RPC holds the interceptor of the cluster it was routed to until
+/// the channel's `invoke` for the RPC returns, i.e. until the RPC is
+/// committed, and holds its `Arc<PickedCluster>` through its `CallOptions`.
+struct PickedCluster {
+    /// Name of the cluster manager child for the cluster ("cluster:<name>").
+    child_name: String,
     /// Keeps the dependency manager subscribed to the cluster. Dropped, which
     /// unsubscribes, together with the last ref.
     _subscription: ClusterSubscription,
     work_scheduler: Arc<dyn WorkScheduler>,
 }
 
-impl fmt::Debug for ClusterRef {
+impl fmt::Debug for PickedCluster {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ClusterRef")
-            .field("name", &self.name)
+        f.debug_struct("PickedCluster")
+            .field("child_name", &self.child_name)
             .finish_non_exhaustive()
     }
 }
 
-impl Drop for ClusterRef {
+impl Drop for PickedCluster {
     fn drop(&mut self) {
         // This can run on any thread, e.g. when an RPC finishes, so it must not
         // touch the resolver. Ask the channel to call `work()`, which removes
@@ -383,6 +384,23 @@ impl Drop for ClusterRef {
         // right after this returns.
         self.work_scheduler.schedule_work();
     }
+}
+
+/// Returns the name of the cluster manager child picked for the RPC with
+/// `call_options`, or `None` if the config selector didn't pick one.
+pub(crate) fn picked_child_name(call_options: &CallOptions) -> Option<&str> {
+    call_options
+        .get_option::<Arc<PickedCluster>>()
+        .map(|picked| picked.child_name.as_str())
+}
+
+/// Stores a pick of child `child_name` in `call_options`, as a cluster
+/// interceptor would. The picked cluster isn't tracked by any resolver.
+#[cfg(test)]
+pub(crate) fn set_picked_cluster_for_testing(call_options: &mut CallOptions, child_name: &str) {
+    call_options.set_option(Arc::new(config_selector::test_utils::untracked_cluster(
+        child_name,
+    )));
 }
 
 #[cfg(test)]
@@ -1296,5 +1314,17 @@ mod tests {
 
         drop(second);
         assert!(dependency_manager.cluster_subscription_counts().is_empty());
+    }
+
+    #[test]
+    fn picked_child_name_is_none_without_pick() {
+        assert_eq!(picked_child_name(&CallOptions::new()), None);
+    }
+
+    #[test]
+    fn set_picked_cluster_for_testing_sets_child_name() {
+        let mut call_options = CallOptions::new();
+        set_picked_cluster_for_testing(&mut call_options, "cluster:a");
+        assert_eq!(picked_child_name(&call_options), Some("cluster:a"));
     }
 }

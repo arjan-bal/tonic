@@ -37,53 +37,13 @@ use grpc::client::DynRecvStream;
 use grpc::client::DynSendStream;
 use grpc::client::RequestHeaders;
 
-use super::ClusterRef;
+use super::PickedCluster;
 use crate::resource::RouteMatch;
 use crate::wrr::RandomWrr;
 use crate::wrr::Wrr;
 
-/// The cluster an RPC was routed to. The cluster's [`ClusterInterceptor`]
-/// stores an `Arc<PickedCluster>` in the RPC's `CallOptions`, where it tells
-/// the cluster manager picker which child to pick from.
-#[derive(Debug)]
-pub(super) struct PickedCluster {
-    /// Name of the cluster manager child for the cluster ("cluster:<name>").
-    child_name: String,
-    /// Keeps the cluster subscribed and in the service config while this pick
-    /// is alive.
-    _cluster_ref: Arc<ClusterRef>,
-}
-
-impl PickedCluster {
-    pub(super) fn new(child_name: String, cluster_ref: Arc<ClusterRef>) -> Self {
-        Self {
-            child_name,
-            _cluster_ref: cluster_ref,
-        }
-    }
-}
-
-/// Returns the name of the cluster manager child picked for the RPC with
-/// `call_options`, or `None` if the config selector didn't pick one.
-pub(crate) fn picked_child_name(call_options: &CallOptions) -> Option<&str> {
-    call_options
-        .get_option::<Arc<PickedCluster>>()
-        .map(|picked| picked.child_name.as_str())
-}
-
-/// Stores a pick of child `child_name` in `call_options`, as a cluster
-/// interceptor would. The pick's `ClusterRef` isn't tracked by any resolver.
-#[cfg(test)]
-pub(crate) fn set_picked_cluster_for_testing(call_options: &mut CallOptions, child_name: &str) {
-    let picked = PickedCluster::new(
-        child_name.to_owned(),
-        Arc::new(test_utils::untracked_cluster_ref(child_name)),
-    );
-    call_options.set_option(Arc::new(picked));
-}
-
-/// The interceptor for the RPCs routed to a cluster. Stores the cluster's
-/// [`PickedCluster`] in each RPC's `CallOptions`.
+/// The interceptor for the RPCs routed to a cluster. Stores a ref to the
+/// cluster's [`PickedCluster`] in each RPC's `CallOptions`.
 ///
 /// A config selector has one per cluster, shared by every route that names
 /// the cluster, so the selector holds a ref to each cluster its routes can
@@ -93,14 +53,12 @@ pub(crate) fn set_picked_cluster_for_testing(call_options: &mut CallOptions, chi
 /// cluster subscribed.
 #[derive(Debug)]
 pub(super) struct ClusterInterceptor {
-    picked: Arc<PickedCluster>,
+    cluster: Arc<PickedCluster>,
 }
 
 impl ClusterInterceptor {
-    pub(super) fn new(child_name: String, cluster_ref: Arc<ClusterRef>) -> Self {
-        Self {
-            picked: Arc::new(PickedCluster::new(child_name, cluster_ref)),
-        }
+    pub(super) fn new(cluster: Arc<PickedCluster>) -> Self {
+        Self { cluster }
     }
 }
 
@@ -112,7 +70,7 @@ impl DynIntercept for ClusterInterceptor {
         mut options: CallOptions,
         next: Arc<dyn DynInvoke>,
     ) -> (Box<dyn DynSendStream>, Box<dyn DynRecvStream>) {
-        options.set_option(self.picked.clone());
+        options.set_option(self.cluster.clone());
         next.dyn_invoke(headers, options).await
     }
 }
@@ -192,6 +150,7 @@ pub(super) mod test_utils {
 
     use super::*;
     use crate::resolver::mocks::DependencyManager;
+    use crate::resolver::picked_child_name;
 
     /// A work scheduler that ignores requests.
     struct NopWorkScheduler;
@@ -200,13 +159,14 @@ pub(super) mod test_utils {
         fn schedule_work(&self) {}
     }
 
-    /// Returns a ref to cluster `name` that no resolver tracks. Its
-    /// subscription is to a throwaway mock dependency manager.
-    pub(in crate::resolver) fn untracked_cluster_ref(name: &str) -> ClusterRef {
+    /// Returns a cluster whose cluster manager child is named `child_name`,
+    /// which no resolver tracks. Its subscription is to a throwaway mock
+    /// dependency manager.
+    pub(in crate::resolver) fn untracked_cluster(child_name: &str) -> PickedCluster {
         let (dependency_manager, _updates_tx) = DependencyManager::new();
-        ClusterRef {
-            name: name.to_owned(),
-            _subscription: dependency_manager.subscribe_to_cluster(name),
+        PickedCluster {
+            child_name: child_name.to_owned(),
+            _subscription: dependency_manager.subscribe_to_cluster(child_name),
             work_scheduler: Arc::new(NopWorkScheduler),
         }
     }
@@ -283,7 +243,7 @@ mod tests {
     use grpc::metadata::MetadataMap;
 
     use super::test_utils::route_rpc;
-    use super::test_utils::untracked_cluster_ref;
+    use super::test_utils::untracked_cluster;
     use super::*;
     use crate::resolver::service_config::cluster_child_name;
     use crate::resource::HeaderMatchSpecifier;
@@ -298,10 +258,9 @@ mod tests {
     /// Returns the interceptor for cluster `name`, as the resolver would
     /// create it.
     fn cluster(name: &str) -> Arc<ClusterInterceptor> {
-        Arc::new(ClusterInterceptor::new(
-            cluster_child_name(name),
-            Arc::new(untracked_cluster_ref(name)),
-        ))
+        Arc::new(ClusterInterceptor::new(Arc::new(untracked_cluster(
+            &cluster_child_name(name),
+        ))))
     }
 
     /// Returns a route match for paths starting with `prefix`.
@@ -430,17 +389,5 @@ mod tests {
         drop(rpc1);
         drop(rpc2);
         assert_eq!(Arc::strong_count(&a), 1);
-    }
-
-    #[test]
-    fn picked_child_name_is_none_without_pick() {
-        assert_eq!(picked_child_name(&CallOptions::new()), None);
-    }
-
-    #[test]
-    fn set_picked_cluster_for_testing_sets_child_name() {
-        let mut call_options = CallOptions::new();
-        set_picked_cluster_for_testing(&mut call_options, "cluster:a");
-        assert_eq!(picked_child_name(&call_options), Some("cluster:a"));
     }
 }
